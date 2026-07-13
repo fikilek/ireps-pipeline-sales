@@ -1,0 +1,78 @@
+# =========================================================
+# Python
+# =========================================================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+
+# =========================================================
+# Secrets and credentials
+# =========================================================
+.env
+.env.*
+!.env.example
+*.json
+!package.json
+!tsconfig.json
+
+# Firebase and service-account credentials
+*serviceAccount*.json
+*service-account*.json
+firebase-adminsdk*.json
+credentials/
+secrets/
+
+# =========================================================
+# Sales pipeline source data
+# Do not commit municipal, customer, meter, or sales data.
+# =========================================================
+input/**
+
+# Keep the approved input folder structure in Git
+!input/
+!input/conlog_sales/
+!input/raw-sales/
+!input/reference/
+!input/**/.gitkeep
+
+# =========================================================
+# Generated pipeline outputs
+# =========================================================
+output/**
+
+# Keep the approved output folder structure in Git
+!output/
+!output/atomic/
+!output/logs/
+!output/meter_master/
+!output/monthly/
+!output/monthly_lm/
+!output/monthly_lm_groups/
+!output/sales_all_meters/
+!output/**/.gitkeep
+
+# =========================================================
+# Logs and temporary files
+# =========================================================
+*.log
+*.tmp
+*.temp
+~$*
+.DS_Store
+Thumbs.db
+
+# =========================================================
+# IDE and editor files
+# =========================================================
+.vscode/
+.idea/
+
+# =========================================================
+# Local backups
+# =========================================================
+*.bak
+*.backup

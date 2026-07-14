@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - governance-sales-schema-20260714
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: read

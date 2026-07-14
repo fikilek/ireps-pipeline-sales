@@ -1,0 +1,13 @@
+{
+  "name": "ireps-firestore-schema-sampler",
+  "version": "1.0.1",
+  "private": true,
+  "description": "Read-only Firestore collection schema sampler for iREPS",
+  "main": "query_firestore_collection_schemas.js",
+  "scripts": {
+    "start": "node query_firestore_collection_schemas.js"
+  },
+  "dependencies": {
+    "firebase-admin": "^13.0.0"
+  }
+}

@@ -76,3 +76,8 @@ Thumbs.db
 # =========================================================
 *.bak
 *.backup
+
+/node_modules/
+/node_modules/
+
+!package-lock.json

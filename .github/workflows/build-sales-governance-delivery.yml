@@ -1,0 +1,28 @@
+name: Build Sales Governance Delivery
+
+on:
+  push:
+    branches:
+      - governance-sales-schema-20260714
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build ZIP
+        run: |
+          cd delivery
+          zip -r iREPS_Sales_Pipeline_Rules_and_Schemas_2026-07-14.zip iREPS_Sales_Pipeline_Rules_and_Schemas_2026-07-14
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: iREPS_Sales_Pipeline_Rules_and_Schemas_2026-07-14
+          path: delivery/iREPS_Sales_Pipeline_Rules_and_Schemas_2026-07-14.zip
+          if-no-files-found: error

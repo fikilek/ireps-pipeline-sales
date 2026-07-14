@@ -14,7 +14,18 @@ Default monthly filename format:
     monthly__FULL__YYYY-MM__from_atomic.csv
 
 Default output filename:
-    meter_master__FULL__<first-month>_to_<last-month>.csv
+    meter_master__<lmPcode>__FULL__<first-month>_to_<last-month>.csv
+
+Governance controls:
+- every project path resolves from this script's repository root
+- monthly rows must match the requested LM and filename month
+- meter identifiers must be non-empty uppercase alphanumeric values after normalisation
+- Customer Details duplicates prefer the dominant identity pattern where CustomerNo equals AccountNo and differs from MeterNumber
+- an Active duplicate may replace a Block Purchases duplicate without consulting ERF, address, or customer-name fields
+- competing dominant identities may resolve only by the latest valid LastPurchaseDate
+- tied or missing purchase dates still stop the build
+- 90-day report duplicates use the same placeholder preference and may resolve competing real customer numbers by latest valid LastPurchaseDate
+- tied or missing NPR purchase dates still stop genuine competing non-placeholder identities
 """
 
 from __future__ import annotations
@@ -28,9 +39,11 @@ from typing import Any, Dict, Iterable, Optional, Sequence
 import pandas as pd
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MONTHLY_FILENAME_RE = re.compile(
     r"^monthly__(?P<scope>[A-Za-z0-9_-]+)__(?P<period>\d{4}-\d{2})__from_atomic\.csv$"
 )
+METER_NO_RE = re.compile(r"^[A-Z0-9]+$")
 
 MASTER_COLUMNS = [
     "masterId",
@@ -69,6 +82,11 @@ class BuildStats:
     monthly_backed_meters: int = 0
     customer_only_seeded_meters: int = 0
     npr_only_seeded_meters: int = 0
+    customer_placeholder_duplicates_resolved: int = 0
+    customer_active_status_duplicates_resolved: int = 0
+    customer_latest_purchase_duplicates_resolved: int = 0
+    npr_placeholder_duplicates_resolved: int = 0
+    npr_latest_purchase_duplicates_resolved: int = 0
     total_master_rows: int = 0
 
 
@@ -146,6 +164,11 @@ def validate_month(value: Optional[str], argument_name: str) -> None:
         return
     if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", value):
         raise ValueError(f"{argument_name} must use YYYY-MM format: {value}")
+
+
+def resolve_project_path(path: Path) -> Path:
+    """Resolve relative runtime paths from the repository root, never the shell CWD."""
+    return path if path.is_absolute() else PROJECT_ROOT / path
 
 
 def require_file(filepath: Path) -> None:
@@ -226,11 +249,189 @@ def normalize_meter_no(value: Any) -> str:
     return "".join(str(value).strip().upper().split())
 
 
+def validate_meter_no(value: Any, source: Path, row_number: int) -> str:
+    """Normalise one meter identifier and reject blank or unsafe characters."""
+    normalized = normalize_meter_no(value)
+    if not normalized:
+        raise ValueError(f"{source} row {row_number} has a blank meter identifier.")
+    if not METER_NO_RE.fullmatch(normalized):
+        raise ValueError(
+            f"{source} row {row_number} has invalid meter identifier {value!r}; "
+            "after normalisation, only A-Z and 0-9 are allowed."
+        )
+    return normalized
+
+
 def safe_str(value: Any) -> str:
     if value is None or pd.isna(value):
         return ""
     text = str(value).strip()
     return "" if text.lower() == "nan" else text
+
+
+def merge_duplicate_reference_record(
+    existing: Dict[str, Any],
+    candidate: Dict[str, Any],
+    *,
+    source: Path,
+    row_number: int,
+    normalized: str,
+    conflict_fields: Sequence[str],
+) -> None:
+    """Merge a duplicate reference row only when populated values do not conflict."""
+    for field in conflict_fields:
+        current = safe_str(existing.get(field))
+        incoming = safe_str(candidate.get(field))
+        if current and incoming and current != incoming:
+            raise ValueError(
+                f"{source} contains conflicting duplicate meter {normalized!r}: "
+                f"{field} is {current!r} and {incoming!r} (conflict at row {row_number})."
+            )
+        if not current and incoming:
+            existing[field] = incoming
+
+    if not safe_str(existing.get("meterNoRaw")) and safe_str(candidate.get("meterNoRaw")):
+        existing["meterNoRaw"] = safe_str(candidate.get("meterNoRaw"))
+
+
+def customer_identity_pattern(record: Dict[str, Any], normalized: str) -> str:
+    """Classify a Customer Details identity using the approved Lesedi source pattern."""
+    customer_no = safe_str(record.get("customerNo"))
+    account_no = safe_str(record.get("accountNo"))
+
+    if customer_no and account_no and customer_no == account_no:
+        if customer_no == normalized:
+            return "METER_EQUALS_CUSTOMER_AND_ACCOUNT"
+        return "CUSTOMER_EQUALS_ACCOUNT_NOT_METER"
+
+    if not customer_no or not account_no:
+        return "INCOMPLETE"
+
+    return "MIXED_OR_OTHER"
+
+
+def parse_customer_purchase_date(value: Any) -> Optional[pd.Timestamp]:
+    """Parse one Customer Details purchase timestamp, returning None for blank or invalid values."""
+    text = safe_str(value)
+    if not text:
+        return None
+    parsed = pd.to_datetime(text, errors="coerce")
+    if pd.isna(parsed):
+        return None
+    return pd.Timestamp(parsed)
+
+
+def replace_customer_record(existing: Dict[str, Any], candidate: Dict[str, Any]) -> None:
+    """Replace the stored duplicate candidate while preserving the normalized map key."""
+    existing.clear()
+    existing.update(candidate)
+
+
+def merge_customer_duplicate_record(
+    existing: Dict[str, Any],
+    candidate: Dict[str, Any],
+    *,
+    source: Path,
+    row_number: int,
+    normalized: str,
+) -> Optional[str]:
+    """
+    Resolve one duplicate Customer Details row.
+
+    Returns:
+    - ``"placeholder"`` when a dominant identity replaces or defeats a meter-number placeholder;
+    - ``"active_status"`` when an Active row replaces a Block Purchases row;
+    - ``"latest_purchase"`` when two dominant identities resolve by latest valid purchase;
+    - ``None`` for identical or complementary duplicates.
+
+    ERF, address, customer name, and other descriptive fields are deliberately excluded
+    from duplicate resolution because they are not part of the locked Meter Master schema.
+    Competing dominant identities remain a hard error when both purchase dates are
+    missing/invalid or when the dates tie.
+    """
+    conflict_fields = [
+        field
+        for field in ("customerNo", "accountNo")
+        if safe_str(existing.get(field))
+        and safe_str(candidate.get(field))
+        and safe_str(existing.get(field)) != safe_str(candidate.get(field))
+    ]
+
+    if not conflict_fields:
+        merge_duplicate_reference_record(
+            existing,
+            candidate,
+            source=source,
+            row_number=row_number,
+            normalized=normalized,
+            conflict_fields=["customerNo", "accountNo"],
+        )
+        existing_date = parse_customer_purchase_date(existing.get("lastPurchaseDate"))
+        candidate_date = parse_customer_purchase_date(candidate.get("lastPurchaseDate"))
+        if candidate_date is not None and (existing_date is None or candidate_date > existing_date):
+            existing["lastPurchaseDate"] = safe_str(candidate.get("lastPurchaseDate"))
+            existing["sourceRow"] = row_number
+        return None
+
+    existing_pattern = customer_identity_pattern(existing, normalized)
+    candidate_pattern = customer_identity_pattern(candidate, normalized)
+    dominant = "CUSTOMER_EQUALS_ACCOUNT_NOT_METER"
+    placeholder = "METER_EQUALS_CUSTOMER_AND_ACCOUNT"
+
+    # Resolve the approved source-identity pattern before considering status or
+    # descriptive fields. A meter-number placeholder is weaker than a row where
+    # CustomerNo = AccountNo and that identity differs from the meter number.
+    # Placeholder ERF/address data may be stale and is not part of Meter Master.
+    if existing_pattern == placeholder and candidate_pattern == dominant:
+        replace_customer_record(existing, candidate)
+        return "placeholder"
+
+    if existing_pattern == dominant and candidate_pattern == placeholder:
+        return "placeholder"
+
+    existing_status = safe_str(existing.get("accountStatus")).upper()
+    candidate_status = safe_str(candidate.get("accountStatus")).upper()
+    status_pair = {existing_status, candidate_status}
+
+    if status_pair == {"ACTIVE", "BLOCK PURCHASES"}:
+        # AccountStatus is used only as an identity-resolution signal.
+        # ERF, address, customer name, and purchase-date equality are not checked here
+        # because those descriptive fields are outside the Meter Master contract.
+        if existing_status != "ACTIVE":
+            replace_customer_record(existing, candidate)
+        return "active_status"
+
+    if existing_pattern == dominant and candidate_pattern == dominant:
+        existing_date = parse_customer_purchase_date(existing.get("lastPurchaseDate"))
+        candidate_date = parse_customer_purchase_date(candidate.get("lastPurchaseDate"))
+        existing_row = safe_str(existing.get("sourceRow")) or "unknown"
+
+        if existing_date is None and candidate_date is None:
+            raise ValueError(
+                f"{source} contains unresolved duplicate meter {normalized!r}. "
+                f"Rows {existing_row} and {row_number} both match the dominant customer/account pattern, "
+                "but neither has a valid LastPurchaseDate."
+            )
+        if existing_date is not None and candidate_date is not None and existing_date == candidate_date:
+            raise ValueError(
+                f"{source} contains unresolved duplicate meter {normalized!r}. "
+                f"Rows {existing_row} and {row_number} both match the dominant customer/account pattern "
+                f"and share the same LastPurchaseDate {existing_date.isoformat()!r}."
+            )
+
+        if candidate_date is not None and (existing_date is None or candidate_date > existing_date):
+            replace_customer_record(existing, candidate)
+        return "latest_purchase"
+
+    existing_row = safe_str(existing.get("sourceRow")) or "unknown"
+    raise ValueError(
+        f"{source} contains unresolved duplicate meter {normalized!r}. "
+        f"Existing row {existing_row}: customerNo={safe_str(existing.get('customerNo'))!r}, "
+        f"accountNo={safe_str(existing.get('accountNo'))!r}, pattern={existing_pattern}; "
+        f"row {row_number}: customerNo={safe_str(candidate.get('customerNo'))!r}, "
+        f"accountNo={safe_str(candidate.get('accountNo'))!r}, pattern={candidate_pattern}. "
+        "Only the approved placeholder rule or latest-purchase rule may resolve duplicates."
+    )
 
 
 def make_base_master_record(config: BuildConfig) -> Dict[str, Any]:
@@ -273,13 +474,32 @@ def load_monthly_meter_universe(
     master_map: MasterMap = {}
 
     for monthly_input in monthly_inputs:
-        df = pd.read_csv(monthly_input.path, dtype=str)
-        require_columns(df, ["meterNo"], monthly_input.path)
+        df = pd.read_csv(monthly_input.path, dtype=str).fillna("")
+        require_columns(df, ["lmPcode", "meterNo", "ym"], monthly_input.path)
 
-        for meter_no_raw in df["meterNo"]:
-            normalized = normalize_meter_no(meter_no_raw)
-            if not normalized:
-                continue
+        lm_values = df["lmPcode"].map(safe_str).str.upper()
+        wrong_lm = lm_values != config.lm_pcode
+        if wrong_lm.any():
+            examples = sorted(set(lm_values[wrong_lm].head(10).tolist()))
+            raise ValueError(
+                f"{monthly_input.path} contains {int(wrong_lm.sum())} row(s) outside "
+                f"LM {config.lm_pcode}. Examples: {examples}"
+            )
+
+        ym_values = df["ym"].map(safe_str)
+        wrong_month = ym_values != monthly_input.period
+        if wrong_month.any():
+            examples = sorted(set(ym_values[wrong_month].head(10).tolist()))
+            raise ValueError(
+                f"{monthly_input.path} contains {int(wrong_month.sum())} row(s) whose ym "
+                f"does not match filename month {monthly_input.period}. Examples: {examples}"
+            )
+
+        for index, row in df.iterrows():
+            meter_no_raw = row.get("meterNo")
+            normalized = validate_meter_no(
+                meter_no_raw, monthly_input.path, int(index) + 2
+            )
 
             rec = master_map.setdefault(normalized, make_base_master_record(config))
             rec["meterNoRaw"] = choose_best_raw_meter_no(
@@ -291,36 +511,160 @@ def load_monthly_meter_universe(
     return master_map
 
 
-def load_customer_details(filepath: Path) -> CustomerMap:
-    df = pd.read_csv(filepath, dtype=str)
-    require_columns(df, ["MeterNumber", "CustomerNo", "AccountNo"], filepath)
+def load_customer_details(filepath: Path, stats: BuildStats) -> CustomerMap:
+    df = pd.read_csv(filepath, dtype=str).fillna("")
+    require_columns(
+        df,
+        [
+            "MeterNumber",
+            "CustomerNo",
+            "AccountNo",
+            "AccountStatus",
+            "LastPurchaseDate",
+        ],
+        filepath,
+    )
 
     customer_map: CustomerMap = {}
-    for _, row in df.iterrows():
-        normalized = normalize_meter_no(row.get("MeterNumber"))
-        if not normalized:
-            continue
-        customer_map[normalized] = {
+    for index, row in df.iterrows():
+        row_number = int(index) + 2
+        normalized = validate_meter_no(row.get("MeterNumber"), filepath, row_number)
+        candidate = {
             "meterNoRaw": safe_str(row.get("MeterNumber")),
             "customerNo": safe_str(row.get("CustomerNo")),
             "accountNo": safe_str(row.get("AccountNo")),
+            "lastPurchaseDate": safe_str(row.get("LastPurchaseDate")),
+            "accountStatus": safe_str(row.get("AccountStatus")),
+            "sourceRow": row_number,
         }
+
+        existing = customer_map.get(normalized)
+        if existing is None:
+            customer_map[normalized] = candidate
+        else:
+            resolution = merge_customer_duplicate_record(
+                existing,
+                candidate,
+                source=filepath,
+                row_number=row_number,
+                normalized=normalized,
+            )
+            if resolution == "placeholder":
+                stats.customer_placeholder_duplicates_resolved += 1
+            elif resolution == "active_status":
+                stats.customer_active_status_duplicates_resolved += 1
+            elif resolution == "latest_purchase":
+                stats.customer_latest_purchase_duplicates_resolved += 1
+
     return customer_map
 
 
-def load_npr(filepath: Path) -> NprMap:
-    df = pd.read_csv(filepath, dtype=str)
-    require_columns(df, ["MeterIdentifier", "CustomerNo1"], filepath)
+def merge_npr_duplicate_record(
+    existing: Dict[str, Any],
+    candidate: Dict[str, Any],
+    *,
+    source: Path,
+    row_number: int,
+    normalized: str,
+) -> Optional[str]:
+    """Resolve one duplicate 90-day report row using governed identity evidence.
+
+    Returns:
+    - ``"placeholder"`` when a real customer number replaces or defeats a
+      customer number equal to the meter number;
+    - ``"latest_purchase"`` when two different real customer numbers resolve
+      by the latest valid LastPurchaseDate;
+    - ``None`` for identical or complementary duplicates.
+
+    Two different non-placeholder customer numbers remain a hard error when
+    both purchase dates are missing/invalid or when the dates tie.
+    """
+    current_customer = safe_str(existing.get("customerNo"))
+    incoming_customer = safe_str(candidate.get("customerNo"))
+
+    if not current_customer or current_customer == incoming_customer:
+        merge_duplicate_reference_record(
+            existing,
+            candidate,
+            source=source,
+            row_number=row_number,
+            normalized=normalized,
+            conflict_fields=["customerNo"],
+        )
+        existing_date = parse_customer_purchase_date(existing.get("lastPurchaseDate"))
+        candidate_date = parse_customer_purchase_date(candidate.get("lastPurchaseDate"))
+        if candidate_date is not None and (existing_date is None or candidate_date > existing_date):
+            existing["lastPurchaseDate"] = safe_str(candidate.get("lastPurchaseDate"))
+            existing["sourceRow"] = row_number
+        return None
+
+    existing_placeholder = current_customer == normalized
+    candidate_placeholder = incoming_customer == normalized
+
+    if existing_placeholder and not candidate_placeholder:
+        replace_customer_record(existing, candidate)
+        return "placeholder"
+
+    if not existing_placeholder and candidate_placeholder:
+        return "placeholder"
+
+    existing_date = parse_customer_purchase_date(existing.get("lastPurchaseDate"))
+    candidate_date = parse_customer_purchase_date(candidate.get("lastPurchaseDate"))
+    existing_row = safe_str(existing.get("sourceRow")) or "unknown"
+
+    if existing_date is None and candidate_date is None:
+        raise ValueError(
+            f"{source} contains unresolved duplicate meter {normalized!r}. "
+            f"Rows {existing_row} and {row_number} contain different non-placeholder "
+            "CustomerNo1 values, but neither has a valid LastPurchaseDate."
+        )
+    if existing_date is not None and candidate_date is not None and existing_date == candidate_date:
+        raise ValueError(
+            f"{source} contains unresolved duplicate meter {normalized!r}. "
+            f"Rows {existing_row} and {row_number} contain different non-placeholder "
+            f"CustomerNo1 values and share the same LastPurchaseDate {existing_date.isoformat()!r}."
+        )
+
+    if candidate_date is not None and (existing_date is None or candidate_date > existing_date):
+        replace_customer_record(existing, candidate)
+    return "latest_purchase"
+
+
+def load_npr(filepath: Path, stats: BuildStats) -> NprMap:
+    df = pd.read_csv(filepath, dtype=str).fillna("")
+    require_columns(
+        df,
+        ["MeterIdentifier", "CustomerNo1", "LastPurchaseDate"],
+        filepath,
+    )
 
     npr_map: NprMap = {}
-    for _, row in df.iterrows():
-        normalized = normalize_meter_no(row.get("MeterIdentifier"))
-        if not normalized:
-            continue
-        npr_map[normalized] = {
+    for index, row in df.iterrows():
+        row_number = int(index) + 2
+        normalized = validate_meter_no(row.get("MeterIdentifier"), filepath, row_number)
+        candidate = {
             "meterNoRaw": safe_str(row.get("MeterIdentifier")),
             "customerNo": safe_str(row.get("CustomerNo1")),
+            "lastPurchaseDate": safe_str(row.get("LastPurchaseDate")),
+            "sourceRow": row_number,
         }
+
+        existing = npr_map.get(normalized)
+        if existing is None:
+            npr_map[normalized] = candidate
+        else:
+            resolution = merge_npr_duplicate_record(
+                existing,
+                candidate,
+                source=filepath,
+                row_number=row_number,
+                normalized=normalized,
+            )
+            if resolution == "placeholder":
+                stats.npr_placeholder_duplicates_resolved += 1
+            elif resolution == "latest_purchase":
+                stats.npr_latest_purchase_duplicates_resolved += 1
+
     return npr_map
 
 
@@ -426,9 +770,39 @@ def resolve_output_path(
     )
 
 
+def validate_staging_dataframe(df: pd.DataFrame, config: BuildConfig) -> None:
+    actual_columns = list(df.columns)
+    if actual_columns != MASTER_COLUMNS:
+        raise ValueError(
+            f"Meter Master output columns do not match the approved contract: {actual_columns}"
+        )
+    if df.empty:
+        raise ValueError("Meter Master build produced zero rows.")
+    if df["masterId"].duplicated().any():
+        examples = df.loc[df["masterId"].duplicated(keep=False), "masterId"].head(10).tolist()
+        raise ValueError(f"Meter Master output contains duplicate masterId values: {examples}")
+    if not df["masterId"].map(lambda value: bool(METER_NO_RE.fullmatch(safe_str(value)))).all():
+        raise ValueError("Meter Master output contains invalid masterId characters.")
+    if not (df["masterId"] == df["meterNoNormalized"]).all():
+        raise ValueError("Meter Master identity failure: masterId must equal meterNoNormalized.")
+    if not (df["salesId"] == df["meterNoNormalized"]).all():
+        raise ValueError("Meter Master identity failure: salesId must equal meterNoNormalized.")
+    if not (df["lmPcode"] == config.lm_pcode).all():
+        raise ValueError("Meter Master output contains an unexpected lmPcode.")
+    if not (df["salesProvider"] == config.provider).all():
+        raise ValueError("Meter Master output contains an unexpected salesProvider.")
+
+
 def write_csv(df: pd.DataFrame, output_path: Path) -> None:
+    """Write through a temporary file so a failed write cannot leave partial output."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(output_path, index=False, encoding="utf-8")
+    temp_path = output_path.with_name(output_path.name + ".tmp")
+    try:
+        df.to_csv(temp_path, index=False, encoding="utf-8")
+        temp_path.replace(output_path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
 
 
 def main() -> None:
@@ -438,11 +812,33 @@ def main() -> None:
     if args.from_month and args.to_month and args.from_month > args.to_month:
         raise ValueError("--from-month cannot be later than --to-month")
 
-    require_file(args.customer_details)
-    require_file(args.npr)
+    config = BuildConfig(
+        lm_pcode=safe_str(args.lm_pcode).upper(),
+        provider=safe_str(args.provider).lower(),
+        meter_type=safe_str(args.meter_type).lower(),
+    )
+    if not config.lm_pcode:
+        raise ValueError("--lm-pcode may not be blank.")
+    if not re.fullmatch(r"[A-Z0-9_-]+", config.lm_pcode):
+        raise ValueError("--lm-pcode may contain only A-Z, 0-9, underscore, and hyphen.")
+    if not config.provider:
+        raise ValueError("--provider may not be blank.")
+    if not config.meter_type:
+        raise ValueError("--meter-type may not be blank.")
+
+    monthly_dir = resolve_project_path(args.monthly_dir)
+    customer_details_path = resolve_project_path(args.customer_details)
+    npr_path = resolve_project_path(args.npr)
+    output_dir = resolve_project_path(args.output_dir)
+    explicit_output = (
+        resolve_project_path(args.output) if args.output is not None else None
+    )
+
+    require_file(customer_details_path)
+    require_file(npr_path)
 
     monthly_inputs = discover_monthly_inputs(
-        args.monthly_dir,
+        monthly_dir,
         args.scope,
         args.from_month,
         args.to_month,
@@ -451,14 +847,9 @@ def main() -> None:
     first_month = monthly_inputs[0].period
     last_month = monthly_inputs[-1].period
 
-    config = BuildConfig(
-        lm_pcode=args.lm_pcode.strip().upper(),
-        provider=args.provider.strip().lower(),
-        meter_type=args.meter_type.strip().lower(),
-    )
     output_path = resolve_output_path(
-        args.output,
-        args.output_dir,
+        explicit_output,
+        output_dir,
         config.lm_pcode,
         args.scope,
         first_month,
@@ -467,8 +858,11 @@ def main() -> None:
     stats = BuildStats()
 
     print("=== METER MASTER BUILD ===")
+    print(f"Repository root: {PROJECT_ROOT}")
     print(f"LM/workbase: {config.lm_pcode}")
     print(f"Provider: {config.provider}")
+    print(f"Customer details: {customer_details_path}")
+    print(f"90-day report: {npr_path}")
     print(f"Months discovered: {len(monthly_inputs)} ({first_month} to {last_month})")
     for item in monthly_inputs:
         print(f"  - {item.period}: {item.path}")
@@ -476,13 +870,14 @@ def main() -> None:
     master_map = load_monthly_meter_universe(monthly_inputs, config)
     stats.monthly_backed_meters = len(master_map)
 
-    customer_map = load_customer_details(args.customer_details)
-    npr_map = load_npr(args.npr)
+    customer_map = load_customer_details(customer_details_path, stats)
+    npr_map = load_npr(npr_path, stats)
     merge_customer_details(master_map, customer_map, config, stats)
     merge_npr(master_map, npr_map, config, stats)
     finalize_master_records(master_map, config)
 
     df = master_rows_to_dataframe(master_map)
+    validate_staging_dataframe(df, config)
     write_csv(df, output_path)
     stats.total_master_rows = len(df)
 
@@ -490,7 +885,28 @@ def main() -> None:
     print(f"Monthly-backed meters: {stats.monthly_backed_meters}")
     print(f"Customer-only seeded meters: {stats.customer_only_seeded_meters}")
     print(f"NPR-only seeded meters: {stats.npr_only_seeded_meters}")
+    print(
+        "Customer placeholder duplicates resolved: "
+        f"{stats.customer_placeholder_duplicates_resolved}"
+    )
+    print(
+        "Customer Active-status duplicates resolved: "
+        f"{stats.customer_active_status_duplicates_resolved}"
+    )
+    print(
+        "Customer latest-purchase duplicates resolved: "
+        f"{stats.customer_latest_purchase_duplicates_resolved}"
+    )
+    print(
+        "NPR placeholder duplicates resolved: "
+        f"{stats.npr_placeholder_duplicates_resolved}"
+    )
+    print(
+        "NPR latest-purchase duplicates resolved: "
+        f"{stats.npr_latest_purchase_duplicates_resolved}"
+    )
     print(f"Total meter master rows: {stats.total_master_rows}")
+    print("Validation: PASS")
     print(f"Output: {output_path}")
 
 

@@ -1,44 +1,53 @@
-# iREPS Sales Pipeline Rules
+﻿# iREPS Sales Pipeline Rules
 
-**File:** `rules/SALES_PIPELINE_RULES.md`  
-**Project:** `C:\dev\ireps-pipeline-sales`  
-**Status:** Governing project rules  
-**Version:** 1.7  
-**Effective date:** 2026-07-15  
-**Current phase:** Lesedi `ireps-test` sales baseline complete; mobile consumption verified  
-**Current provider:** Conlog  
+**File:** `rules/SALES_PIPELINE_RULES.md`
+**Project:** `C:\dev\ireps-pipeline-sales`
+**Status:** Governing project rules
+**Version:** 1.8
+**Effective date:** 2026-07-16
+**Current phase:** Meter Master governance correction before backend-writer reassessment
+**Current provider:** Conlog
 **Current LM / workbase:** Lesedi — `ZA7423`
 
 ---
 
 ## 1. Purpose
 
-This file is the governing architecture, implementation, data, safety, validation and operating contract for the iREPS Sales Pipeline.
+This file is the governing architecture, implementation, data, safety, and operating contract for the iREPS Sales Pipeline.
 
-It preserves approved decisions across developers, future maintainers, Codex and other AI agents, pipeline operators, documentation work, environment migrations, Trials preparation and Production preparation.
+It exists to preserve agreed decisions across developers, future maintainers, Codex and other AI agents, pipeline operators, documentation work, environment migrations, and future Trials and Production preparation.
 
-The rules in this file must be read before analysing, changing, running, uploading or documenting any part of the Sales Pipeline.
+The rules in this file must be read before analysing, designing, changing, running, or documenting this project.
 
 ---
 
 ## 2. Authority
 
-The authority order is:
+The authority order for this project is:
 
-1. Locked canonical collection schemas under `C:\dev\ireps-schemas` for Firestore document identity, shape, field type and field ownership.
-2. `rules/SALES_PIPELINE_RULES.md` for pipeline architecture, execution, safety and operating behaviour.
-3. Approved iREPS architecture and data decisions.
-4. The iREPS Master Dictionary.
-5. Confirmed current code behaviour.
-6. Sprint instructions.
-7. Chat discussions.
-8. Assumptions.
+1. Locked canonical collection schemas under `C:\dev\ireps-schemas` for Firestore document identity, shape, field type, and field ownership
+2. `rules/SALES_PIPELINE_RULES.md` for pipeline architecture, implementation, safety, and operating behaviour
+3. Approved iREPS architecture and data decisions
+4. The iREPS Master Dictionary
+5. Confirmed current code behaviour
+6. Sprint instructions
+7. Chat discussions
+8. Assumptions
 
-Code does not silently define or change a schema.
+A pipeline rule must not invent a Firestore field that is absent from the applicable locked canonical schema.
 
-A pipeline rule must not invent a Firestore field that is absent from the applicable locked schema.
+A schema document must not silently redefine pipeline execution, environment safety, or upload controls governed by this rules file.
 
-If code, this file and the schema repository disagree, the work must stop until the conflict is identified, reviewed and documented.
+If code conflicts with this rules file, do not silently change either one.
+
+The conflict must first be identified and classified as one of the following:
+
+- the code is outdated or incorrect;
+- the rules file is outdated;
+- an agreed migration is incomplete;
+- the implementation differs intentionally and needs documentation.
+
+No developer or agent may override an agreed rule through an undocumented code change.
 
 ---
 
@@ -49,10 +58,9 @@ Before working on this project:
 1. Read this entire file.
 2. Read the Sales Pipeline section in the iREPS Master Dictionary.
 3. Inspect the current repository tree.
-4. Inspect the scripts involved in the requested change.
-5. Inspect the applicable schemas under `C:\dev\ireps-schemas`.
-6. Confirm the target environment before any upload or destructive action.
-7. Report conflicts before editing.
+4. Inspect the current scripts involved in the requested change.
+5. Confirm the target environment before any upload or destructive action.
+6. Report any conflict between the rules and current code before editing.
 
 Every Codex or AI-agent request must begin with an instruction equivalent to:
 
@@ -60,16 +68,36 @@ Every Codex or AI-agent request must begin with an instruction equivalent to:
 
 ---
 
-## 4. Official terminology and naming
+## 4. Official terminology source
 
-There is one iREPS Master Dictionary:
+There is only one iREPS Master Dictionary.
+
+The official dictionary is maintained in:
 
 ```text
 C:\dev\ireps-academy\15-dictionary\
 iREPS_Master_Dictionary_v1.3.md
 ```
 
-Use the generic word `sales` for new architecture, project and governance names.
+The Master Dictionary is the single source of truth for iREPS terminology.
+
+This repository must not create a separate module dictionary.
+
+Sales Pipeline terms must be added to or refined in a dedicated section of the Master Dictionary:
+
+```text
+Sales Pipeline Concepts
+```
+
+New business, data, collection, architecture, or pipeline terms must not be introduced without an approved definition in the Master Dictionary.
+
+This rules file defines how the pipeline must operate. The Master Dictionary defines what approved terms mean.
+
+---
+
+## 5. Naming rule
+
+Use the generic word `sales` for new project, rules, architecture, and internal governance names.
 
 Preferred examples:
 
@@ -82,24 +110,21 @@ sales_all_meters
 SALES_PIPELINE_RULES.md
 ```
 
-The word `prepaid` may remain where it accurately describes Conlog source data, an existing source filename or a user-facing report name.
+Avoid introducing `prepaid` or `PREPAID` into new generic project and governance filenames.
 
-Existing collection names remain unchanged during TEST stabilisation:
+The word `prepaid` may still appear where it accurately describes the current Conlog source data, a source-system filename, an existing input filename, or a business explanation.
+
+Existing filenames such as the following do not need to be renamed during the current sprint:
 
 ```text
-conlog_sales_atomic
-conlog_sales_monthly
-conlog_sales_monthly_lm
-conlog_sales_monthly_lm_groups
-meter_master
-sales-all-meters
+conlog_prepaid_sales__ZA7423__2026-06.csv
 ```
-
-Do not rename these collections during the current phase.
 
 ---
 
-## 5. Approved repository structure
+## 6. Approved repository structure
+
+The approved project structure is:
 
 ```text
 C:\dev\ireps-pipeline-sales
@@ -123,6 +148,7 @@ C:\dev\ireps-pipeline-sales
 │
 ├── docs
 │   ├── architecture
+│   │   └── SALES_PIPELINE_FLOW.drawio
 │   └── project-history
 │
 ├── input
@@ -140,29 +166,29 @@ C:\dev\ireps-pipeline-sales
     └── sales_all_meters
 ```
 
-The repository root must remain clean.
+The root folder must remain clean.
 
-Scripts must resolve the repository root from their own location:
+Python scripts belong in `scripts`.
 
-```python
-from pathlib import Path
+Project-history files belong in:
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+```text
+docs/project-history
 ```
 
-Operational input and output paths must be derived from `PROJECT_ROOT`.
+The already-cleaned `input` and `output` structures must not be reorganised without an agreed design change.
 
 ---
 
-## 6. Authoritative schema repository
+### 6.1 Authoritative schema repository
 
-The authoritative schema repository is:
+The authoritative iREPS collection-schema repository is:
 
 ```text
 C:\dev\ireps-schemas
 ```
 
-Current Sales Pipeline schema folders are:
+The Sales Pipeline schemas maintained there are:
 
 ```text
 conlog-sales-atomic
@@ -173,60 +199,144 @@ meter-master
 sales-all-meters
 ```
 
-The pipeline rules and schema repository have connected but different responsibilities:
+This rules file governs pipeline execution and safety. The schema repository governs canonical Firestore document identity, shape, field type and field ownership.
 
-```text
-SALES_PIPELINE_RULES.md
-    = execution, architecture, safety and operating contract
+A code change that changes a Firestore shape or identity must update the corresponding schema in the same governed change. If code, rules and schemas disagree, the change or upload must stop until the conflict is resolved.
 
-C:\dev\ireps-schemas
-    = Firestore identity, shape, type and field contract
+---
+## 7. Script path rule
+
+Scripts must not depend on being located in the project root.
+
+Every script must resolve the repository root from its own file location.
+
+The standard pattern is:
+
+```python
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+INPUT_DIR = PROJECT_ROOT / "input"
+OUTPUT_DIR = PROJECT_ROOT / "output"
 ```
 
-A Firestore document-shape change requires a versioned schema update and an aligned code change.
+All input, output, reference, log, and staging paths must be derived from `PROJECT_ROOT`.
+
+Scripts must work when launched from the repository root, for example:
+
+```powershell
+python .\scripts\01_prepare_conlog_sales.py
+```
+
+The moved scripts must not be run until their path handling has been inspected and updated.
 
 ---
 
-## 7. Environment and provider model
+## 8. Environment model
 
-Current and planned environments:
+The iREPS environments are separate from the sales provider.
+
+Current and planned environments are:
 
 ```text
-ireps2            DEV
-ireps-test        TEST
-ireps-trials      Future Trials
-ireps-production  Future Production
+ireps2           DEV
+ireps-test       TEST
+ireps-trials     Future Trials environment
+ireps-production Future Production environment
 ```
 
-Current target:
+Current sprint target:
 
 ```text
 ireps-test
 ```
 
-Current provider:
+The local build scripts must remain environment-neutral.
+
+Build scripts must not contain a silent Firebase project selection.
+
+Upload scripts must require an explicit target project, such as:
+
+```powershell
+--project-id ireps-test
+```
+
+Future examples:
+
+```powershell
+--project-id ireps-trials
+--project-id ireps-production
+```
+
+Production must never be selected by default.
+
+If the target project is missing, unclear, or unsupported, the upload must stop.
+
+---
+
+## 9. Provider model for the current phase
+
+The current provider is:
 
 ```text
 conlog
 ```
 
-Current Conlog vending-provider document:
+The current Firestore collection family remains:
 
 ```text
-vending_providers/vpr_7f4d3c91a2b84e6f
+conlog_sales_atomic
+conlog_sales_monthly
+conlog_sales_monthly_lm
+conlog_sales_monthly_lm_groups
 ```
 
-Local build scripts must remain environment-neutral.
+These names remain active during TEST stabilisation.
 
-Upload scripts must require an explicit Firebase project, matching project confirmation and a service account whose `project_id` matches the requested project.
+Do not rename them during the current sprint.
 
-Production must never be selected by default.
+Do not place another vending provider's data into these collections during the current sprint.
 
-The provider-neutral redesign is deferred to a separate controlled Trials-readiness sprint.
+The future provider-neutral architecture is deferred until Trials Readiness.
+
+Possible future providers include Conlog, Landis+Gyr, and others.
+
+The provider-neutral redesign must be handled as a separate controlled architecture and migration sprint.
 
 ---
 
-## 8. Current source-data scope
+## 10. Deferred provider-neutral reset
+
+The long-term preferred architecture is expected to use generic sales collections with an explicit provider property.
+
+That refactor is not part of the current TEST stabilisation work.
+
+The provider-neutral reset is deferred until iREPS is stable and ready for `ireps-trials`.
+
+The future reset is expected to include:
+
+1. Codex full codebase inventory.
+2. Search for every sales-related collection, field, API, rule, index, report, and UI reference.
+3. Final provider-neutral schema.
+4. Cadastral corrections.
+5. Sales pipeline corrections.
+6. Firestore rule and index corrections.
+7. Web and mobile query updates.
+8. Clean cadastral rebuild.
+9. Clean sales rebuild.
+10. Clean Meter Master rebuild.
+11. Clean Sales All Meters rebuild.
+12. Fresh loading of DEV and TEST.
+13. Creation of Trials from the corrected architecture.
+14. Creation of Production from the approved Trials architecture.
+
+The future reset is intended to be a clean reload, not an uncontrolled mixed backfill.
+
+Until that sprint is formally opened, continue using `conlog_sales_xxx`.
+
+---
+
+## 11. Current source-data scope
 
 Current LM / workbase:
 
@@ -235,14 +345,7 @@ Lesedi
 ZA7423
 ```
 
-Current approved period:
-
-```text
-2025-09 through 2026-06
-10 continuous months
-```
-
-Source layers:
+The current Conlog source-data path has two separate pre-Atomic layers:
 
 ```text
 RAW provider download
@@ -252,24 +355,42 @@ RAW STAGING
 input/conlog_sales
 ```
 
-Current reference files:
+`input/raw-sales` contains the original CSV files downloaded from the Conlog sales portal. These files are source evidence and must remain unchanged.
+
+`input/conlog_sales` contains generated, standardised Conlog raw-staging files. It is not the Atomic layer.
+
+Current raw-staging coverage is:
+
+```text
+2025-09 through 2026-06
+```
+
+Current original portal downloads under `input/raw-sales` include April, May, and June 2026.
+
+Current reference files are:
 
 ```text
 input/reference/Customer_Details.csv
 input/reference/90_Days_No_Purchase_Report.csv
 ```
 
-RAW source files are evidence and must remain unchanged.
-
-RAW STAGING is generated provider-specific input. It is not Atomic Sales and must not be uploaded to Firestore.
-
-All municipal source CSVs and generated operational CSVs must remain excluded from Git.
+All source CSV files are operational data and must not be committed to Git.
 
 ---
 
-## 9. Completed `ireps-test` baseline
+## 12. Current generated-data and Firestore status
 
-The Lesedi Conlog baseline was completed and verified for September 2025 through June 2026.
+The Lesedi Conlog baseline for `ireps-test` is complete for:
+
+```text
+LM / workbase: ZA7423
+Provider:      conlog
+Period:        2025-09 through 2026-06
+Months:        10 continuous months
+Completed:     2026-07-14
+```
+
+### 12.1 Verified collection counts
 
 ```text
 conlog_sales_atomic             822,527 documents
@@ -280,121 +401,179 @@ meter_master                     35,295 documents
 sales-all-meters                 35,295 documents
 ```
 
-All required month sequences are complete.
-
-Atomic, Monthly Meter, Monthly LM and Monthly LM Group totals reconcile for the same source period.
-
-The mandatory dependency and upload order was followed:
+### 12.2 Meter Master baseline
 
 ```text
-Atomic Sales
-    -> Monthly Sales collections
-    -> Meter Master
-    -> Sales All Meters
+Monthly-backed meters:            19,904
+Customer-only seeded meters:       3,987
+NPR-only seeded meters:           11,404
+Total rows/documents:             35,295
+CSV SHA-256: 44a604c0ca06e0f4bb624be69ad20155d07fbb6c903d911d4d19fa3fe084108d
 ```
+
+Approved duplicate outcomes:
+
+```text
+Customer placeholder duplicates:    124
+Customer Active-status duplicates:    10
+Customer latest-purchase duplicates:   1
+NPR placeholder duplicates:           13
+NPR latest-purchase duplicates:         0
+```
+
+### 12.3 Sales All Meters baseline
+
+```text
+Meters with sales:                19,904
+Meters without sales:             15,391
+Total rows/documents:             35,295
+Total amount cents:        9,728,029,408
+CSV SHA-256: 139e1775ed4404696077ccf5df4355288eabcb0357fbb7ddeebe578d69179087
+```
+
+All current Sales All Meters records are `INVISIBLE` because the approved staging Meter Master CSV contained blank `astId` values. This is a derived staging result, not proof that no corresponding operational AST exists anywhere in iREPS.
+
+Earlier Meter Master or Sales All Meters files ending at February 2026 are historical and are not the approved TEST baseline.
 
 ---
 
-## 10. Pipeline architecture and operating grain
+## 13. Pipeline dependency and execution order
 
-The approved build dependency is:
+The mandatory data dependency is:
 
 ```text
-Original Conlog portal CSV
-    -> Stage 00 RAW preparation
-    -> Conlog RAW STAGING
-    -> Stage 01 Atomic preparation
+RAW provider download
+    -> RAW STAGING
     -> Atomic Sales
-    -> Stage 03 Monthly aggregation
     -> Monthly Sales
-    -> Stage 05 Meter Master build
     -> Meter Master
-    -> Stage 06 Sales All Meters build
     -> Sales All Meters
 ```
 
-The stages do not all use the same operating grain.
+### 13.1 Stage operating grains
 
-### 10.1 Stages 00 to 04
-
-Stages 00 to 04 operate at:
+Stages 00 to 04 operate at one LM and one month per execution:
 
 ```text
-one LM + one month per execution
+00_prepare_conlog_raw_sales.py
+01_prepare_conlog_sales.py
+02_upload_conlog_atomic_v2.py
+03_aggregate_monthly_from_atomic_outputs.py
+04_upload_conlog_monthly_v3.py
 ```
 
-Applicable scripts must require explicit `--lm-pcode` and `--month` arguments.
+Historical Atomic and Monthly loads repeat those monthly commands chronologically.
 
-### 10.2 Stages 05 and 06
-
-Stages 05 and 06 are controlled full-range downstream builders.
-
-They operate at:
+Stages 05 and 06 are controlled downstream full-period builders. They require one LM plus an explicit continuous `--from-month` and `--to-month` range:
 
 ```text
-one LM + one explicit continuous from-month/to-month range
+05_build_meter_master_v3.py
+06_build_sales_all_meters.py
 ```
 
-They must:
+They must dynamically discover and validate every required monthly meter-level file inside that explicit range. They must not contain a fixed historical month list.
 
-- require an explicit LM;
-- require an explicit first and last month;
-- discover only valid monthly files inside the requested range;
-- reject duplicate months;
-- stop on a missing internal month;
-- sort months chronologically;
-- print the discovered range;
-- include the range in the output filename;
-- remain environment-neutral;
-- never connect to Firebase.
+Stages 07 and 08 upload one frozen approved full-period CSV to one explicitly selected Firebase project:
 
-The completed range is:
+```text
+07_upload_meter_master_v3.py
+08_upload_sales_all_meters.py
+```
+
+### 13.2 Firestore upload order
+
+```text
+1. conlog_sales_atomic
+2. conlog_sales_monthly, conlog_sales_monthly_lm, conlog_sales_monthly_lm_groups
+3. meter_master
+4. sales-all-meters
+```
+
+A downstream build or upload is blocked until every required upstream month is complete, reconciled and verified.
+
+### 13.3 Environment contract
+
+Local builders remain environment-neutral. Every uploader requires explicit project ID, matching project confirmation and a service account whose `project_id` matches the selected project.
+
+### 13.4 Architecture diagram
+
+The editable architecture diagram remains:
+
+```text
+docs/architecture/SALES_PIPELINE_FLOW.drawio
+```
+
+The diagram is explanatory. This rules file remains the operating authority.
+
+---
+
+## 14. Monthly progression and downstream rebuild rule
+
+New provider sales data is introduced month by month through Stages 00 to 04 without changing Python code.
+
+For each new month:
+
+1. prepare RAW STAGING for one LM/month;
+2. build and upload Atomic Sales for that LM/month;
+3. build and upload the three Monthly Sales datasets for that LM/month;
+4. confirm reconciliation and upload verification.
+
+After the approved monthly source range changes, Meter Master and Sales All Meters are rebuilt from one explicit continuous range. Their builders dynamically discover every month in that range.
+
+The current approved historical baseline is:
 
 ```text
 2025-09 through 2026-06
 ```
 
-### 10.3 Stages 07 and 08
-
-Stages 07 and 08 upload one approved frozen full-period CSV to one explicit Firebase project.
-
-They operate at:
-
-```text
-one Firebase project + one approved full-period CSV per execution
-```
-
-They do not silently rebuild data and do not select a Firebase environment by default.
-
-### 10.4 Prohibited simplification
-
-Do not reinstate the incorrect rule that every Stage 00 to Stage 08 script must run one month at a time.
-
-The proven approved model is:
-
-```text
-Stages 00-04: monthly
-Stages 05-06: explicit continuous range build
-Stages 07-08: frozen full-period upload
-```
+A future July 2026 refresh will first process July through Stages 00 to 04, then create a new governed downstream range ending at 2026-07. Replacing established downstream Firestore collections requires a separate reviewed refresh or migration plan; `resume` is not a general update mode.
 
 ---
 
-## 11. Raw and Atomic Sales rules
+## 15. Raw, raw-staging, and Atomic Sales rule
 
-### 11.1 RAW provider download
+### 15.1 RAW provider-download layer
 
-Approved filename contract:
+The RAW layer is the original CSV downloaded from the vending provider portal.
+
+For the current Conlog process, RAW files belong only in:
+
+```text
+input/raw-sales
+```
+
+RAW files must:
+
+- preserve the original provider CSV contents unchanged as source evidence;
+- never be manually converted into Atomic files;
+- never be overwritten by Stage 00;
+- remain excluded from Git.
+
+For controlled local identity, the downloaded Conlog CSV may be renamed without opening, editing, re-saving, or changing its contents. The approved RAW filename contract is:
 
 ```text
 conlog_raw_sales__<lmPcode>__YYYY-MM.csv
 ```
 
-A local rename may standardise the filename, but it must not change CSV content, encoding, delimiter, quoting or line endings.
+The local rename is filename governance only. It must not alter any CSV header, row, value, encoding, delimiter, quoting, line ending, or other source content.
 
-### 11.2 RAW STAGING
+The normal monthly operator responsibility is limited to:
 
-Approved Conlog RAW STAGING columns:
+1. downloading the original provider CSV;
+2. renaming it to the approved RAW filename contract where required; and
+3. placing it in `input/raw-sales` without modifying the CSV contents.
+
+### 15.2 RAW STAGING layer
+
+RAW STAGING is the standardised, provider-specific input produced from the original RAW provider download.
+
+For Conlog, RAW STAGING belongs only in:
+
+```text
+input/conlog_sales
+```
+
+The approved Conlog raw-staging schema is exactly:
 
 ```text
 lmPcode
@@ -405,149 +584,452 @@ costC
 vatC
 ```
 
-In RAW STAGING only, the historical `*C` column names contain validated decimal-rand source values.
+RAW STAGING is not Atomic Sales and must not be uploaded to Firestore.
 
-Stage 01 is the single approved conversion boundary from decimal rand to integer cents.
-
-### 11.3 Atomic Sales
-
-Atomic Sales is the transaction-level source of truth.
-
-Approved target:
+The approved Stage 00 script is:
 
 ```text
-conlog_sales_atomic/{atomicId}
+scripts/00_prepare_conlog_raw_sales.py
 ```
 
-Atomic data preserves provider, LM, meter, transaction time, source file, source row and ingestion lineage.
+Its sole transformation responsibility is:
 
-From Atomic onward, every `*C` value is integer cents.
+```text
+input/raw-sales
+    -> input/conlog_sales
+```
 
-Normal upload mode is `create-only`.
+Stage 00 must create the approved filename pattern:
 
-`resume` is restricted to verified recovery from a partial upload of the same approved monthly CSV.
+```text
+conlog_prepaid_sales__<lmPcode>__YYYY-MM.csv
+```
 
-Create operations are required. Merge, update, overwrite and silent conflict skipping are prohibited.
+#### 15.2.1 Stage 00 monthly execution contract
+
+Stage 00 must run one LM and one month at a time. One execution selects exactly one source file.
+
+The approved validation command is:
+
+```powershell
+python .\scripts\00_prepare_conlog_raw_sales.py `
+  --lm-pcode ZA7423 `
+  --month 2026-04 `
+  --preflight-only
+```
+
+The approved write command is:
+
+```powershell
+python .\scripts\00_prepare_conlog_raw_sales.py `
+  --lm-pcode ZA7423 `
+  --month 2026-04
+```
+
+For the requested LM and month, Stage 00 must require exactly:
+
+```text
+input/raw-sales/conlog_raw_sales__<lmPcode>__YYYY-MM.csv
+```
+
+and must plan or create exactly:
+
+```text
+input/conlog_sales/conlog_prepaid_sales__<lmPcode>__YYYY-MM.csv
+```
+
+The `--lm-pcode` and `--month` arguments are mandatory. The filename LM and month, the requested LM and month, and every valid transaction month must agree.
+
+#### 15.2.2 Stage 00 validation and safety contract
+
+Stage 00 must:
+
+- resolve all paths from the repository root;
+- stop if the exact monthly RAW source file is missing;
+- stop if the RAW filename does not match the approved identity contract;
+- stop if required Conlog portal columns are missing;
+- validate dates, month membership, meter numbers, meter-column consistency, monetary values, refunds, and amount/cost/VAT reconciliation;
+- preserve all valid rows, including duplicate six-field staging rows;
+- report duplicate six-field staging rows as preserved, not as confirmed duplicate portal transactions;
+- write a rejected-row report when any rows fail validation;
+- write no RAW STAGING output when any rejected rows exist;
+- write no RAW STAGING output in `--preflight-only` mode;
+- leave an identical existing RAW STAGING output unchanged;
+- block replacement of a different existing output unless `--replace-existing` is deliberately supplied after review;
+- write through a temporary file and verify the planned SHA-256 before finalising the output;
+- never edit, rename, move, delete, or overwrite the RAW source file; and
+- never connect to Firebase or upload data.
+
+`--replace-existing` is an exceptional controlled recovery or correction option. It is not part of the normal monthly command.
+
+#### 15.2.3 Stage 00 traceability and logs
+
+Every Stage 00 run must report at least:
+
+```text
+RAW filename
+LM and month
+rows read
+rows prepared
+rows rejected
+unique meter count
+duplicate six-field staging rows preserved
+amount, cost, and VAT totals
+RAW SHA-256
+planned or written output SHA-256
+planned or written output path
+```
+
+Every successful write run must create a timestamped summary under:
+
+```text
+output/logs/stage00_prep_summary__<UTC timestamp>.csv
+```
+
+When rejected rows exist, Stage 00 must create a timestamped rejected-row report under `output/logs` and terminate without writing RAW STAGING.
+
+The operator, developer, or AI agent must not manually prepare or edit files under `input/conlog_sales` as a normal operating step. Corrections must be made through the Stage 00 mapping, validation, rejection, and rerun process.
+
+Stage 00 must preserve source traceability, validate the source month and LM, preserve meter numbers as strings, standardise the approved six fields, report rejected rows, and stop on an ambiguous or unsafe source structure.
+
+### 15.3 Atomic Sales layer
+
+An Atomic Sales record represents one normalised source sales transaction.
+
+The Atomic layer is the transaction-level source of truth for downstream monthly aggregation.
+
+The approved Stage 01 script is:
+
+```text
+scripts/01_prepare_conlog_sales.py
+```
+
+Its sole transformation responsibility is:
+
+```text
+input/conlog_sales
+    -> output/atomic
+```
+
+Files under `output/atomic` are upload-ready Atomic CSVs. They are not considered uploaded until the approved Atomic uploader writes them to `conlog_sales_atomic` and the upload is verified.
+
+Atomic processing must preserve enough source lineage to support reconciliation, including where available:
+
+- vending-provider identity;
+- LM pCode;
+- meter number;
+- transaction or source identifier;
+- transaction date and time;
+- amount;
+- raw-staging source filename;
+- source row or trace reference;
+- ingestion or preparation context.
+
+Atomic files must not be manually edited after successful generation except through an agreed correction and rerun process.
 
 ---
 
-## 12. Monthly Sales rules
+## 16. Monthly-sales rule
 
-Monthly outputs are derived only from approved Atomic outputs.
+Monthly outputs must be derived only from approved Atomic outputs.
 
-The three monthly grains are:
+The monthly layer must not independently reinterpret RAW or RAW STAGING files after the Atomic layer is approved.
+
+The current TEST collection family remains:
 
 ```text
 conlog_sales_monthly
-    one meter + one LM + one month
-
 conlog_sales_monthly_lm
-    one LM + one month
-
 conlog_sales_monthly_lm_groups
-    one LM + one month + one sales group
 ```
 
-Document identities:
+The corresponding local datasets are:
+
+```text
+output/monthly
+output/monthly_lm
+output/monthly_lm_groups
+```
+
+The Firestore document identities are:
 
 ```text
 conlog_sales_monthly/{lmPcode}__{normalizedMeterNo}__{ym}
+
 conlog_sales_monthly_lm/{lmPcode}__{ym}
+
 conlog_sales_monthly_lm_groups/{lmPcode}__{ym}__{salesGroupId}
 ```
 
-Sales groups:
+The exact Firestore document fields are governed by the applicable canonical schema documents under:
 
 ```text
-GR1  below R100.00
-GR2  R100.00 to R299.99
-GR3  R300.00 to R499.99
-GR4  R500.00 to R999.99
-GR5  R1,000.00 and above
+C:\dev\ireps-schemas
 ```
+
+Pipeline scripts must not add metadata, provider, source, status, visibility, or other fields that are absent from the approved monthly schemas.
+
+### 16.1 Stage 03 build contract
+
+The approved builder is:
+
+```text
+scripts/03_aggregate_monthly_from_atomic_outputs.py
+```
+
+Stage 03 must:
+
+- resolve all paths from `PROJECT_ROOT`;
+- remain environment-neutral and never connect to Firebase;
+- require explicit `--lm-pcode` and `--month` arguments;
+- process exactly one LM and one month per execution;
+- select exactly one valid Atomic CSV for that LM/month;
+- validate the exact Atomic CSV schema and governed Atomic identities;
+- use the common meter-number normalisation rule without a fixed length restriction;
+- stop on duplicate Atomic identities in the selected Atomic file;
+- build exactly one meter-month file, one LM-month file, and one LM-month-group file for the selected month;
+- reconcile transaction count, meter count, amount, cost, VAT, and first/last transaction times across all four selected-month layers;
+- protect different existing outputs for the selected month unless `--replace-existing` is deliberately supplied;
+- leave outputs for every other month untouched;
+- write through temporary files and verify SHA-256;
+- create one month-specific JSON Stage 03 build report and manifest;
+- never accept `--from-month` or `--to-month`;
+- never build combined `ALL` files as part of the normal monthly execution.
+
+Stage 03 preflight must perform all validation and reconciliation without writing monthly CSV outputs.
+
+A successful write run must record:
+
+```text
+result = BUILD_WRITTEN
+status = PASS
+```
+
+The Stage 03 manifest is the only approved Stage 04 input selector. Stage 04 must not upload files merely because they exist in an output folder.
+
+### 16.2 Stage 04 upload contract
+
+The approved uploader is:
+
+```text
+scripts/04_upload_conlog_monthly_v3.py
+```
+
+Stage 04 operates at this grain:
+
+```text
+one Firebase project + one LM + one month per execution
+```
+
+Stage 04 must consume a Stage 03 manifest for exactly the same one LM/month. It must not consume a multi-month manifest or upload a date range in one execution.
+
+Stage 04 must:
+
+- require explicit `--project-id`;
+- require matching `--confirm-project`;
+- require an explicit service-account path;
+- verify the service-account `project_id` before Firebase starts;
+- require a successful Stage 03 `BUILD_WRITTEN` manifest;
+- select exactly the three requested monthly CSVs from that manifest;
+- verify every CSV SHA-256;
+- validate exact CSV schemas, deterministic document IDs, field values, and cross-dataset reconciliation;
+- verify the governed Conlog vending-provider document exists and is active;
+- preflight all three Firestore collection scopes before any write begins;
+- use `create-only` as the normal mode;
+- support `resume` only for verified recovery from a partial upload of the same Stage 03 outputs;
+- use Firestore create operations only;
+- never use `merge=True`;
+- never silently update, overwrite, delete, or skip a conflicting document;
+- verify final counts and deterministic sample documents;
+- create a JSON audit report for every preflight and execute attempt.
+
+In `create-only` mode, all three target LM/month scopes must be empty.
+
+In `resume` mode:
+
+- every existing expected document must exactly match the CSV;
+- missing expected documents may be created;
+- conflicting documents block the run;
+- unexpected extra documents block the run.
+
+A broad merged write is prohibited:
+
+```python
+batch.set(document_ref, document, merge=True)
+```
+
+The approved normal write is a Firestore create operation:
+
+```python
+batch.create(document_ref, document)
+```
+
+### 16.3 Monthly reconciliation rule
 
 For each LM/month:
 
 ```text
-Atomic totals
-    = sum of Monthly Meter totals
-    = Monthly LM total
-    = sum of Monthly LM Group totals
+Atomic
+    =
+sum of conlog_sales_monthly
+    =
+conlog_sales_monthly_lm
+    =
+sum of conlog_sales_monthly_lm_groups
 ```
 
-Reconciliation includes purchases, meters, amount, cost, VAT, first purchase time and last purchase time.
-
-Stage 04 v3 consumes a successful Stage 03 manifest, validates all three datasets before writing, uses create operations and verifies final counts and deterministic samples.
-
----
-
-## 13. Meter-number normalisation
-
-The same meter-number normalisation rule applies across every sales and meter layer.
-
-Rules:
-
-- cast to string;
-- trim leading and trailing whitespace;
-- remove embedded whitespace;
-- uppercase letters;
-- preserve leading zeroes;
-- preserve meaningful letters;
-- reject blank or invalid identities;
-- do not impose a fixed meter-number length.
-
-A meter number must never be treated as a numeric value where leading zeroes can be lost.
-
----
-
-## 14. Monetary-value rule
-
-From Atomic onward:
+The following values must reconcile:
 
 ```text
-fields ending in C = integer cents
+purchasesCount
+metersCount
+amountTotalC
+costC
+vatC
+firstPurchaseAtMs
+lastPurchaseAtMs
 ```
 
-Required equation:
+The monetary equation must hold at every layer:
 
 ```text
 amountTotalC = costC + vatC
 ```
 
-Aggregations must use integer arithmetic wherever possible.
-
-No downstream stage may reinterpret Atomic cent values as rand values or convert them a second time.
+Historical combined `ALL` files are not authoritative routine outputs. Stage 03 must not create or require them during normal monthly execution, and downstream stages must not depend on them.
 
 ---
 
-## 15. Meter Master rule
+## 17. Meter-number normalisation
+
+The same meter-number normalisation rule must be used across raw sales preparation, atomic data, monthly data, Meter Master, Sales All Meters, backend lookup, meter discovery integration, and later provider adapters.
+
+Current expected rules include:
+
+- cast to string;
+- trim leading and trailing whitespace;
+- remove embedded whitespace;
+- convert letters to uppercase;
+- preserve leading zeroes;
+- do not remove meaningful letters;
+- return an empty value for missing or invalid blank input.
+
+There is no universal fixed meter-number length rule.
+
+A meter number must not be padded, truncated, rejected, or rewritten merely to force 11 characters.
+
+Meter numbers must never be treated as numeric values where leading zeroes can be lost.
+
+---
+
+## 18. Monetary-value rule
+
+Sales amounts must use a clear and consistent unit.
+
+From the Atomic Sales layer onward, fields ending in `C` represent integer cents.
+
+Examples:
+
+```text
+amountTotalC
+totalAmountC
+amount_2026_06_C
+```
+
+### 18.1 Controlled Conlog RAW STAGING exception
+
+The current Conlog RAW STAGING schema contains three historical column names:
+
+```text
+amountTotalC
+costC
+vatC
+```
+
+In `input/conlog_sales` only, these three fields contain the provider's validated decimal rand source values, for example `100.00`, `86.96`, and `13.04`. Their historical `C` suffix does not mean that the RAW STAGING text is already expressed as integer cents.
+
+Stage 00 parses these values into cents internally for validation and reconciliation, but writes the approved decimal rand source representation to RAW STAGING.
+
+Stage 01 is the controlled conversion boundary. It must convert the RAW STAGING decimal rand values exactly once into integer cents for Atomic Sales, for example:
+
+```text
+100.00 -> 10000
+86.96  -> 8696
+13.04  -> 1304
+```
+
+From `output/atomic` onward, every approved `*C` field must contain integer cents. No downstream stage may reinterpret Atomic cent values as rand values or convert them a second time.
+
+Do not mix rand values and cent values within the same governed layer.
+
+Conversion must happen once at the Stage 01 boundary and must be validated.
+
+Aggregations must use integer-cent arithmetic wherever possible.
+
+---
+
+## 19. Meter Master rule
 
 `meter_master` is the thin identity and cross-reference bridge between the sales-side meter universe and iREPS operational meter identity.
 
-It is not a transaction-history, premise, ERF, TRN, status, visibility or service-provider collection.
+It is not a transaction-history, premise, ERF, TRN, status, or service-provider collection.
 
-### 15.1 Approved scripts
+### 19.1 Approved scripts
+
+The approved Meter Master staging builder is:
 
 ```text
 scripts/05_build_meter_master_v3.py
+```
+
+The approved reusable Firestore uploader is:
+
+```text
 scripts/07_upload_meter_master_v3.py
 ```
 
-### 15.2 Builder inputs
+`scripts/07_upload_meter_master_v2.py` is historical. It is not approved for TEST, Trials, or Production because it contains hard-coded environment and input-file configuration.
+
+The existing `scripts/05_build_meter_master_v3.py` is the approved builder and must not be recreated or renamed.
+
+### 19.2 Builder input and full-period range rule
+
+The normal Stage 05 operating grain is:
+
+```text
+one LM + one explicit continuous from-month/to-month range per execution
+```
+
+Stage 05 must require:
+
+```text
+--lm-pcode
+--from-month
+--to-month
+```
+
+For the selected LM and continuous range, Stage 05 must dynamically discover and validate exactly one approved monthly meter-level file for every required month:
 
 ```text
 output/monthly/monthly__<scope>__YYYY-MM__from_atomic.csv
+```
+
+The builder must not contain a fixed historical month list. It must stop when a required month is missing, duplicated, outside the requested range, or otherwise invalid.
+
+The builder may also use the approved reference files:
+
+```text
 input/reference/Customer_Details.csv
 input/reference/90_Days_No_Purchase_Report.csv
 ```
 
-The builder uses the complete explicit continuous monthly range.
+The builder does not read raw Conlog source files directly. Every included Conlog month must first pass through the approved preparation, Atomic, monthly aggregation, upload, and verification stages.
 
-It does not read RAW or RAW STAGING sales files directly.
+One successful Stage 05 execution produces one complete Meter Master staging CSV for the explicit approved range. The output must record the LM, from-month, to-month, included months, row counts, reconciliation results, and SHA-256 fingerprint.
 
-### 15.3 Approved staging CSV
+### 19.3 Approved staging CSV schema
 
-The staging CSV has exactly ten columns in this order:
+The output from `05_build_meter_master_v3.py` is a flat staging CSV with exactly these columns:
 
 ```text
 masterId
@@ -562,7 +1044,15 @@ salesProvider
 astId
 ```
 
-Identity rules:
+The normalized meter number is the merge key across monthly sales, Customer Details, and the 90 Days No Purchase report.
+
+The current provider value is:
+
+```text
+conlog
+```
+
+The builder must apply these identity rules:
 
 ```text
 masterId = meterNoNormalized
@@ -570,9 +1060,13 @@ salesId = meterNoNormalized
 salesProvider = conlog
 ```
 
-### 15.4 Governed duplicate-resolution rules
+Customer Details may populate or improve `meterNoRaw`, `customerNo`, and `accountNo`.
 
-Customer Details duplicate resolution may use only:
+The 90 Days No Purchase report may add meters that are absent from the other inputs and may populate `customerNo` only when a stronger customer value is not already present.
+
+### 19.3.1 Governed duplicate-resolution rule
+
+The Meter Master builder may use only these Customer Details fields when resolving duplicate meter identities:
 
 ```text
 MeterNumber
@@ -582,51 +1076,41 @@ AccountStatus
 LastPurchaseDate
 ```
 
-Customer name, ERF, ERF description, physical address and postal address must not decide customer/account identity.
+Customer name, ERF, physical address, postal address and other premise information are not duplicate-resolution inputs.
 
-Approved Customer Details rules:
+For Customer Details duplicates:
 
-1. `CustomerNo = AccountNo = MeterNumber` is a weak placeholder.
-2. Prefer the normal dominant pattern `CustomerNo = AccountNo` and `CustomerNo != MeterNumber` over the placeholder.
-3. An Active row may resolve the approved compatible Active versus Block Purchases pattern.
-4. Competing approved real identities may use the latest valid `LastPurchaseDate`.
-5. Tied, missing or still-conflicting identities stop the build.
+1. `CustomerNo = AccountNo = MeterNumber` is a weak placeholder;
+2. `CustomerNo = AccountNo` with a value different from `MeterNumber` is the dominant normal pattern and may replace the placeholder;
+3. a controlled Active-status rule may select an otherwise supportable `Active` row over a `Block Purchases` row;
+4. remaining competing non-placeholder identities may be resolved only by the latest valid `LastPurchaseDate`;
+5. tied dates, missing dates or remaining conflicts stop the build.
 
-Approved 90 Days No Purchase rules:
+For 90 Days No Purchase duplicates, a customer number equal to the meter identifier is a weak placeholder. A different non-empty customer number may replace it. Remaining competing non-placeholder customer numbers may be resolved only by the latest valid purchase date; unresolved conflicts stop the build.
 
-1. `CustomerNo1 = MeterIdentifier` is a weak placeholder.
-2. Prefer a non-empty `CustomerNo1` that differs from `MeterIdentifier`.
-3. Competing real customer numbers may use the latest valid `LastPurchaseDate`.
-4. Tied, missing or unresolved identities stop the build.
+The builder must report the count resolved by each approved rule.
+### 19.4 Firestore document identity
 
-The completed build reported:
+The uploader writes to:
 
 ```text
-Customer placeholder duplicates resolved:     124
-Customer Active-status duplicates resolved:    10
-Customer latest-purchase duplicates resolved:   1
-NPR placeholder duplicates resolved:            13
-NPR latest-purchase duplicates resolved:          0
+meter_master/{masterId}
 ```
 
-### 15.5 Firestore identity
+Because `masterId` equals `meterNoNormalized`, the Firestore document ID is the normalized meter number.
 
-```text
-meter_master/{normalizedMeterNo}
-```
+This deterministic document-ID design must not be changed casually because AST links, direct lookups, duplicate prevention, rebuilds, and other application logic may depend on it.
 
-The Firestore document ID equals `meterNo.normalized`.
+### 19.5 Approved Firestore schema and missing-data rule
 
-Random IDs, suffix IDs and unofficial composite IDs are prohibited.
-
-### 15.6 Locked Firestore shape
+Every Meter Master document created by any writer—including the Sales Pipeline, Meter Discovery, Meter Installation, migration utilities, repair utilities, and backend services—must use exactly this canonical shape:
 
 ```json
 {
   "lmPcode": "ZA7423",
   "meterNo": {
-    "raw": "04085348348",
-    "normalized": "04085348348"
+    "raw": "04085345850",
+    "normalized": "04085345850"
   },
   "meterType": "electricity",
   "customerNo": "",
@@ -636,8 +1120,8 @@ Random IDs, suffix IDs and unofficial composite IDs are prohibited.
       "id": ""
     },
     "sales": {
-      "id": "04085348348",
-      "provider": "conlog"
+      "id": "",
+      "provider": ""
     }
   },
   "metadata": {
@@ -651,7 +1135,36 @@ Random IDs, suffix IDs and unofficial composite IDs are prohibited.
 }
 ```
 
-Canonical root fields are only:
+The Firestore document identity is:
+
+```text
+meter_master/{meterNo.normalized}
+```
+
+The document ID must exactly equal `meterNo.normalized`.
+
+Canonical string fields must not use `null`. Where approved source data is not available:
+
+```text
+customerNo          = ""
+accountNo           = ""
+refs.asts.id        = ""
+refs.sales.id       = ""
+refs.sales.provider = ""
+```
+
+The following creation fields are mandatory and must not be blank:
+
+```text
+lmPcode
+meterNo.raw
+meterNo.normalized
+meterType
+```
+
+Every writer must use the common meter-number normalisation rule in Section 17 before constructing the document ID or `meterNo.normalized`.
+
+The canonical root contains only:
 
 ```text
 lmPcode
@@ -663,23 +1176,50 @@ refs
 metadata
 ```
 
-Prohibited fields include:
+The canonical nested reference paths are only:
+
+```text
+refs.asts.id
+refs.sales.id
+refs.sales.provider
+```
+
+These fields are prohibited in Meter Master:
 
 ```text
 id
+createdBySource
+updatedBySource
+metadata.createdBySource
+metadata.updatedBySource
 parents
 refs.premise
 refs.trns
 status
 serviceProvider
 visibility
-createdBySource
-updatedBySource
 ```
 
-### 15.7 Metadata constitution
+No writer may add a field that is absent from the authoritative Meter Master schema.
 
-`metadata` contains exactly six fields:
+The Stage 05 staging-to-Firestore mapping is:
+
+```text
+lmPcode             -> lmPcode
+meterNoRaw          -> meterNo.raw
+meterNoNormalized   -> meterNo.normalized
+meterType           -> meterType
+customerNo          -> customerNo
+accountNo           -> accountNo
+astId               -> refs.asts.id
+salesId             -> refs.sales.id
+salesProvider       -> refs.sales.provider
+masterId            -> Firestore document ID
+```
+
+### 19.6 Metadata rule
+
+`metadata` is mandatory on every Meter Master document and must contain exactly these six fields:
 
 ```text
 createdAt
@@ -690,81 +1230,262 @@ updatedByUid
 updatedByUser
 ```
 
-Timestamps are native Firestore Timestamp values.
+`createdBySource`, `updatedBySource`, and any additional metadata fields are prohibited.
 
-Do not place source-provenance fields at the root or inside metadata in the current locked Meter Master schema.
+`createdAt` and `updatedAt` must be Firestore Timestamp values. ISO strings are not permitted in these fields.
 
-### 15.8 Upload safety
+On first creation, the writer sets both the `created*` and `updated*` fields.
 
-Normal mode is:
-
-```text
-create-only
-```
-
-The initial target collection must be empty.
-
-Controlled `resume` may create missing documents and skip exact matches from the same frozen CSV, but it must stop on conflicts or unexpected documents.
-
-Broad `merge=True` writes are prohibited.
-
-A blank staging `astId` must never erase an existing populated `refs.asts.id`.
-
-### 15.9 Completed Meter Master baseline
+On every ordinary update:
 
 ```text
-Monthly-backed meters:       19,904
-Customer-only seeded meters:  3,987
-NPR-only seeded meters:      11,404
-Total rows/documents:        35,295
-Validation:                  PASS
+metadata.createdAt
+metadata.createdByUid
+metadata.createdByUser
 ```
 
-Approved CSV:
+must remain unchanged, and only these metadata paths may be refreshed:
 
 ```text
-output/meter_master/meter_master__ZA7423__FULL__2025-09_to_2026-06.csv
+metadata.updatedAt
+metadata.updatedByUid
+metadata.updatedByUser
 ```
 
-Upload report:
+The Sales Pipeline system actor is:
 
 ```text
-output/meter_master/upload-reports/
-meter_master_upload__ireps-test__20260714T200849Z.json
+createdByUid / updatedByUid   = SYSTEM
+createdByUser / updatedByUser = METER MASTER PIPELINE
 ```
 
-The governed duplicate fix was committed as:
+Meter Discovery, Meter Installation, and other backend workflows must use the authenticated or otherwise approved workflow actor while keeping the same exact six-field metadata constitution.
+
+### 19.7 Cross-writer creation, ownership, and update rule
+
+The first approved writer that creates a missing Meter Master document must create the complete canonical document. A partial, legacy, flat, or workflow-specific creation shape is prohibited.
+
+The shared canonical identity fields are:
 
 ```text
-82060dc fix: resolve meter master duplicate customer records
+lmPcode
+meterNo.raw
+meterNo.normalized
+meterType
 ```
+
+The first writer creates them. Later writers must validate and preserve them. A conflicting non-empty value must stop the operation for reconciliation; it must not be silently overwritten.
+
+Meter Discovery and Meter Installation own:
+
+```text
+refs.asts.id
+```
+
+The Sales Pipeline owns:
+
+```text
+customerNo
+accountNo
+refs.sales.id
+refs.sales.provider
+```
+
+All writers may refresh only the three `metadata.updated*` fields during an approved update.
+
+For an existing Meter Master document, every writer must:
+
+- update only explicit approved dot paths;
+- preserve all fields owned by other workflows;
+- preserve all `metadata.created*` fields;
+- reject identity, LM, meter-type, or ownership conflicts;
+- remain idempotent for an already-applied identical result;
+- never replace the complete `meterNo`, `refs`, or `metadata` object;
+- never use a broad complete-document merge as a substitute for field ownership.
+
+Prohibited Meter Master write patterns include:
+
+```javascript
+set(documentRef, broadDocument, { merge: true })
+transaction.set(documentRef, broadDocument, { merge: true })
+```
+
+and:
+
+```python
+batch.set(document_ref, broad_document, merge=True)
+```
+
+A governed create may use a strict create operation after confirming that the deterministic document does not exist. A governed update must use explicit field-level paths.
+
+Meter Discovery and Meter Installation must use the exact Section 17 normalisation rule:
+
+```javascript
+String(value ?? "")
+  .replace(/\s+/g, "")
+  .trim()
+  .toUpperCase()
+```
+
+They must reject an empty normalized result, preserve leading zeroes, impose no fixed length, and create or update only the canonical Meter Master shape.
+
+### 19.8 Stage 05 build and Stage 07 upload operating rule
+
+Stage 05 operates at:
+
+```text
+one LM + one explicit continuous from-month/to-month range
+```
+
+It dynamically discovers and validates every monthly meter-level file in that range and produces one complete approved Meter Master CSV.
+
+Stage 07 operates at:
+
+```text
+one explicit Firebase project + one approved frozen full-period Meter Master CSV
+```
+
+The normal Stage 07 mode is `create-only` against an empty target collection.
+
+Stage 07 does not perform normal month-by-month enrichment and does not broadly merge into existing documents.
+
+If the target collection is already established, contains operational Meter Master documents, or requires preservation of project-specific field-workflow links, the upload must stop. Replacing, reconciling, or migrating an established collection requires a separate reviewed refresh or migration plan.
+
+### 19.9 Controlled resume rule
+
+`resume` may be used only to recover from a verified partial failure involving:
+
+```text
+the same Firebase project
+the same approved frozen full-period CSV
+the same CSV SHA-256 fingerprint
+the same planned document set
+```
+
+In `resume` mode:
+
+```text
+missing planned creation
+    -> create it
+
+existing exact matching planned result
+    -> skip it
+
+existing conflicting result
+    -> stop and report the conflict
+
+unexpected extra document
+    -> stop and report the conflict
+```
+
+`resume` is not a general update, refresh, migration, or enrichment mode. It must not introduce a different CSV, range, fingerprint, or changed business data.
+
+### 19.10 Reusable cross-project uploader rule
+
+The same approved frozen Meter Master CSV may be reused across explicitly approved Firebase projects.
+
+The uploader must not hard-code:
+
+```text
+Firebase project ID
+service-account path
+input CSV path
+```
+
+It must require explicit runtime values for:
+
+```text
+--project-id
+--confirm-project
+--service-account
+--input
+--mode
+```
+
+The value supplied through `--confirm-project` must exactly match `--project-id`.
+
+Before connecting to Firestore, the uploader must read the `project_id` inside the service-account JSON and verify that it exactly matches the requested target project.
+
+A mismatch must stop the upload before any Firestore write.
+
+The approved operating model is:
+
+```text
+Build one full-period CSV
+    -> validate and freeze it
+    -> upload that same approved CSV to each explicitly approved Firebase project
+```
+
+The CSV must not be manually changed between TEST, Trials, and Production uploads.
+
+The uploader must calculate and report the CSV SHA-256 fingerprint so that uploads to different projects can be proven to use the same source file.
+
+### 19.11 Validation and reporting rule
+
+Before upload, the uploader must verify:
+
+- the exact ten-column staging schema and column order;
+- non-empty `masterId`;
+- unique `masterId`;
+- `masterId = meterNoNormalized`;
+- `salesId = meterNoNormalized`;
+- the explicit approved full-period range represented by the input;
+- valid project confirmation;
+- service-account project match;
+- approved upload mode;
+- target collection state appropriate to that mode.
+
+The uploader must display a preflight summary containing at least:
+
+```text
+target project
+target collection
+input CSV
+from-month
+to-month
+included months
+row count
+unique master ID count
+LM pCode values
+provider values
+CSV SHA-256
+upload mode
+```
+
+Every run must produce a JSON report under:
+
+```text
+output/logs/meter_master
+```
+
+The report must record the project, collection, input file, fingerprint, approved range, mode, counts, result, and any conflict or failure.
+
+No Meter Master upload is complete until the resulting Firestore document count and a sample of document shapes have been verified.
+
+The identity design must be reviewed before multi-LM or multi-provider Production rollout.
 
 ---
 
-## 16. Sales All Meters rule
+## 20. Sales All Meters rule
 
-`sales-all-meters` is the governed supporting sales-awareness projection for every approved Meter Master identity, including meters with no sales in the selected period.
-
-It is not the Atomic source of truth.
-
-### 16.1 Approved scripts
+The Firestore collection is:
 
 ```text
-scripts/06_build_sales_all_meters.py
-scripts/08_upload_sales_all_meters.py
+sales-all-meters
 ```
 
-### 16.2 Build inputs
+Sales All Meters is the governed supporting sales-awareness projection for every approved Meter Master identity, including meters with no sales.
+
+### 20.1 Approved scripts and inputs
 
 ```text
-approved Meter Master CSV
-+
-valid monthly meter-level sales CSVs
+Builder:  scripts/06_build_sales_all_meters.py
+Uploader: scripts/08_upload_sales_all_meters.py
 ```
 
-The build starts from Meter Master so that zero-sales meters remain represented.
+The builder combines one approved Meter Master CSV with every valid monthly meter-level file in an explicit continuous `--from-month` to `--to-month` range.
 
-### 16.3 Approved staging CSV
+### 20.2 Staging contract
 
 Fixed columns:
 
@@ -781,53 +1502,26 @@ lastPurchaseAtISO
 daysSinceLastPurchase
 ```
 
-Dynamic monthly columns:
+They are followed by one dynamic integer-cent column per included month:
 
 ```text
 amount_YYYY_MM_C
 ```
 
-Completed range columns:
+`totalAmountC` must equal the sum of all included monthly amount columns. `lastPurchaseAtISO` is the latest valid purchase across the included range. `daysSinceLastPurchase` is calculated from the explicit build as-of date when reproducibility is required.
+
+Every Meter Master identity remains present. A meter with no sales has zero totals and blank CSV last-purchase fields.
+
+### 20.3 Visibility projection
 
 ```text
-amount_2025_09_C
-amount_2025_10_C
-amount_2025_11_C
-amount_2025_12_C
-amount_2026_01_C
-amount_2026_02_C
-amount_2026_03_C
-amount_2026_04_C
-amount_2026_05_C
-amount_2026_06_C
+astId populated -> VISIBLE
+astId blank     -> INVISIBLE
 ```
 
-`totalAmountC` must equal the sum of all included monthly amount columns.
+This is a supporting projection and must not be written back into Meter Master.
 
-`lastPurchaseAtISO` is the latest valid included purchase timestamp.
-
-`daysSinceLastPurchase` is calculated against the explicit build `--as-of-date`.
-
-Zero-sales meters remain present with zero monthly totals and blank CSV purchase-age fields.
-
-### 16.4 Visibility projection
-
-```text
-Meter Master astId populated -> VISIBLE
-Meter Master astId blank     -> INVISIBLE
-```
-
-Visibility is a supporting Sales All Meters projection. It is not canonical Meter Master truth and must not be written back into `meter_master`.
-
-The completed staging CSV contained blank `astId` values, therefore all 35,295 Sales All Meters rows were `INVISIBLE`.
-
-This does not prove that no related AST exists elsewhere in iREPS. It records only the linkage available in the approved staging Meter Master CSV.
-
-### 16.5 Firestore identity and shape
-
-```text
-sales-all-meters/{masterId}
-```
+### 20.4 Firestore shape
 
 ```json
 {
@@ -858,351 +1552,522 @@ sales-all-meters/{masterId}
 }
 ```
 
-`monthlyTotalsC` keys are generated dynamically from the approved CSV month columns.
+The `monthlyTotalsC` keys are dynamic. The current TEST schema does not add metadata to Sales All Meters.
 
-The current TEST schema does not add a metadata object to Sales All Meters.
+### 20.5 Upload safety
 
-### 16.6 Upload safety
+The uploader requires explicit `--project-id`, `--confirm-project`, `--service-account`, `--input` and `--mode` values.
 
-Required arguments:
+Normal mode is `create-only` against an empty collection. `resume` is restricted to recovery from a verified partial upload of the same frozen CSV. Missing documents may be created, exact matches skipped, and conflicts or unexpected documents must stop the upload.
 
-```text
---project-id
---confirm-project
---service-account
---input
---mode
-```
+Firestore create operations are required. Broad merge writes are prohibited. Every run records the CSV SHA-256, writes a JSON report and verifies the final collection count.
 
-Supported modes:
+### 20.6 Completed TEST baseline
 
 ```text
-create-only
-resume
-```
-
-`create-only` is normal operation and requires an empty target collection.
-
-`resume` is restricted to recovery from a verified partial upload of the same frozen CSV:
-
-```text
-missing document             -> create
-existing matching document   -> skip
-existing conflicting document -> stop
-unexpected extra document    -> stop
-```
-
-Create operations are required. Broad `merge=True` writes are prohibited.
-
-Every run must print a complete preflight, calculate the CSV SHA-256, report progress, verify the final count and write a JSON report.
-
-### 16.7 Completed Sales All Meters baseline
-
-```text
-Rows/documents:       35,295
-Meters with sales:    19,904
-Meters without sales: 15,391
-Visible meters:            0
-Invisible meters:     35,295
-Total amount cents:   9,728,029,408
-Validation:           PASS
-```
-
-Approved CSV:
-
-```text
-output/sales_all_meters/
-sales_all_meters__ZA7423__FULL__2025-09_to_2026-06.csv
-```
-
-CSV SHA-256:
-
-```text
-139e1775ed4404696077ccf5df4355288eabcb0357fbb7ddeebe578d69179087
-```
-
-Upload report:
-
-```text
-output/sales_all_meters/upload-reports/
-sales_all_meters_upload__ireps-test__20260714T212554Z.json
-```
-
-The governed builder and uploader were committed as:
-
-```text
-66f06fb fix: govern sales all meters build and upload
+LM:                    ZA7423
+Period:                2025-09 through 2026-06
+Documents:             35,295
+Meters with sales:     19,904
+Meters without sales:  15,391
+Total amount cents:    9,728,029,408
+Upload result:         PASS
 ```
 
 ---
 
-## 17. Validation and reconciliation
+## 21. Visibility rule
 
-No build or upload is complete until validation is complete.
+Visibility terminology must follow the iREPS Master Dictionary.
 
-Minimum validation includes, where applicable:
+The backend remains the authority.
+
+A form-side indication may assist the user, but it must not be treated as final truth.
+
+The pipeline must not infer operational linkage beyond what the approved Meter Master and backend rules support.
+
+Any change to `VISIBLE` or `INVISIBLE` behaviour requires review across pipeline, backend, mobile, web, Meter Master, Master Dictionary, and rules.
+
+---
+
+## 22. Validation and reconciliation
+
+No upload is complete until validation is complete.
+
+Minimum validation must include, where applicable:
 
 - input file count;
 - input row count;
 - output row count;
-- rejected or skipped rows;
-- duplicate identities;
+- rejected or skipped row count;
+- duplicate count;
 - unique meter count;
-- total integer cents;
-- earliest and latest purchase dates;
-- complete continuous month sequence;
-- Atomic-to-Monthly reconciliation;
-- Monthly Meter-to-LM reconciliation;
-- Monthly Group-to-LM reconciliation;
-- Meter Master row and identity validation;
-- Sales All Meters row and total reconciliation;
-- target collection count;
-- deterministic sample verification;
-- CSV SHA-256;
-- JSON run report.
+- total amount in cents;
+- earliest purchase date;
+- latest purchase date;
+- monthly totals;
+- LM totals;
+- LM group totals;
+- Meter Master row count;
+- Sales All Meters row count;
+- missing-month detection;
+- source-to-output reconciliation.
 
-A script must fail loudly on missing, incomplete, ambiguous or conflicting data.
+A script must fail loudly when a required file is missing.
 
-Warnings must not be presented as successful completion.
+A script must not silently continue after a critical validation failure.
+
+Warnings must be clear and distinguishable from successful completion.
 
 ---
 
-## 18. Upload safety
+## 23. Upload safety
 
-Every uploader must:
+Upload scripts must:
 
 - require an explicit Firebase project ID;
-- require matching project confirmation;
-- verify the credential project before Firebase starts;
-- display the target project and collections;
+- display the target project before writing;
+- display the target collections;
 - display input filenames and row counts;
-- display the expected operation;
-- validate all data before writing;
 - use controlled batch sizes;
-- report progress and final writes;
-- stop on conflicts;
-- avoid Production defaults;
-- avoid silent environment switching;
-- create a run report;
-- verify final counts and samples.
+- report progress;
+- report total successful writes;
+- report failures;
+- stop on invalid configuration;
+- avoid defaulting to Production;
+- avoid silently switching environments.
 
-Destructive delete-and-reload operations require a separate approved plan, a backup and explicit confirmation.
+Before an upload, the operator must confirm:
 
-The old 11-document `meter_master` TEST collection was backed up before its controlled reset and full approved reload.
+```text
+provider
+LM
+month
+target project
+target collections
+input row count
+expected operation
+```
+
+Destructive delete-and-reload operations require a separate agreed reset plan.
 
 ---
 
-## 19. Git and data protection
+## 24. Git and data-protection rules
 
-The repository branch is:
+The repository is initialised on branch:
 
 ```text
 main
 ```
 
-Do not commit:
+Initial checkpoint:
+
+```text
+21468f6 chore: initialise sales pipeline repository structure
+```
+
+The following must not be committed:
 
 - municipal sales CSV files;
-- Customer Details or 90 Days No Purchase source data;
-- generated output CSVs;
-- upload reports containing operational data;
+- customer reference data;
+- meter reference data;
+- generated output CSV files;
 - service-account files;
 - Firebase credentials;
 - `.env` secrets;
 - local credentials;
 - large operational datasets.
 
-Before committing, run:
+The `.gitignore` must continue to exclude:
+
+```text
+input/**
+output/**
+credentials
+secrets
+service-account files
+```
+
+Only approved `.gitkeep` placeholders may be committed inside ignored data folders.
+
+Before every commit involving data-folder changes, run:
 
 ```powershell
 git status --short --untracked-files=all
 ```
 
-Do not use `git add -f` to force operational data or credentials into Git.
+Never use `git add -f` on an ignored data or credential file unless an explicit security review has approved it.
 
-Work in small verified commits. Do not combine unrelated changes.
-
----
-
-## 20. Mobile consumption verification
-
-On 2026-07-15, the completed June 2026 sales data was manually synced and displayed successfully in `ireps-mobile` on the **Prepaid Revenue Report** screen.
-
-The observed screen confirmed:
-
-- June 2026 Monthly mode loaded;
-- Lesedi workbase context loaded;
-- 16,089 total meters displayed for June 2026;
-- Sales Group G4 filtering displayed records;
-- meter-level purchase counts and monthly amounts displayed;
-- cached mobile data was available after sync.
-
-This is recorded as:
-
-```text
-MANUAL MOBILE CONSUMPTION VERIFICATION: PASS
-```
-
-This manual verification complements, but does not replace, automated pipeline, Firestore count and reconciliation validation.
-
-The milestone proves that the completed data flow reaches the intended user-facing report:
-
-```text
-Conlog source
-    -> Atomic
-    -> Monthly
-    -> Meter Master
-    -> Sales All Meters
-    -> iREPS Mobile Prepaid Revenue Report
-```
+The GitHub repository, when created, must be private.
 
 ---
 
-## 21. Current implementation status
+## 25. Large-file and ChatGPT safety
 
-Completed:
+Large CSV files must not be uploaded into ChatGPT unless absolutely necessary and explicitly agreed.
 
-1. RAW-to-RAW-STAGING preparation established.
-2. Atomic Sales prepared through June 2026.
-3. 822,527 Atomic documents uploaded and verified.
-4. Monthly Meter, LM and LM Group outputs rebuilt through June 2026.
-5. All three Monthly collections uploaded and verified.
-6. Meter Master rebuilt with approved duplicate-resolution rules.
-7. 35,295 Meter Master documents uploaded and verified.
-8. Sales All Meters rebuilt with ten dynamic months.
-9. 35,295 Sales All Meters documents uploaded and verified.
-10. Governed Stage 06 and Stage 08 changes committed and pushed.
-11. June 2026 data synced and displayed successfully in iREPS Mobile.
+Use safer evidence instead:
 
-Immediate governance close-out:
+- filenames;
+- headers;
+- row counts;
+- terminal output;
+- validation summaries;
+- a few selected sample rows;
+- scripts;
+- schema descriptions.
 
-1. Keep this rules file current.
-2. Update and commit the six authoritative schemas under `C:\dev\ireps-schemas`.
-3. Update the project README where required.
-4. Update the iREPS Master Dictionary where terminology requires it.
-5. Keep operational data and credentials outside Git.
+This rule exists because large file-heavy chats can crash or freeze the browser or machine.
 
 ---
 
-## 22. Definition of done for the Lesedi TEST sales baseline
+## 26. Change-management rule
 
-The baseline is complete because:
+Before changing code:
 
-- RAW STAGING covers September 2025 through June 2026;
-- Atomic Sales covers the same ten months;
-- Monthly Meter, LM and Group data covers the same ten months;
-- all month sequences are complete;
-- financial totals reconcile;
-- Meter Master was rebuilt from the full approved range and references;
-- Sales All Meters was rebuilt from the same range;
-- builders no longer contain the old fixed February 2026 end range;
-- upload scripts require explicit environment selection;
-- upload order was followed;
-- final collection counts were verified;
-- run reports were recorded;
-- script changes were committed and pushed;
-- June 2026 data was successfully consumed by iREPS Mobile.
+1. Read this rules file.
+2. Inspect the current script.
+3. State the intended behaviour change.
+4. Separate structural cleanup from business-logic changes.
+5. Make the smallest safe change.
+6. Test the script.
+7. Verify outputs.
+8. Update this file if an agreed rule changed.
+9. Update the Master Dictionary if terminology changed.
+10. Commit the verified change.
 
-Milestone:
+Do not combine unrelated changes in one patch.
+
+Do not rewrite all scripts at once.
+
+Work one script or one tightly related group at a time.
+
+---
+
+## 27. Versioning rule
+
+Do not overwrite historical scripts without preserving traceability.
+
+When behaviour changes materially, use a new script version or a clear Git commit history.
+
+Old scripts may be moved to an approved history location only after the replacement is tested, outputs are reconciled, the change is committed, and the new script is accepted.
+
+The repository history is the primary record of code evolution.
+
+---
+
+## 28. Current implementation status and next governance actions
+
+The Lesedi `ireps-test` Sales Pipeline baseline is complete:
+
+1. RAW and RAW STAGING prepared through June 2026.
+2. Atomic Sales built, uploaded and verified for ten months.
+3. Monthly meter, LM and group datasets built, reconciled and uploaded.
+4. Meter Master rebuilt, validated and uploaded with 35,295 documents.
+5. Sales All Meters rebuilt, reconciled and uploaded with 35,295 documents.
+6. CSV fingerprints and JSON upload reports recorded.
+7. Governed script changes committed and pushed.
+
+Immediate governance close-out actions are:
+
+1. keep this rules file current;
+2. maintain all six collection schemas under `C:\dev\ireps-schemas`;
+3. update the project README and iREPS Master Dictionary where required;
+4. commit rules and schema changes in their respective repositories;
+5. keep operational CSVs, credentials and upload reports outside Git.
+
+---
+
+## 29. Current non-goals
+
+The following are not part of the current sprint:
+
+- renaming `conlog_sales_xxx`;
+- implementing Landis+Gyr ingestion;
+- provider-neutral collection migration;
+- creating `ireps-trials`;
+- creating `ireps-production`;
+- full cadastral reset;
+- nuclear reset of DEV and TEST;
+- Production data loading;
+- billing-engine development.
+
+These items require separate approved sprints.
+
+---
+
+## 30. Definition of done and completion record for the TEST sales sprint
+
+The Lesedi TEST sales-data baseline satisfies the implementation definition of done:
+
+- Atomic and Monthly data cover September 2025 through June 2026;
+- the ten months are continuous and reconciled;
+- Meter Master and Sales All Meters use the complete approved range;
+- all uploaders require explicit environment selection;
+- Firestore uploads followed the mandatory dependency order;
+- frozen CSV fingerprints and JSON reports were recorded;
+- all six target collections were count-verified in `ireps-test`;
+- governed script changes were committed and pushed.
 
 ```text
 Lesedi Conlog Sales Pipeline
 ZA7423
 2025-09 through 2026-06
 ireps-test
-DATA, FIRESTORE AND MOBILE CONSUMPTION BASELINE COMPLETE
+DATA AND FIRESTORE BASELINE COMPLETE
 ```
+
+Governance close-out is complete after this rules update and the authoritative schemas under `C:\dev\ireps-schemas` are reviewed and committed, and Git status confirms no municipal source data or credentials are staged.
 
 ---
 
-## 23. Decision history
+## 31. Decision history
 
 ### 2026-07-13 — Governing rules file required
 
-Every substantial iREPS coding and data sprint must have an authoritative Markdown rules file.
+Every substantial iREPS analysis, design, and coding sprint must have an authoritative Markdown rules file under a `rules` folder.
+
+The rules file must be read first whenever the sprint is revisited.
 
 ### 2026-07-13 — Clean repository structure
 
-Python scripts were moved into `scripts`, and data folders remained excluded from Git.
+Python scripts were moved from the project root into `scripts`.
 
-### 2026-07-13 — One Master Dictionary
+Project-history tree files were moved into:
 
-No separate Sales Pipeline dictionary will be created.
+```text
+docs/project-history
+```
 
-### 2026-07-13 — Generic sales naming
+The cleaned `input` and `output` structures were preserved.
 
-New architecture and governance names use `sales`; existing accurate prepaid source and report names may remain.
+### 2026-07-13 — One Master Dictionary only
+
+No local Sales Pipeline dictionary will be created.
+
+Sales Pipeline terminology must be maintained in the single iREPS Master Dictionary.
+
+### 2026-07-13 — Generic `sales` naming
+
+New governance and architecture filenames must use `sales` rather than `prepaid`.
+
+Existing source filenames containing `prepaid` remain unchanged during the current sprint.
+
+### 2026-07-13 — Keep Conlog collection names during TEST
+
+The existing `conlog_sales_xxx` collection names remain active during `ireps-test` stabilisation.
+
+Provider-neutral restructuring is deferred until Trials Readiness.
+
+### 2026-07-13 — Dynamic full-period builders approved
+
+Stages 05 and 06 are governed downstream full-period builders.
+
+Each execution requires one LM and one explicit continuous `--from-month` to `--to-month` range. The builders must dynamically discover and validate every required monthly meter-level file inside that range and must not contain a fixed historical month list.
 
 ### 2026-07-13 — Environment-neutral builds
 
-Build scripts do not select Firebase environments. Upload scripts require an explicit target project.
+Local build scripts must not select Firebase environments.
+
+Upload scripts must require an explicit target project.
+
+### 2026-07-13 — Meter Master v3 and Firestore contract approved
+
+`scripts/05_build_meter_master_v3.py` is the approved Meter Master staging builder.
+
+Its ten-column CSV output and the final `meter_master` Firestore schema are locked in Section 19.
+
+All Meter Master documents require six-field metadata. Pipeline reruns must preserve existing `metadata.created*` values and populated `refs.asts.id` links.
+
+### 2026-07-13 — Reusable frozen full-period Meter Master uploader approved
+
+Stage 07 uploads one approved frozen full-period Meter Master CSV to one explicitly selected Firebase project.
+
+The normal mode is `create-only` against an empty collection. `resume` is restricted to recovery from a partial upload of the same approved CSV and fingerprint.
+
+The uploader is not a normal month-by-month enrichment mechanism. Any replacement, reconciliation, or migration of an established Meter Master collection requires a separate reviewed plan that protects workflow-owned fields and immutable creation metadata.
+
+### 2026-07-13 — RAW, RAW STAGING, and Atomic layers locked
+
+The provider-download path is formally separated into three governed data states:
+
+```text
+RAW
+input/raw-sales
+    -> scripts/00_prepare_conlog_raw_sales.py
+RAW STAGING
+input/conlog_sales
+    -> scripts/01_prepare_conlog_sales.py
+ATOMIC
+output/atomic
+```
+
+The operator downloads the original vending-provider CSV and places it unchanged in `input/raw-sales`.
+
+`scripts/00_prepare_conlog_raw_sales.py` must generate the approved six-column Conlog raw-staging file. Manual preparation of files under `input/conlog_sales` is no longer an approved normal operating step.
+
+`scripts/01_prepare_conlog_sales.py` consumes raw-staging files and generates upload-ready Atomic CSVs under `output/atomic`.
+
+### 2026-07-13 — Stage 00 monthly operating contract proven
+
+Stage 00 was validated and successfully run against the original Conlog portal downloads for April, May, and June 2026.
+
+The approved operating model is one LM and one month per execution using mandatory `--lm-pcode` and `--month` arguments, with optional `--preflight-only` validation before writing.
+
+The RAW source filename is governed as `conlog_raw_sales__<lmPcode>__YYYY-MM.csv`. The CSV contents remain unchanged; only the local filename may be standardised for controlled identity.
+
+Stage 00 preserves duplicate six-field staging rows, blocks all output when rejected rows exist, fingerprints both the RAW source and planned output with SHA-256, protects different existing outputs unless an approved `--replace-existing` run is used, and records successful write summaries under `output/logs`.
+
+The Conlog RAW STAGING monetary fields retain their historical names but contain validated decimal rand values. Stage 01 is the single approved conversion boundary to integer cents for Atomic Sales.
 
 ### 2026-07-13 — Pipeline dependency and upload order locked
 
-```text
-Atomic -> Monthly -> Meter Master -> Sales All Meters
-```
-
-### 2026-07-14 — Ten-month Atomic upload verified
-
-822,527 Atomic documents were loaded into `ireps-test` for September 2025 through June 2026.
-
-### 2026-07-14 — Monthly build and upload completed
-
-All ten Monthly Meter datasets, ten Monthly LM documents and fifty Monthly LM Group documents were built, reconciled, uploaded and verified.
-
-### 2026-07-14 — Meter-number length rule corrected
-
-There is no universal 11-character meter-number rule.
-
-### 2026-07-14 — Meter Master schema locked
-
-The deterministic normalized meter number is the document ID. The canonical document contains the exact approved root shape and six-field metadata object. `createdBySource` and `updatedBySource` are prohibited.
-
-### 2026-07-14 — Meter Master duplicate rules proven
-
-The approved placeholder, account-status and latest-purchase rules resolved the known duplicate patterns. Customer name, ERF and addresses were excluded from identity resolution.
-
-### 2026-07-14 — Meter Master baseline completed
-
-35,295 Meter Master documents were created and verified in `ireps-test`.
-
-### 2026-07-14 — Sales All Meters governed
-
-The builder was changed to use an explicit continuous range and dynamic monthly columns. The uploader was changed to explicit project selection, create-only/controlled-resume safety and conflict blocking.
-
-### 2026-07-14 — Sales All Meters baseline completed
-
-35,295 Sales All Meters documents were created and verified in `ireps-test`.
-
-### 2026-07-15 — Operating-grain correction
-
-The incorrect universal one-month rule for Stages 05 to 08 was removed.
-
-Approved operating grain:
+The approved data dependency is:
 
 ```text
-Stages 00-04: one LM and one month
-Stages 05-06: one LM and one explicit continuous range
-Stages 07-08: one project and one frozen full-period CSV
+Atomic Sales
+    -> Monthly Sales
+    -> Meter Master
+    -> Sales All Meters
 ```
 
-### 2026-07-15 — Mobile consumption verified
+The mandatory Firestore upload order is:
 
-June 2026 sales synced successfully and displayed on the iREPS Mobile Prepaid Revenue Report, including the 16,089-meter monthly result and meter-level group records.
+```text
+Atomic Sales
+    -> Monthly Sales collections
+    -> Meter Master
+    -> Sales All Meters
+```
+
+Meter Master must not be uploaded before the required Atomic and Monthly Sales data is complete and validated. Sales All Meters must not be built or uploaded before Meter Master is approved.
+
+### 2026-07-13 — Git repository created
+
+The local Git repository was created on `main`.
+
+Initial commit:
+
+```text
+21468f6 chore: initialise sales pipeline repository structure
+```
+
+Operational CSV data and generated outputs remain excluded from Git.
 
 ---
 
-## 24. Rule amendment
+### 2026-07-14 — Ten-month Atomic upload verified
 
-This file may be amended only when an architecture, implementation, data, safety, naming, schema or operating decision changes.
+The ten Conlog Atomic months from September 2025 through June 2026 were uploaded to `ireps-test/conlog_sales_atomic`.
 
-Every amendment must record:
+The verified total is:
+
+```text
+822,527 documents
+```
+
+Every month completed with `UPLOAD_VERIFIED`, count verification PASS, sample verification PASS, zero conflicts, and zero extra documents.
+
+### 2026-07-14 — Canonical meter-number length rule corrected
+
+The pipeline must not impose an 11-character meter-number rule.
+
+Stage 01, Stage 02, Stage 03, Stage 04, Meter Master, Sales All Meters, and future readers must preserve the canonical normalized meter number without padding or fixed-length rejection.
+
+### 2026-07-14 — Monthly build and upload safety model approved
+
+Stage 03 must produce a successful SHA-256 build manifest.
+
+Stage 04 v3 must consume that manifest, preflight all three monthly collection scopes, use create-only or controlled resume, use Firestore create operations only, and verify counts and deterministic samples.
+
+Broad `merge=True` writes are prohibited for the three monthly aggregate collections.
+
+### 2026-07-14 — Split stage-execution grains locked
+
+The approved Sales Pipeline operating model is:
+
+```text
+Stages 00–04
+    one LM + one month per execution
+
+Stages 05–06
+    one LM + one explicit continuous from-month/to-month range
+
+Stages 07–08
+    one explicit Firebase project + one approved frozen full-period CSV
+```
+
+Stages 05 and 06 must dynamically discover and validate all months inside the explicit range and must not contain a fixed historical month list.
+
+Stages 07 and 08 use `create-only` as the normal mode. `resume` is restricted to recovery from a partial upload of the same frozen CSV and fingerprint.
+
+The earlier universal month-by-month statement for Stages 05 through 08 was incorrect and is not governing.
+
+---
+
+### 2026-07-14 — Lesedi TEST Sales Pipeline baseline completed
+
+The complete Conlog Sales Pipeline baseline for Lesedi `ZA7423`, covering September 2025 through June 2026, was built, reconciled and uploaded to `ireps-test`.
+
+```text
+conlog_sales_atomic             822,527
+conlog_sales_monthly            157,940
+conlog_sales_monthly_lm              10
+conlog_sales_monthly_lm_groups       50
+meter_master                     35,295
+sales-all-meters                 35,295
+```
+
+### 2026-07-14 — Meter Master duplicate-resolution contract proven
+
+Customer Details and 90 Days No Purchase duplicate rows are resolved only through the governed identity, account-status and latest-purchase rules. Customer name, ERF and address are not resolution inputs.
+
+### 2026-07-14 — Governed Sales All Meters scripts approved
+
+`scripts/06_build_sales_all_meters.py` now uses an explicit LM, continuous dynamic range, approved Meter Master input, reproducible as-of date and full reconciliation.
+
+`scripts/08_upload_sales_all_meters.py` requires explicit project selection and controlled `create-only` or `resume` mode. Broad merge behaviour is prohibited.
+
+```text
+66f06fb fix: govern sales all meters build and upload
+```
+
+### 2026-07-14 — Authoritative schema repository confirmed
+
+```text
+C:\dev\ireps-schemas
+```
+
+All six completed Sales Pipeline collections require active canonical schema documents there.
+### 2026-07-16 — Meter Master governance contradiction corrected
+
+The rules file contained contradictory Stage 05–08 operating models: the correct split-stage model in Sections 13 and 14, and an incorrect universal month-by-month model in the former Section 19 and decision history.
+
+This amendment confirms:
+
+```text
+Stages 00–04 = one LM + one month
+Stages 05–06 = one LM + explicit continuous range
+Stages 07–08 = one approved frozen full-period CSV to one explicit project
+```
+
+It also confirms that every Meter Master writer must create the exact canonical shape, use governed empty strings where optional data is unavailable, use Firestore Timestamp metadata, apply the common whitespace-removing meter-number normalization, preserve fields owned by other workflows, and avoid broad document merges.
+
+No backend writer code may be changed until a fresh read-only assessment has been run against this corrected governing file and the authoritative Meter Master schema.
+
+---
+
+## 32. Rule amendment
+
+This file may be amended only when an architecture, implementation, data, safety, naming, or operating decision changes.
+
+Every amendment must include:
 
 - the date;
 - the changed rule;
 - the reason;
 - the effect on code or data;
-- any required migration.
+- any migration action required.
 
-A rules update and its related code or schema change should be committed together whenever practical.
+A rules update and the related code change should be committed together whenever practical.

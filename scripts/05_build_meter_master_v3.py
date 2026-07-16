@@ -2,7 +2,7 @@
 05_build_meter_master_v3.py
 
 Build an environment-neutral meter master staging CSV from:
-- every available meter-level monthly sales CSV in output/monthly
+- every approved meter-level monthly sales CSV in one explicit continuous range
 - Customer_Details.csv
 - 90_Days_No_Purchase_Report.csv
 
@@ -18,7 +18,9 @@ Default output filename:
 
 Governance controls:
 - every project path resolves from this script's repository root
-- monthly rows must match the requested LM and filename month
+- every month requires matching successful one-month Stage 03 manifest evidence
+- monthly rows must satisfy the exact Stage 03 schema, identities, types, reconciliation, LM, and filename month
+- every source is parsed from the same immutable byte snapshot whose SHA-256 is recorded
 - meter identifiers must be non-empty uppercase alphanumeric values after normalisation
 - Customer Details duplicates prefer the dominant identity pattern where CustomerNo equals AccountNo and differs from MeterNumber
 - an Active duplicate may replace a Block Purchases duplicate without consulting ERF, address, or customer-name fields
@@ -26,24 +28,57 @@ Governance controls:
 - tied or missing purchase dates still stop the build
 - 90-day report duplicates use the same placeholder preference and may resolve competing real customer numbers by latest valid LastPurchaseDate
 - tied or missing NPR purchase dates still stop genuine competing non-placeholder identities
+- --from-month and --to-month are mandatory and every month in the range must exist
+- the current governed provider is conlog and the current meter type is electricity
+- the final CSV is accompanied by a frozen Stage 05 JSON manifest containing input hashes,
+  output hash, range, included months, build statistics, and a deterministic fingerprint
 """
 
 from __future__ import annotations
 
 import argparse
+import datetime as dt
+import hashlib
+import io
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional, Sequence
+from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
 
 import pandas as pd
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+GOVERNED_PROVIDER = "conlog"
+GOVERNED_METER_TYPE = "electricity"
+MANIFEST_SCHEMA_VERSION = 1
+STAGE03_SCRIPT = "03_aggregate_monthly_from_atomic_outputs.py"
+STAGE03_DATASETS = ("monthly", "monthly_lm", "monthly_lm_groups")
 MONTHLY_FILENAME_RE = re.compile(
     r"^monthly__(?P<scope>[A-Za-z0-9_-]+)__(?P<period>\d{4}-\d{2})__from_atomic\.csv$"
 )
 METER_NO_RE = re.compile(r"^[A-Z0-9]+$")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+MONTHLY_COLUMNS = [
+    "docId",
+    "lmPcode",
+    "meterNo",
+    "ym",
+    "y",
+    "m",
+    "purchasesCount",
+    "amountTotalC",
+    "costC",
+    "vatC",
+    "firstPurchaseAtISO",
+    "lastPurchaseAtISO",
+    "firstPurchaseAtMs",
+    "lastPurchaseAtMs",
+    "salesGroupId",
+    "salesGroupLabel",
+]
 
 MASTER_COLUMNS = [
     "masterId",
@@ -71,6 +106,34 @@ class MonthlyInput:
 
 
 @dataclass(frozen=True)
+class CsvSnapshot:
+    path: Path
+    payload: bytes
+    frame: pd.DataFrame
+    sha256: str
+
+
+@dataclass(frozen=True)
+class JsonSnapshot:
+    path: Path
+    payload: Mapping[str, Any]
+    sha256: str
+
+
+@dataclass(frozen=True)
+class ApprovedMonthlyInput:
+    period: str
+    csv: CsvSnapshot
+    frame: pd.DataFrame
+    reconciliation: Mapping[str, Any]
+    stage03_manifest: JsonSnapshot
+
+    @property
+    def path(self) -> Path:
+        return self.csv.path
+
+
+@dataclass(frozen=True)
 class BuildConfig:
     lm_pcode: str
     provider: str
@@ -92,7 +155,10 @@ class BuildStats:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Build meter_master from every available monthly sales file."
+        description=(
+            "Build meter_master from one continuous range of approved Stage 03 "
+            "monthly sales files."
+        )
     )
     parser.add_argument(
         "--lm-pcode",
@@ -108,15 +174,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--scope",
         default="FULL",
+        choices=("FULL",),
         help="Monthly filename scope to consume. Default: FULL.",
     )
     parser.add_argument(
+        "--stage03-manifest-dir",
+        type=Path,
+        default=Path("output/logs/monthly_build"),
+        help=(
+            "Directory containing successful one-month Stage 03 BUILD_WRITTEN "
+            "manifests for every requested month."
+        ),
+    )
+    parser.add_argument(
         "--from-month",
-        help="Optional inclusive first month in YYYY-MM format.",
+        required=True,
+        help="Required inclusive first month in YYYY-MM format.",
     )
     parser.add_argument(
         "--to-month",
-        help="Optional inclusive last month in YYYY-MM format.",
+        required=True,
+        help="Required inclusive last month in YYYY-MM format.",
     )
     parser.add_argument(
         "--customer-details",
@@ -132,13 +210,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--provider",
-        default="conlog",
-        help="Sales provider written to the master output. Default: conlog.",
+        default=GOVERNED_PROVIDER,
+        choices=(GOVERNED_PROVIDER,),
+        help="Governed sales provider. Current approved value: conlog.",
     )
     parser.add_argument(
         "--meter-type",
-        default="electricity",
-        help="Default meter type. Default: electricity.",
+        default=GOVERNED_METER_TYPE,
+        choices=(GOVERNED_METER_TYPE,),
+        help="Governed meter type. Current approved value: electricity.",
     )
     parser.add_argument(
         "--output-dir",
@@ -151,17 +231,10 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Optional exact output CSV path. Overrides --output-dir.",
     )
-    parser.add_argument(
-        "--allow-gaps",
-        action="store_true",
-        help="Allow missing months inside the discovered date range.",
-    )
     return parser.parse_args()
 
 
-def validate_month(value: Optional[str], argument_name: str) -> None:
-    if value is None:
-        return
+def validate_month(value: str, argument_name: str) -> None:
     if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", value):
         raise ValueError(f"{argument_name} must use YYYY-MM format: {value}")
 
@@ -180,6 +253,68 @@ def require_columns(df: pd.DataFrame, required: Sequence[str], source: Path) -> 
     missing = [column for column in required if column not in df.columns]
     if missing:
         raise ValueError(f"{source} is missing required columns: {', '.join(missing)}")
+
+
+def sha256_bytes(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
+def read_csv_snapshot(path: Path, label: str) -> CsvSnapshot:
+    """Read and hash one immutable byte snapshot, then parse only those bytes."""
+    require_file(path)
+    payload = path.read_bytes()
+    last_error: Optional[Exception] = None
+    frame: Optional[pd.DataFrame] = None
+    for encoding in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            frame = pd.read_csv(io.BytesIO(payload), dtype=str, encoding=encoding).fillna("")
+            break
+        except Exception as exc:
+            last_error = exc
+    if frame is None:
+        raise ValueError(f"{label} is not a valid CSV: {path}") from last_error
+    return CsvSnapshot(
+        path=path.resolve(),
+        payload=payload,
+        frame=frame,
+        sha256=sha256_bytes(payload),
+    )
+
+
+def read_json_snapshot(path: Path, label: str) -> JsonSnapshot:
+    """Read, hash, and decode one immutable JSON byte snapshot."""
+    require_file(path)
+    payload = path.read_bytes()
+    try:
+        decoded = json.loads(payload.decode("utf-8-sig"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{label} is not valid JSON: {path}") from exc
+    if not isinstance(decoded, dict):
+        raise ValueError(f"{label} must contain one JSON object: {path}")
+    return JsonSnapshot(
+        path=path.resolve(),
+        payload=decoded,
+        sha256=sha256_bytes(payload),
+    )
+
+
+def require_json_int(
+    value: Any,
+    label: str,
+    *,
+    minimum: Optional[int] = None,
+) -> int:
+    if type(value) is not int:
+        raise ValueError(f"{label} must be a JSON integer")
+    if minimum is not None and value < minimum:
+        raise ValueError(f"{label} must be at least {minimum}")
+    return value
+
+
+def require_sha256(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not SHA256_RE.fullmatch(value):
+        raise ValueError(f"{label} must be a lowercase SHA-256 fingerprint")
+    return value
 
 
 def discover_monthly_inputs(
@@ -230,17 +365,26 @@ def month_sequence(first_month: str, last_month: str) -> list[str]:
 
 def validate_month_continuity(
     monthly_inputs: Sequence[MonthlyInput],
-    allow_gaps: bool,
-) -> None:
+    from_month: str,
+    to_month: str,
+) -> list[str]:
     discovered = [item.period for item in monthly_inputs]
-    expected = month_sequence(discovered[0], discovered[-1])
+    expected = month_sequence(from_month, to_month)
     missing = [period for period in expected if period not in discovered]
-    if missing and not allow_gaps:
+    unexpected = [period for period in discovered if period not in expected]
+    if missing or unexpected or discovered != expected:
+        details: list[str] = []
+        if missing:
+            details.append("missing=" + ",".join(missing))
+        if unexpected:
+            details.append("unexpected=" + ",".join(unexpected))
+        if not details:
+            details.append("discovered month order does not match the required range")
         raise ValueError(
-            "Missing monthly files inside the selected range: "
-            + ", ".join(missing)
-            + ". Add the files or rerun with --allow-gaps only when intentional."
+            "Stage 05 requires every consecutive month from "
+            f"{from_month} through {to_month}: " + "; ".join(details)
         )
+    return expected
 
 
 def normalize_meter_no(value: Any) -> str:
@@ -267,6 +411,438 @@ def safe_str(value: Any) -> str:
         return ""
     text = str(value).strip()
     return "" if text.lower() == "nan" else text
+
+
+def strict_integer_series(
+    frame: pd.DataFrame,
+    column: str,
+    source: Path,
+) -> pd.Series:
+    raw = frame[column].map(safe_str)
+    invalid = ~raw.str.fullmatch(r"-?\d+")
+    if invalid.any():
+        examples = [int(index) + 2 for index in invalid[invalid].index[:5]]
+        raise ValueError(
+            f"{source.name}: {column} must contain integer text in every row; "
+            f"invalid CSV line examples: {examples}"
+        )
+    if frame[column].astype(str).ne(raw).any():
+        raise ValueError(f"{source.name}: whitespace drift in integer column {column}")
+    return raw.astype("int64")
+
+
+def sales_group_from_amount_total_c(amount_total_c: int) -> str:
+    if amount_total_c <= 9_999:
+        return "GR1"
+    if amount_total_c <= 29_999:
+        return "GR2"
+    if amount_total_c <= 49_999:
+        return "GR3"
+    if amount_total_c <= 99_999:
+        return "GR4"
+    return "GR5"
+
+
+def sales_group_label(group_id: str) -> str:
+    labels = {
+        "GR1": "<=99.99",
+        "GR2": "100-299.99",
+        "GR3": "300-499.99",
+        "GR4": "500-999.99",
+        "GR5": ">=1000",
+    }
+    return labels[group_id]
+
+
+def validate_monthly_snapshot(
+    monthly_input: MonthlyInput,
+    snapshot: CsvSnapshot,
+    config: BuildConfig,
+) -> tuple[pd.DataFrame, Dict[str, Any]]:
+    """Validate the complete Stage 03 meter-month contract from one byte snapshot."""
+    frame = snapshot.frame.copy()
+    source = snapshot.path
+    if list(frame.columns) != MONTHLY_COLUMNS:
+        raise ValueError(
+            f"{source.name}: monthly schema mismatch. Expected {MONTHLY_COLUMNS}; "
+            f"found {list(frame.columns)}"
+        )
+    if frame.empty:
+        raise ValueError(f"Monthly CSV is empty: {source}")
+
+    string_columns = [
+        "docId",
+        "lmPcode",
+        "meterNo",
+        "ym",
+        "firstPurchaseAtISO",
+        "lastPurchaseAtISO",
+        "salesGroupId",
+        "salesGroupLabel",
+    ]
+    for column in string_columns:
+        cleaned = frame[column].map(safe_str)
+        if cleaned.eq("").any():
+            raise ValueError(f"{source.name}: blank values in {column}")
+        if frame[column].astype(str).ne(cleaned).any():
+            raise ValueError(f"{source.name}: whitespace drift in {column}")
+        frame[column] = cleaned
+
+    numeric_columns = [
+        "y",
+        "m",
+        "purchasesCount",
+        "amountTotalC",
+        "costC",
+        "vatC",
+        "firstPurchaseAtMs",
+        "lastPurchaseAtMs",
+    ]
+    for column in numeric_columns:
+        frame[column] = strict_integer_series(frame, column, source)
+
+    if frame["docId"].duplicated().any():
+        raise ValueError(f"{source.name}: duplicate docId values")
+    if frame["meterNo"].duplicated().any():
+        raise ValueError(f"{source.name}: duplicate meterNo values")
+    if not frame["lmPcode"].eq(config.lm_pcode).all():
+        raise ValueError(f"{source.name}: lmPcode mismatch")
+    if not frame["ym"].eq(monthly_input.period).all():
+        raise ValueError(f"{source.name}: ym mismatch")
+
+    expected_year, expected_month = (
+        int(part) for part in monthly_input.period.split("-")
+    )
+    if not frame["y"].eq(expected_year).all() or not frame["m"].eq(expected_month).all():
+        raise ValueError(
+            f"{source.name}: y/m values do not match {monthly_input.period}"
+        )
+
+    normalized = frame["meterNo"].map(normalize_meter_no)
+    valid_meter = frame["meterNo"].str.fullmatch(METER_NO_RE)
+    if not valid_meter.all() or not frame["meterNo"].eq(normalized).all():
+        raise ValueError(
+            f"{source.name}: meterNo must already be canonical uppercase alphanumeric text"
+        )
+    expected_doc_id = (
+        frame["lmPcode"] + "__" + frame["meterNo"] + "__" + frame["ym"]
+    )
+    if not frame["docId"].eq(expected_doc_id).all():
+        raise ValueError(f"{source.name}: deterministic docId mismatch")
+
+    if not frame["purchasesCount"].gt(0).all():
+        raise ValueError(f"{source.name}: purchasesCount must be positive")
+    if not (
+        frame["amountTotalC"].ge(0)
+        & frame["costC"].ge(0)
+        & frame["vatC"].ge(0)
+    ).all():
+        raise ValueError(f"{source.name}: negative monthly monetary value")
+    if not frame["amountTotalC"].eq(frame["costC"] + frame["vatC"]).all():
+        raise ValueError(f"{source.name}: amountTotalC != costC + vatC")
+
+    first_purchase = pd.to_datetime(
+        frame["firstPurchaseAtISO"],
+        format="%Y-%m-%dT%H:%M:%SZ",
+        errors="coerce",
+        utc=True,
+    )
+    last_purchase = pd.to_datetime(
+        frame["lastPurchaseAtISO"],
+        format="%Y-%m-%dT%H:%M:%SZ",
+        errors="coerce",
+        utc=True,
+    )
+    if first_purchase.isna().any() or last_purchase.isna().any():
+        raise ValueError(f"{source.name}: invalid first/last purchase timestamp")
+    if not frame["firstPurchaseAtISO"].eq(
+        first_purchase.dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    ).all() or not frame["lastPurchaseAtISO"].eq(
+        last_purchase.dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    ).all():
+        raise ValueError(f"{source.name}: purchase timestamps are not canonical UTC text")
+    if not first_purchase.dt.strftime("%Y-%m").eq(monthly_input.period).all():
+        raise ValueError(f"{source.name}: firstPurchaseAtISO is outside the month")
+    if not last_purchase.dt.strftime("%Y-%m").eq(monthly_input.period).all():
+        raise ValueError(f"{source.name}: lastPurchaseAtISO is outside the month")
+    if not first_purchase.le(last_purchase).all():
+        raise ValueError(f"{source.name}: first purchase is later than last purchase")
+    expected_first_ms = (first_purchase.astype("int64") // 1_000_000).astype("int64")
+    expected_last_ms = (last_purchase.astype("int64") // 1_000_000).astype("int64")
+    if not frame["firstPurchaseAtMs"].eq(expected_first_ms).all():
+        raise ValueError(f"{source.name}: firstPurchaseAtMs does not match ISO")
+    if not frame["lastPurchaseAtMs"].eq(expected_last_ms).all():
+        raise ValueError(f"{source.name}: lastPurchaseAtMs does not match ISO")
+
+    expected_groups = frame["amountTotalC"].map(sales_group_from_amount_total_c)
+    if not frame["salesGroupId"].eq(expected_groups).all():
+        raise ValueError(f"{source.name}: salesGroupId classification mismatch")
+    expected_labels = frame["salesGroupId"].map(sales_group_label)
+    if not frame["salesGroupLabel"].eq(expected_labels).all():
+        raise ValueError(f"{source.name}: salesGroupLabel mismatch")
+
+    reconciliation = {
+        "lmPcode": config.lm_pcode,
+        "month": monthly_input.period,
+        "purchasesCount": int(frame["purchasesCount"].sum()),
+        "metersCount": int(len(frame)),
+        "amountTotalC": int(frame["amountTotalC"].sum()),
+        "costC": int(frame["costC"].sum()),
+        "vatC": int(frame["vatC"].sum()),
+    }
+    return frame, reconciliation
+
+
+def expected_stage03_filename(dataset: str, scope: str, month: str) -> str:
+    prefixes = {
+        "monthly": "monthly",
+        "monthly_lm": "monthly_lm",
+        "monthly_lm_groups": "monthly_lm_groups",
+    }
+    return f"{prefixes[dataset]}__{scope}__{month}__from_atomic.csv"
+
+
+def validate_stage03_manifest(
+    manifest: JsonSnapshot,
+    *,
+    monthly_input: MonthlyInput,
+    monthly_snapshot: CsvSnapshot,
+    reconciliation: Mapping[str, Any],
+    config: BuildConfig,
+    scope: str,
+) -> None:
+    payload = manifest.payload
+    label = manifest.path.name
+    expected_manifest_prefix = (
+        f"stage03_monthly_build__{config.lm_pcode}__{monthly_input.period}__"
+    )
+    if not label.startswith(expected_manifest_prefix) or not label.endswith(".json"):
+        raise ValueError(f"{label}: Stage 03 manifest filename identity mismatch")
+    if payload.get("stage") != "03" or payload.get("script") != STAGE03_SCRIPT:
+        raise ValueError(f"{label}: manifest is not from approved Stage 03")
+    if payload.get("status") != "PASS" or payload.get("result") != "BUILD_WRITTEN":
+        raise ValueError(f"{label}: manifest is not a successful Stage 03 build")
+    if payload.get("operation") != "build-write":
+        raise ValueError(f"{label}: Stage 03 operation must be build-write")
+    if payload.get("lmPcode") != config.lm_pcode:
+        raise ValueError(f"{label}: Stage 03 LM mismatch")
+    if payload.get("month") != monthly_input.period:
+        raise ValueError(f"{label}: Stage 03 month mismatch")
+
+    manifest_reconciliation = payload.get("reconciliation")
+    if not isinstance(manifest_reconciliation, list) or len(manifest_reconciliation) != 1:
+        raise ValueError(f"{label}: Stage 03 reconciliation must contain exactly one LM/month")
+    recorded_reconciliation = manifest_reconciliation[0]
+    if not isinstance(recorded_reconciliation, Mapping):
+        raise ValueError(f"{label}: Stage 03 reconciliation row is invalid")
+    expected_reconciliation_keys = {
+        "lmPcode",
+        "month",
+        "purchasesCount",
+        "metersCount",
+        "amountTotalC",
+        "costC",
+        "vatC",
+    }
+    if set(recorded_reconciliation) != expected_reconciliation_keys:
+        raise ValueError(f"{label}: Stage 03 reconciliation fields are incomplete or unexpected")
+    for field in ("purchasesCount", "metersCount", "amountTotalC", "costC", "vatC"):
+        require_json_int(recorded_reconciliation.get(field), f"{label} reconciliation.{field}", minimum=0)
+    if recorded_reconciliation.get("purchasesCount") == 0 or recorded_reconciliation.get("metersCount") == 0:
+        raise ValueError(f"{label}: Stage 03 reconciliation counts must be positive")
+    if recorded_reconciliation.get("amountTotalC") != (
+        recorded_reconciliation.get("costC") + recorded_reconciliation.get("vatC")
+    ):
+        raise ValueError(f"{label}: Stage 03 reconciliation money does not balance")
+    if dict(recorded_reconciliation) != dict(reconciliation):
+        raise ValueError(f"{label}: reconciliation does not match the monthly CSV")
+
+    outputs = payload.get("outputs")
+    if not isinstance(outputs, list) or len(outputs) != 3:
+        raise ValueError(f"{label}: Stage 03 manifest must contain exactly three outputs")
+    by_dataset: dict[str, Mapping[str, Any]] = {}
+    for item in outputs:
+        if not isinstance(item, Mapping):
+            raise ValueError(f"{label}: Stage 03 output entry is invalid")
+        dataset = item.get("dataset")
+        if dataset not in STAGE03_DATASETS or dataset in by_dataset:
+            raise ValueError(f"{label}: duplicate or unsupported Stage 03 dataset {dataset!r}")
+        by_dataset[str(dataset)] = item
+    if set(by_dataset) != set(STAGE03_DATASETS):
+        raise ValueError(f"{label}: Stage 03 output dataset set is incomplete")
+
+    output_rows: dict[str, int] = {}
+    for dataset in STAGE03_DATASETS:
+        item = by_dataset[dataset]
+        expected_filename = expected_stage03_filename(dataset, scope, monthly_input.period)
+        if item.get("month") != monthly_input.period:
+            raise ValueError(f"{label}: {dataset} output month mismatch")
+        if item.get("filename") != expected_filename:
+            raise ValueError(f"{label}: {dataset} output filename mismatch")
+        recorded_path = item.get("path")
+        if not isinstance(recorded_path, str) or Path(recorded_path).name != expected_filename:
+            raise ValueError(f"{label}: {dataset} output path identity mismatch")
+        rows = require_json_int(item.get("rows"), f"{label} {dataset}.rows", minimum=1)
+        output_rows[dataset] = rows
+        require_sha256(item.get("sha256"), f"{label} {dataset}.sha256")
+
+    monthly_evidence = by_dataset["monthly"]
+    if Path(str(monthly_evidence["path"])).resolve() != monthly_snapshot.path:
+        raise ValueError(f"{label}: monthly output path does not match the selected CSV")
+    if monthly_evidence.get("rows") != len(monthly_snapshot.frame):
+        raise ValueError(f"{label}: monthly output row count does not match the selected CSV")
+    if monthly_evidence.get("sha256") != monthly_snapshot.sha256:
+        raise ValueError(f"{label}: monthly output SHA-256 does not match the selected CSV")
+
+    atomic_file = payload.get("atomicFile")
+    if not isinstance(atomic_file, Mapping):
+        raise ValueError(f"{label}: missing Atomic source evidence")
+    atomic_rows = require_json_int(atomic_file.get("rows"), f"{label} atomicFile.rows", minimum=1)
+    atomic_filename = atomic_file.get("filename")
+    if not isinstance(atomic_filename, str):
+        raise ValueError(f"{label}: invalid Atomic filename evidence")
+    atomic_pattern = re.compile(
+        rf"^atomic__conlog_prepaid_sales__{re.escape(config.lm_pcode)}__"
+        rf"{re.escape(monthly_input.period)}__(?P<rows>\d+)\.csv$"
+    )
+    atomic_match = atomic_pattern.fullmatch(atomic_filename)
+    if not atomic_match or int(atomic_match.group("rows")) != atomic_rows:
+        raise ValueError(f"{label}: Atomic filename/row evidence mismatch")
+    if atomic_file.get("month") != monthly_input.period:
+        raise ValueError(f"{label}: Atomic month evidence mismatch")
+    atomic_path = atomic_file.get("path")
+    if not isinstance(atomic_path, str) or Path(atomic_path).name != atomic_filename:
+        raise ValueError(f"{label}: Atomic path evidence mismatch")
+    require_sha256(atomic_file.get("sha256"), f"{label} atomicFile.sha256")
+
+    if require_json_int(payload.get("atomicRows"), f"{label} atomicRows", minimum=1) != atomic_rows:
+        raise ValueError(f"{label}: atomicRows does not match atomicFile.rows")
+    if atomic_rows != reconciliation["purchasesCount"]:
+        raise ValueError(f"{label}: Atomic row count does not reconcile to monthly purchases")
+    if require_json_int(payload.get("atomicUniqueMeters"), f"{label} atomicUniqueMeters", minimum=1) != reconciliation["metersCount"]:
+        raise ValueError(f"{label}: Atomic unique meters do not reconcile to monthly rows")
+    if require_json_int(payload.get("monthlyRows"), f"{label} monthlyRows", minimum=1) != output_rows["monthly"]:
+        raise ValueError(f"{label}: monthlyRows does not match monthly output")
+    if require_json_int(payload.get("monthlyLmRows"), f"{label} monthlyLmRows", minimum=1) != output_rows["monthly_lm"] or output_rows["monthly_lm"] != 1:
+        raise ValueError(f"{label}: monthly LM output must contain exactly one row")
+    if require_json_int(payload.get("monthlyLmGroupRows"), f"{label} monthlyLmGroupRows", minimum=1) != output_rows["monthly_lm_groups"]:
+        raise ValueError(f"{label}: monthly group row count mismatch")
+
+    write_summary = payload.get("writeSummary")
+    if not isinstance(write_summary, Mapping):
+        raise ValueError(f"{label}: missing Stage 03 write summary")
+    written = require_json_int(write_summary.get("written"), f"{label} writeSummary.written", minimum=0)
+    unchanged = require_json_int(write_summary.get("unchanged"), f"{label} writeSummary.unchanged", minimum=0)
+    if written + unchanged != 3:
+        raise ValueError(f"{label}: Stage 03 write summary does not cover all three outputs")
+
+
+def stage03_source_identity(manifest: JsonSnapshot) -> str:
+    atomic = manifest.payload["atomicFile"]
+    reconciliation = manifest.payload["reconciliation"]
+    outputs = sorted(
+        (
+            {
+                "dataset": item["dataset"],
+                "filename": item["filename"],
+                "rows": item["rows"],
+                "sha256": item["sha256"],
+            }
+            for item in manifest.payload["outputs"]
+        ),
+        key=lambda item: item["dataset"],
+    )
+    contract = {
+        "atomicFilename": atomic["filename"],
+        "atomicRows": atomic["rows"],
+        "atomicSha256": atomic["sha256"],
+        "reconciliation": reconciliation,
+        "outputs": outputs,
+    }
+    return canonical_json_sha256(contract)
+
+
+def approve_monthly_input(
+    monthly_input: MonthlyInput,
+    *,
+    manifest_dir: Path,
+    config: BuildConfig,
+    scope: str,
+) -> ApprovedMonthlyInput:
+    csv_snapshot = read_csv_snapshot(monthly_input.path, "monthly input")
+    frame, reconciliation = validate_monthly_snapshot(
+        monthly_input,
+        csv_snapshot,
+        config,
+    )
+    pattern = (
+        f"stage03_monthly_build__{config.lm_pcode}__"
+        f"{monthly_input.period}__*.json"
+    )
+    candidates = sorted(manifest_dir.glob(pattern))
+    if not candidates:
+        raise FileNotFoundError(
+            f"No Stage 03 manifest found for {config.lm_pcode}/{monthly_input.period} "
+            f"in {manifest_dir}"
+        )
+
+    valid: list[JsonSnapshot] = []
+    errors: list[str] = []
+    for path in candidates:
+        try:
+            manifest = read_json_snapshot(path, "Stage 03 manifest")
+            validate_stage03_manifest(
+                manifest,
+                monthly_input=monthly_input,
+                monthly_snapshot=csv_snapshot,
+                reconciliation=reconciliation,
+                config=config,
+                scope=scope,
+            )
+            valid.append(manifest)
+        except Exception as exc:
+            errors.append(f"{path.name}: {exc}")
+    if not valid:
+        detail = "; ".join(errors[:3])
+        raise ValueError(
+            f"No successful matching Stage 03 manifest for "
+            f"{config.lm_pcode}/{monthly_input.period}. {detail}"
+        )
+
+    identities = {stage03_source_identity(item) for item in valid}
+    if len(identities) != 1:
+        raise ValueError(
+            f"Ambiguous Stage 03 source evidence for {config.lm_pcode}/"
+            f"{monthly_input.period}: {len(identities)} different valid Atomic contracts"
+        )
+    selected = max(valid, key=lambda item: item.path.name)
+    return ApprovedMonthlyInput(
+        period=monthly_input.period,
+        csv=csv_snapshot,
+        frame=frame,
+        reconciliation=reconciliation,
+        stage03_manifest=selected,
+    )
+
+
+def approve_monthly_inputs(
+    monthly_inputs: Sequence[MonthlyInput],
+    *,
+    manifest_dir: Path,
+    config: BuildConfig,
+    scope: str,
+) -> list[ApprovedMonthlyInput]:
+    if not manifest_dir.is_dir():
+        raise FileNotFoundError(f"Stage 03 manifest directory not found: {manifest_dir}")
+    return [
+        approve_monthly_input(
+            item,
+            manifest_dir=manifest_dir,
+            config=config,
+            scope=scope,
+        )
+        for item in monthly_inputs
+    ]
 
 
 def merge_duplicate_reference_record(
@@ -468,14 +1044,13 @@ def choose_best_raw_meter_no(
 
 
 def load_monthly_meter_universe(
-    monthly_inputs: Iterable[MonthlyInput],
+    monthly_inputs: Iterable[ApprovedMonthlyInput],
     config: BuildConfig,
 ) -> MasterMap:
     master_map: MasterMap = {}
 
     for monthly_input in monthly_inputs:
-        df = pd.read_csv(monthly_input.path, dtype=str).fillna("")
-        require_columns(df, ["lmPcode", "meterNo", "ym"], monthly_input.path)
+        df = monthly_input.frame
 
         lm_values = df["lmPcode"].map(safe_str).str.upper()
         wrong_lm = lm_values != config.lm_pcode
@@ -511,8 +1086,9 @@ def load_monthly_meter_universe(
     return master_map
 
 
-def load_customer_details(filepath: Path, stats: BuildStats) -> CustomerMap:
-    df = pd.read_csv(filepath, dtype=str).fillna("")
+def load_customer_details(snapshot: CsvSnapshot, stats: BuildStats) -> CustomerMap:
+    filepath = snapshot.path
+    df = snapshot.frame
     require_columns(
         df,
         [
@@ -582,6 +1158,11 @@ def merge_npr_duplicate_record(
     current_customer = safe_str(existing.get("customerNo"))
     incoming_customer = safe_str(candidate.get("customerNo"))
 
+    # A blank NPR identity carries no authority to replace or rank a populated
+    # customer number, including the governed meter-number placeholder.
+    if current_customer and not incoming_customer:
+        return None
+
     if not current_customer or current_customer == incoming_customer:
         merge_duplicate_reference_record(
             existing,
@@ -630,8 +1211,9 @@ def merge_npr_duplicate_record(
     return "latest_purchase"
 
 
-def load_npr(filepath: Path, stats: BuildStats) -> NprMap:
-    df = pd.read_csv(filepath, dtype=str).fillna("")
+def load_npr(snapshot: CsvSnapshot, stats: BuildStats) -> NprMap:
+    filepath = snapshot.path
+    df = snapshot.frame
     require_columns(
         df,
         ["MeterIdentifier", "CustomerNo1", "LastPurchaseDate"],
@@ -793,13 +1375,193 @@ def validate_staging_dataframe(df: pd.DataFrame, config: BuildConfig) -> None:
         raise ValueError("Meter Master output contains an unexpected salesProvider.")
 
 
-def write_csv(df: pd.DataFrame, output_path: Path) -> None:
-    """Write through a temporary file so a failed write cannot leave partial output."""
+def utc_iso_now() -> str:
+    return (
+        dt.datetime.now(dt.timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def canonical_json_sha256(payload: Dict[str, Any]) -> str:
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def resolve_manifest_path(output_path: Path) -> Path:
+    return output_path.with_suffix(".manifest.json")
+
+
+def build_manifest(
+    *,
+    config: BuildConfig,
+    scope: str,
+    from_month: str,
+    to_month: str,
+    included_months: Sequence[str],
+    monthly_inputs: Sequence[ApprovedMonthlyInput],
+    customer_details: CsvSnapshot,
+    npr: CsvSnapshot,
+    output: CsvSnapshot,
+    output_rows: int,
+    stats: BuildStats,
+) -> Dict[str, Any]:
+    monthly_evidence: list[Dict[str, Any]] = []
+    for item in monthly_inputs:
+        stage03_atomic = item.stage03_manifest.payload["atomicFile"]
+        monthly_evidence.append(
+            {
+                "month": item.period,
+                "path": str(item.path),
+                "filename": item.path.name,
+                "rows": len(item.frame),
+                "columns": list(MONTHLY_COLUMNS),
+                "sha256": item.csv.sha256,
+                "stage03Manifest": {
+                    "path": str(item.stage03_manifest.path),
+                    "filename": item.stage03_manifest.path.name,
+                    "sha256": item.stage03_manifest.sha256,
+                    "atomicFile": {
+                        "filename": stage03_atomic["filename"],
+                        "rows": stage03_atomic["rows"],
+                        "sha256": stage03_atomic["sha256"],
+                    },
+                    "reconciliation": dict(item.reconciliation),
+                },
+            }
+        )
+    source_contract: Dict[str, Any] = {
+        "lmPcode": config.lm_pcode,
+        "scope": scope,
+        "fromMonth": from_month,
+        "toMonth": to_month,
+        "includedMonths": list(included_months),
+        "provider": config.provider,
+        "meterType": config.meter_type,
+        "monthlyInputs": monthly_evidence,
+        "customerDetails": {
+            "path": str(customer_details.path),
+            "filename": customer_details.path.name,
+            "rows": len(customer_details.frame),
+            "sha256": customer_details.sha256,
+        },
+        "npr": {
+            "path": str(npr.path),
+            "filename": npr.path.name,
+            "rows": len(npr.frame),
+            "sha256": npr.sha256,
+        },
+    }
+    output_contract: Dict[str, Any] = {
+        "path": str(output.path),
+        "filename": output.path.name,
+        "rows": output_rows,
+        "columns": list(MASTER_COLUMNS),
+        "sha256": output.sha256,
+    }
+    stats_payload = {
+        "monthlyBackedMeters": stats.monthly_backed_meters,
+        "customerOnlySeededMeters": stats.customer_only_seeded_meters,
+        "nprOnlySeededMeters": stats.npr_only_seeded_meters,
+        "customerPlaceholderDuplicatesResolved": stats.customer_placeholder_duplicates_resolved,
+        "customerActiveStatusDuplicatesResolved": stats.customer_active_status_duplicates_resolved,
+        "customerLatestPurchaseDuplicatesResolved": stats.customer_latest_purchase_duplicates_resolved,
+        "nprPlaceholderDuplicatesResolved": stats.npr_placeholder_duplicates_resolved,
+        "nprLatestPurchaseDuplicatesResolved": stats.npr_latest_purchase_duplicates_resolved,
+        "totalMasterRows": stats.total_master_rows,
+    }
+    fingerprint_contract = {
+        "lmPcode": config.lm_pcode,
+        "scope": scope,
+        "fromMonth": from_month,
+        "toMonth": to_month,
+        "includedMonths": list(included_months),
+        "provider": config.provider,
+        "meterType": config.meter_type,
+        "monthlyInputs": [
+            {
+                "month": item["month"],
+                "filename": item["filename"],
+                "rows": item["rows"],
+                "columns": item["columns"],
+                "sha256": item["sha256"],
+                "stage03Manifest": {
+                    "filename": item["stage03Manifest"]["filename"],
+                    "sha256": item["stage03Manifest"]["sha256"],
+                    "atomicFile": item["stage03Manifest"]["atomicFile"],
+                    "reconciliation": item["stage03Manifest"]["reconciliation"],
+                },
+            }
+            for item in monthly_evidence
+        ],
+        "customerDetails": {
+            "filename": source_contract["customerDetails"]["filename"],
+            "rows": source_contract["customerDetails"]["rows"],
+            "sha256": source_contract["customerDetails"]["sha256"],
+        },
+        "npr": {
+            "filename": source_contract["npr"]["filename"],
+            "rows": source_contract["npr"]["rows"],
+            "sha256": source_contract["npr"]["sha256"],
+        },
+        "output": {
+            "filename": output_contract["filename"],
+            "rows": output_contract["rows"],
+            "columns": output_contract["columns"],
+            "sha256": output_contract["sha256"],
+        },
+        "stats": stats_payload,
+    }
+    return {
+        "schemaVersion": MANIFEST_SCHEMA_VERSION,
+        "stage": "05",
+        "script": "05_build_meter_master_v3.py",
+        "status": "PASS",
+        "result": "BUILD_WRITTEN",
+        "createdAt": utc_iso_now(),
+        "sourceContract": source_contract,
+        "outputContract": output_contract,
+        "stats": stats_payload,
+        "buildFingerprint": canonical_json_sha256(fingerprint_contract),
+    }
+
+
+def write_json(payload: Dict[str, Any], output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = output_path.with_name(output_path.name + ".tmp")
     try:
-        df.to_csv(temp_path, index=False, encoding="utf-8")
+        with temp_path.open("w", encoding="utf-8", newline="\n") as target:
+            json.dump(payload, target, indent=2, sort_keys=True, ensure_ascii=False)
+            target.write("\n")
         temp_path.replace(output_path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+
+def write_csv(df: pd.DataFrame, output_path: Path) -> CsvSnapshot:
+    """Write through a temporary file so a failed write cannot leave partial output."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = output_path.with_name(output_path.name + ".tmp")
+    payload = df.to_csv(index=False, lineterminator="\n").encode("utf-8")
+    expected_sha256 = sha256_bytes(payload)
+    try:
+        temp_path.write_bytes(payload)
+        if sha256_bytes(temp_path.read_bytes()) != expected_sha256:
+            raise ValueError(f"Temporary Meter Master SHA-256 mismatch: {output_path}")
+        temp_path.replace(output_path)
+        output = read_csv_snapshot(output_path, "Meter Master output")
+        if output.sha256 != expected_sha256:
+            raise ValueError(f"Written Meter Master SHA-256 mismatch: {output_path}")
+        if list(output.frame.columns) != MASTER_COLUMNS or len(output.frame) != len(df):
+            raise ValueError(f"Written Meter Master CSV does not match the planned output: {output_path}")
+        return output
     finally:
         if temp_path.exists():
             temp_path.unlink()
@@ -809,7 +1571,7 @@ def main() -> None:
     args = parse_args()
     validate_month(args.from_month, "--from-month")
     validate_month(args.to_month, "--to-month")
-    if args.from_month and args.to_month and args.from_month > args.to_month:
+    if args.from_month > args.to_month:
         raise ValueError("--from-month cannot be later than --to-month")
 
     config = BuildConfig(
@@ -821,12 +1583,17 @@ def main() -> None:
         raise ValueError("--lm-pcode may not be blank.")
     if not re.fullmatch(r"[A-Z0-9_-]+", config.lm_pcode):
         raise ValueError("--lm-pcode may contain only A-Z, 0-9, underscore, and hyphen.")
-    if not config.provider:
-        raise ValueError("--provider may not be blank.")
-    if not config.meter_type:
-        raise ValueError("--meter-type may not be blank.")
+    if config.provider != GOVERNED_PROVIDER:
+        raise ValueError(
+            f"Stage 05 is currently governed only for provider={GOVERNED_PROVIDER!r}."
+        )
+    if config.meter_type != GOVERNED_METER_TYPE:
+        raise ValueError(
+            f"Stage 05 is currently governed only for meterType={GOVERNED_METER_TYPE!r}."
+        )
 
     monthly_dir = resolve_project_path(args.monthly_dir)
+    stage03_manifest_dir = resolve_project_path(args.stage03_manifest_dir)
     customer_details_path = resolve_project_path(args.customer_details)
     npr_path = resolve_project_path(args.npr)
     output_dir = resolve_project_path(args.output_dir)
@@ -843,9 +1610,21 @@ def main() -> None:
         args.from_month,
         args.to_month,
     )
-    validate_month_continuity(monthly_inputs, args.allow_gaps)
-    first_month = monthly_inputs[0].period
-    last_month = monthly_inputs[-1].period
+    included_months = validate_month_continuity(
+        monthly_inputs,
+        args.from_month,
+        args.to_month,
+    )
+    first_month = args.from_month
+    last_month = args.to_month
+    approved_monthly_inputs = approve_monthly_inputs(
+        monthly_inputs,
+        manifest_dir=stage03_manifest_dir,
+        config=config,
+        scope=args.scope,
+    )
+    customer_details = read_csv_snapshot(customer_details_path, "Customer Details")
+    npr = read_csv_snapshot(npr_path, "90 Days No Purchase report")
 
     output_path = resolve_output_path(
         explicit_output,
@@ -863,23 +1642,45 @@ def main() -> None:
     print(f"Provider: {config.provider}")
     print(f"Customer details: {customer_details_path}")
     print(f"90-day report: {npr_path}")
-    print(f"Months discovered: {len(monthly_inputs)} ({first_month} to {last_month})")
-    for item in monthly_inputs:
-        print(f"  - {item.period}: {item.path}")
+    print(f"Stage 03 manifests: {stage03_manifest_dir}")
+    print(
+        f"Months approved: {len(approved_monthly_inputs)} "
+        f"({first_month} to {last_month})"
+    )
+    for item in approved_monthly_inputs:
+        print(
+            f"  - {item.period}: {item.path} "
+            f"[{item.stage03_manifest.path.name}]"
+        )
 
-    master_map = load_monthly_meter_universe(monthly_inputs, config)
+    master_map = load_monthly_meter_universe(approved_monthly_inputs, config)
     stats.monthly_backed_meters = len(master_map)
 
-    customer_map = load_customer_details(customer_details_path, stats)
-    npr_map = load_npr(npr_path, stats)
+    customer_map = load_customer_details(customer_details, stats)
+    npr_map = load_npr(npr, stats)
     merge_customer_details(master_map, customer_map, config, stats)
     merge_npr(master_map, npr_map, config, stats)
     finalize_master_records(master_map, config)
 
     df = master_rows_to_dataframe(master_map)
     validate_staging_dataframe(df, config)
-    write_csv(df, output_path)
+    output = write_csv(df, output_path)
     stats.total_master_rows = len(df)
+    manifest_path = resolve_manifest_path(output_path)
+    manifest = build_manifest(
+        config=config,
+        scope=args.scope,
+        from_month=first_month,
+        to_month=last_month,
+        included_months=included_months,
+        monthly_inputs=approved_monthly_inputs,
+        customer_details=customer_details,
+        npr=npr,
+        output=output,
+        output_rows=len(df),
+        stats=stats,
+    )
+    write_json(manifest, manifest_path)
 
     print("=== BUILD SUMMARY ===")
     print(f"Monthly-backed meters: {stats.monthly_backed_meters}")
@@ -908,6 +1709,9 @@ def main() -> None:
     print(f"Total meter master rows: {stats.total_master_rows}")
     print("Validation: PASS")
     print(f"Output: {output_path}")
+    print(f"Output SHA-256: {manifest['outputContract']['sha256']}")
+    print(f"Build fingerprint: {manifest['buildFingerprint']}")
+    print(f"Manifest: {manifest_path}")
 
 
 if __name__ == "__main__":

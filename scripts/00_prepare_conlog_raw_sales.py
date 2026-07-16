@@ -14,6 +14,9 @@ RAW STAGING output columns:
 
 The original RAW files are read-only source evidence. This script never edits,
 renames, moves, or deletes them. It does not connect to Firebase.
+
+Meter identities use the shared normalization contract: remove all whitespace,
+uppercase letters, preserve leading zeroes, and impose no universal fixed length.
 """
 
 from __future__ import annotations
@@ -58,7 +61,6 @@ STAGING_COLUMNS = [
     "vatC",
 ]
 
-METER_LENGTH = 11
 
 
 @dataclass
@@ -88,19 +90,19 @@ def parse_args() -> argparse.Namespace:
         "--input-dir",
         type=Path,
         default=DEFAULT_INPUT_DIR,
-        help="Directory containing conlog_raw_sales__<lmPcode>__YYYY-MM.csv files.",
+        help="RAW directory. Relative paths resolve from the repository root.",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
         default=DEFAULT_OUTPUT_DIR,
-        help="Directory for generated Conlog RAW STAGING CSV files.",
+        help="RAW STAGING output directory. Relative paths resolve from the repository root.",
     )
     parser.add_argument(
         "--log-dir",
         type=Path,
         default=DEFAULT_LOG_DIR,
-        help="Directory for Stage 00 summaries and rejected-row reports.",
+        help="Log directory. Relative paths resolve from the repository root.",
     )
     parser.add_argument(
         "--lm-pcode",
@@ -165,6 +167,11 @@ def clean_text(value: object) -> str:
     return str(value).strip()
 
 
+def resolve_project_path(value: Path) -> Path:
+    """Resolve relative CLI paths from PROJECT_ROOT, never from the shell CWD."""
+    return value if value.is_absolute() else PROJECT_ROOT / value
+
+
 def read_csv_robust(path: Path) -> pd.DataFrame:
     last_error: Optional[Exception] = None
     for encoding in ("utf-8-sig", "utf-8", "latin-1"):
@@ -206,9 +213,14 @@ def parse_transaction_datetime(value: object) -> pd.Timestamp:
 
 
 def normalize_raw_meter(value: object) -> str:
-    text = clean_text(value).replace(" ", "")
+    """Apply the governed meter-number normalization without fixed-length rules."""
+    text = re.sub(r"\s+", "", clean_text(value)).upper()
+
+    # Conlog/CSV tools can render an integer identifier as text ending in ".0".
+    # Remove only that numeric source artifact; preserve all other characters.
     if text.endswith(".0") and text[:-2].isdigit():
         text = text[:-2]
+
     return text
 
 
@@ -272,12 +284,6 @@ def canonicalize_raw(
     meter_group = frame["CDUToggle"].apply(normalize_raw_meter)
 
     append_reason(reasons, meter_no == "", "blank_meter_number")
-    append_reason(reasons, ~meter_no.str.fullmatch(r"\d+"), "non_numeric_meter_number")
-    append_reason(
-        reasons,
-        meter_no.str.fullmatch(r"\d+") & (meter_no.str.len() != METER_LENGTH),
-        "invalid_meter_length",
-    )
     append_reason(
         reasons,
         (meter_group != "") & (meter_group != meter_no),
@@ -558,6 +564,10 @@ def write_summary(
 def main() -> None:
     args = parse_args()
     validate_month(args.month, "--month")
+
+    args.input_dir = resolve_project_path(args.input_dir).resolve()
+    args.output_dir = resolve_project_path(args.output_dir).resolve()
+    args.log_dir = resolve_project_path(args.log_dir).resolve()
 
     args.lm_pcode = args.lm_pcode.strip().upper()
     if not re.fullmatch(r"[A-Z0-9_-]+", args.lm_pcode):

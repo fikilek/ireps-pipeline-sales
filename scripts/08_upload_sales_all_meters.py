@@ -1,55 +1,80 @@
 """
 08_upload_sales_all_meters.py
 
-Reusable, controlled uploader for an approved Sales All Meters staging CSV.
+Controlled uploader for one approved, frozen Sales All Meters staging CSV.
 
-Design goals
-------------
-- No hard-coded Firebase project, service account, input CSV, or month list.
-- The service-account project must match --project-id.
-- --confirm-project must exactly match --project-id.
-- create-only requires an empty sales-all-meters collection.
-- resume creates only missing documents, skips exact matches, and blocks conflicts.
-- Dynamic monthly columns become the Firestore monthlyTotalsC map.
-- No merge=True writes.
-- A SHA-256 fingerprint and JSON report provide traceability.
+Safety contract
+---------------
+- explicit Firebase project, confirmation, service account, CSV, Stage 06 manifest and mode;
+- the successful Stage 06 manifest must fingerprint the exact visibility-free CSV;
+- the visibility-free Stage 06 CSV shape, provider, totals, date pairs and canonical
+  meter identities must pass preflight before Firebase is opened;
+- current governed provider is exactly ``conlog``;
+- normal mode is create-only against an empty collection;
+- resume requires the failed report from the exact original Stage 08 upload contract;
+- resume creates only missing documents and rejects changed sources, conflicting
+  pipeline-owned fields and unexpected extra documents;
+- ``master.visibility`` is operationally owned: Stage 08 never creates, defaults,
+  overwrites or clears it, and resume comparison preserves/ignores it;
+- Firestore create operations only: no merge, update, delete or silent overwrite;
+- final collection count and deterministic document samples are verified;
+- every run writes an atomic JSON report.
 
-Example
--------
+Create-only example
+-------------------
 python .\\scripts\\08_upload_sales_all_meters.py `
   --project-id ireps-test `
   --confirm-project ireps-test `
   --service-account "C:\\dev\\secrets\\ireps-test-firebase-adminsdk-fbsvc-d02929e1e3.json" `
   --input .\\output\\sales_all_meters\\sales_all_meters__ZA7423__FULL__2025-09_to_2026-06.csv `
-  --mode create-only `
-  --report-dir .\\output\\sales_all_meters\\upload-reports
+  --manifest .\\output\\sales_all_meters\\sales_all_meters__ZA7423__FULL__2025-09_to_2026-06.manifest.json `
+  --mode create-only
+
+Resume example
+--------------
+python .\\scripts\\08_upload_sales_all_meters.py `
+  --project-id ireps-test `
+  --confirm-project ireps-test `
+  --service-account "C:\\dev\\secrets\\ireps-test-firebase-adminsdk-fbsvc-d02929e1e3.json" `
+  --input .\\output\\sales_all_meters\\sales_all_meters__ZA7423__FULL__2025-09_to_2026-06.csv `
+  --manifest .\\output\\sales_all_meters\\sales_all_meters__ZA7423__FULL__2025-09_to_2026-06.manifest.json `
+  --mode resume `
+  --resume-report <previous-failed-stage08-report.json>
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, Iterator, Mapping, Optional, Sequence
 
 import pandas as pd
-from google.cloud import firestore
-from google.oauth2 import service_account
 from tqdm import tqdm
+
+try:
+    from google.cloud import firestore
+    from google.oauth2 import service_account
+except ImportError:  # Allows offline preflight/help tests without Firebase dependencies.
+    firestore = None  # type: ignore[assignment]
+    service_account = None  # type: ignore[assignment]
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 COLLECTION_NAME = "sales-all-meters"
 BATCH_SIZE = 450
+GOVERNED_PROVIDER = "conlog"
 MONTH_COLUMN_RE = re.compile(r"^amount_(\d{4})_(\d{2})_C$")
+METER_ID_RE = re.compile(r"^[A-Z0-9]+$")
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 BASE_COLUMNS = [
     "masterId",
-    "visibility",
     "meterNo",
     "meterNoNormalized",
     "provider",
@@ -60,7 +85,7 @@ BASE_COLUMNS = [
     "daysSinceLastPurchase",
 ]
 
-ALLOWED_TOP_LEVEL_FIELDS = {
+PIPELINE_TOP_LEVEL_FIELDS = {
     "master",
     "meterNo",
     "meterNoNormalized",
@@ -72,6 +97,7 @@ ALLOWED_TOP_LEVEL_FIELDS = {
     "lastPurchaseAtISO",
     "daysSinceLastPurchase",
 }
+ALLOWED_MASTER_FIELDS = {"id", "visibility"}
 
 
 @dataclass(frozen=True)
@@ -79,7 +105,9 @@ class UploadConfig:
     project_id: str
     service_account_path: Path
     input_path: Path
+    manifest_path: Path
     mode: str
+    resume_report_path: Optional[Path]
     report_dir: Path
 
 
@@ -88,11 +116,19 @@ class PreflightResult:
     row_count: int
     unique_master_ids: int
     csv_sha256: str
+    document_ids_sha256: str
     months: list[str]
     providers: list[str]
-    visible_count: int
-    invisible_count: int
     total_amount_c: int
+
+
+@dataclass(frozen=True)
+class JsonSnapshot:
+    """A parsed JSON object and SHA produced from one immutable byte read."""
+
+    path: Path
+    payload: dict[str, Any]
+    sha256: str
 
 
 @dataclass
@@ -103,12 +139,15 @@ class ResumePlan:
     extra_document_ids: list[str]
 
 
+@dataclass
+class UploadProgress:
+    documents_created: int = 0
+    committed_batches: int = 0
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=(
-            "Upload an approved Sales All Meters CSV to an explicitly selected "
-            "Firebase project."
-        )
+        description="Upload one frozen Sales All Meters CSV to Firestore."
     )
     parser.add_argument("--project-id", required=True, help="Target Firebase project ID.")
     parser.add_argument(
@@ -126,25 +165,36 @@ def parse_args() -> argparse.Namespace:
         "--input",
         required=True,
         type=Path,
-        help="Approved Sales All Meters staging CSV.",
+        help="Frozen visibility-free Sales All Meters CSV generated by Stage 06.",
+    )
+    parser.add_argument(
+        "--manifest",
+        required=True,
+        type=Path,
+        help="Matching successful Stage 06 frozen-build manifest.",
     )
     parser.add_argument(
         "--mode",
         required=True,
-        choices=["create-only", "resume"],
-        help="create-only requires an empty collection; resume completes a verified partial upload.",
+        choices=("create-only", "resume"),
+        help="create-only is normal; resume is restricted recovery.",
+    )
+    parser.add_argument(
+        "--resume-report",
+        type=Path,
+        help="Previous failed Stage 08 JSON report. Required only for resume.",
     )
     parser.add_argument(
         "--report-dir",
         type=Path,
-        default=Path("output/sales_all_meters/upload-reports"),
-        help="Directory for the JSON upload report.",
+        default=Path("output/logs/sales_all_meters"),
+        help="Directory for Stage 08 JSON reports.",
     )
     return parser.parse_args()
 
 
 def resolve_project_path(path: Path) -> Path:
-    return path if path.is_absolute() else PROJECT_ROOT / path
+    return (path if path.is_absolute() else PROJECT_ROOT / path).expanduser().resolve()
 
 
 def safe_str(value: Any) -> str:
@@ -154,14 +204,45 @@ def safe_str(value: Any) -> str:
     return "" if text.lower() == "nan" else text
 
 
+def normalize_meter_id(value: Any) -> str:
+    return "".join(safe_str(value).upper().split())
+
+
 def require_file(path: Path, label: str) -> None:
     if not path.is_file():
         raise FileNotFoundError(f"{label} not found: {path}")
 
 
+def sha256_bytes(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
+def read_json(path: Path, label: str) -> dict[str, Any]:
+    require_file(path, label)
+    try:
+        with path.open("r", encoding="utf-8") as source:
+            payload = json.load(source)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{label} is not valid JSON: {path}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"{label} must contain one JSON object: {path}")
+    return payload
+
+
+def read_json_snapshot(path: Path, label: str) -> JsonSnapshot:
+    require_file(path, label)
+    raw = path.read_bytes()
+    try:
+        payload = json.loads(raw.decode("utf-8-sig"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{label} is not valid JSON: {path}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"{label} must contain one JSON object: {path}")
+    return JsonSnapshot(path=path, payload=payload, sha256=sha256_bytes(raw))
+
+
 def read_service_account_project_id(path: Path) -> str:
-    with path.open("r", encoding="utf-8") as handle:
-        payload = json.load(handle)
+    payload = read_json(path, "Service-account file")
     project_id = safe_str(payload.get("project_id"))
     if not project_id:
         raise ValueError(f"Service-account file has no project_id: {path}")
@@ -170,10 +251,24 @@ def read_service_account_project_id(path: Path) -> str:
 
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def canonical_json_sha256(payload: Any) -> str:
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def document_ids_sha256(values: Sequence[str]) -> str:
+    return canonical_json_sha256(sorted(values))
 
 
 def parse_month_columns(columns: Sequence[str]) -> tuple[list[str], list[str]]:
@@ -190,33 +285,34 @@ def parse_month_columns(columns: Sequence[str]) -> tuple[list[str], list[str]]:
         months.append(f"{year:04d}-{month:02d}")
 
     if not monthly_columns:
-        raise ValueError("CSV has no dynamic amount_YYYY_MM_C monthly columns.")
+        raise ValueError("CSV has no dynamic amount_YYYY_MM_C monthly columns")
     if months != sorted(months):
         raise ValueError(f"Monthly columns are not in chronological order: {months}")
     if len(set(months)) != len(months):
         raise ValueError(f"CSV contains duplicate month columns: {months}")
 
-    expected: list[str] = []
-    start_year, start_month = map(int, months[0].split("-"))
-    end_year, end_month = map(int, months[-1].split("-"))
-    year, month = start_year, start_month
-    while (year, month) <= (end_year, end_month):
-        expected.append(f"{year:04d}-{month:02d}")
-        month += 1
-        if month == 13:
-            month = 1
-            year += 1
+    start = pd.Period(months[0], freq="M")
+    end = pd.Period(months[-1], freq="M")
+    expected = [str(period) for period in pd.period_range(start, end, freq="M")]
     if months != expected:
         raise ValueError(
-            f"Monthly columns must form one complete contiguous range. Found={months}; expected={expected}"
+            "Monthly columns must form one complete contiguous range. "
+            f"Found={months}; expected={expected}"
         )
     return monthly_columns, months
 
 
-def parse_int_series(series: pd.Series, column: str, allow_blank: bool = False) -> pd.Series:
+def parse_integer_series(
+    series: pd.Series,
+    column: str,
+    *,
+    allow_blank: bool = False,
+) -> pd.Series:
     text = series.map(safe_str)
     if not allow_blank and text.eq("").any():
-        raise ValueError(f"CSV contains blank {column} values.")
+        rows = [int(index) + 2 for index in text[text.eq("")].index[:10]]
+        raise ValueError(f"CSV contains blank {column} values at rows {rows}")
+
     numeric = pd.to_numeric(text.replace("", pd.NA), errors="coerce")
     invalid = text.ne("") & numeric.isna()
     if invalid.any():
@@ -233,32 +329,136 @@ def parse_int_series(series: pd.Series, column: str, allow_blank: bool = False) 
     return numeric.astype("Int64")
 
 
+def validate_identity_column(df: pd.DataFrame, column: str) -> None:
+    values = df[column]
+    normalized = values.map(normalize_meter_id)
+    invalid_shape = ~normalized.str.fullmatch(METER_ID_RE)
+    noncanonical = values.ne(normalized)
+    invalid = invalid_shape | noncanonical
+    if invalid.any():
+        examples = [
+            {
+                "row": int(index) + 2,
+                "value": values.loc[index],
+                "canonical": normalized.loc[index],
+            }
+            for index in values[invalid].index[:10]
+        ]
+        raise ValueError(
+            f"{column} must already be canonical uppercase alphanumeric text with all "
+            f"whitespace removed. Examples: {examples}"
+        )
+
+
 def validate_iso_columns(df: pd.DataFrame) -> None:
-    purchase = df["lastPurchaseAtISO"].map(safe_str)
-    days = df["daysSinceLastPurchase"].map(safe_str)
+    purchase = df["lastPurchaseAtISO"]
+    days = df["daysSinceLastPurchase"]
 
     for index, value in purchase[purchase.ne("")].items():
         try:
             parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
         except ValueError as exc:
             raise ValueError(
-                f"lastPurchaseAtISO is invalid at CSV row {index + 2}: {value!r}"
+                f"lastPurchaseAtISO is invalid at CSV row {int(index) + 2}: {value!r}"
             ) from exc
         if parsed.tzinfo is None:
             raise ValueError(
-                f"lastPurchaseAtISO has no timezone at CSV row {index + 2}: {value!r}"
+                f"lastPurchaseAtISO has no timezone at CSV row {int(index) + 2}: {value!r}"
             )
 
-    blank_purchase_with_days = purchase.eq("") & days.ne("")
-    purchase_without_days = purchase.ne("") & days.eq("")
-    if blank_purchase_with_days.any():
-        raise ValueError("daysSinceLastPurchase must be blank when lastPurchaseAtISO is blank.")
-    if purchase_without_days.any():
-        raise ValueError("daysSinceLastPurchase is required when lastPurchaseAtISO is populated.")
+    if (purchase.eq("") & days.ne("")).any():
+        raise ValueError("daysSinceLastPurchase must be blank when lastPurchaseAtISO is blank")
+    if (purchase.ne("") & days.eq("")).any():
+        raise ValueError("daysSinceLastPurchase is required when lastPurchaseAtISO is populated")
 
 
-def load_and_validate_csv(path: Path) -> tuple[pd.DataFrame, list[str], PreflightResult]:
-    df = pd.read_csv(path, dtype=str, encoding="utf-8-sig").fillna("")
+def parse_manifest_as_of_date(value: Any) -> date:
+    text = safe_str(value)
+    if not DATE_RE.fullmatch(text):
+        raise ValueError("Stage 06 manifest sourceContract.asOfDate must use YYYY-MM-DD")
+    try:
+        parsed = date.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError("Stage 06 manifest sourceContract.asOfDate is invalid") from exc
+    if parsed.isoformat() != text:
+        raise ValueError("Stage 06 manifest sourceContract.asOfDate is not canonical")
+    return parsed
+
+
+def validate_recency_contract(
+    df: pd.DataFrame,
+    months: Sequence[str],
+    as_of_date: date,
+) -> None:
+    approved_months = set(months)
+    for index, row in df.iterrows():
+        csv_row = int(index) + 2
+        total = int(safe_str(row["totalAmountC"]))
+        purchase_text = safe_str(row["lastPurchaseAtISO"])
+        days_text = safe_str(row["daysSinceLastPurchase"])
+        positive_months = [
+            month
+            for month in months
+            if int(safe_str(row[f"amount_{month.replace('-', '_')}_C"])) > 0
+        ]
+
+        if total > 0 and (not purchase_text or not days_text):
+            raise ValueError(
+                "Positive totalAmountC requires populated lastPurchaseAtISO and "
+                f"daysSinceLastPurchase at CSV row {csv_row}"
+            )
+        if total == 0 and (purchase_text or days_text):
+            raise ValueError(
+                "A no-sales row must have blank lastPurchaseAtISO and "
+                f"daysSinceLastPurchase at CSV row {csv_row}"
+            )
+        if not purchase_text:
+            continue
+
+        try:
+            purchase = datetime.fromisoformat(purchase_text.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError(
+                f"lastPurchaseAtISO is invalid at CSV row {csv_row}: {purchase_text!r}"
+            ) from exc
+        if purchase.tzinfo is None:
+            raise ValueError(
+                f"lastPurchaseAtISO has no timezone at CSV row {csv_row}: {purchase_text!r}"
+            )
+        purchase_utc = purchase.astimezone(UTC)
+        purchase_month = purchase_utc.strftime("%Y-%m")
+        if purchase_month not in approved_months:
+            raise ValueError(
+                f"lastPurchaseAtISO month {purchase_month!r} is outside the approved "
+                f"Stage 06 range at CSV row {csv_row}"
+            )
+        if positive_months and purchase_month != positive_months[-1]:
+            raise ValueError(
+                f"lastPurchaseAtISO belongs to {purchase_month!r}, but the latest "
+                f"positive sales month is {positive_months[-1]!r} at CSV row {csv_row}"
+            )
+
+        expected_days = (as_of_date - purchase_utc.date()).days
+        if expected_days < 0:
+            raise ValueError(
+                f"lastPurchaseAtISO occurs after Stage 06 asOfDate at CSV row {csv_row}"
+            )
+        if int(days_text) != expected_days:
+            raise ValueError(
+                f"daysSinceLastPurchase is {days_text!r} at CSV row {csv_row}; "
+                f"expected {expected_days} from Stage 06 asOfDate {as_of_date.isoformat()}"
+            )
+
+
+def load_and_validate_csv(
+    path: Path,
+) -> tuple[pd.DataFrame, list[str], PreflightResult]:
+    require_file(path, "Input CSV")
+    raw_bytes = path.read_bytes()
+    try:
+        df = pd.read_csv(io.BytesIO(raw_bytes), dtype=str, encoding="utf-8-sig").fillna("")
+    except Exception as exc:
+        raise ValueError(f"Input CSV is not valid CSV data: {path}") from exc
     actual_columns = list(df.columns)
     monthly_columns, months = parse_month_columns(actual_columns)
     expected_columns = BASE_COLUMNS + monthly_columns
@@ -266,56 +466,74 @@ def load_and_validate_csv(path: Path) -> tuple[pd.DataFrame, list[str], Prefligh
         missing = [column for column in expected_columns if column not in actual_columns]
         unexpected = [column for column in actual_columns if column not in expected_columns]
         raise ValueError(
-            "Sales All Meters columns do not match the approved dynamic contract. "
+            "Sales All Meters columns do not match the visibility-free governed contract. "
             f"Expected={expected_columns}; actual={actual_columns}; "
             f"missing={missing}; unexpected={unexpected}"
         )
+    if "visibility" in actual_columns:
+        raise ValueError(
+            "Stage 08 must not consume a visibility column; master.visibility is operationally owned"
+        )
     if df.empty:
-        raise ValueError("Sales All Meters CSV contains zero rows.")
+        raise ValueError("Sales All Meters CSV contains zero rows")
 
     for column in actual_columns:
-        df[column] = df[column].map(safe_str)
+        raw_series = df[column].astype(str)
+        cleaned = raw_series.map(safe_str)
+        drift = raw_series.ne(cleaned)
+        if drift.any():
+            rows = [int(index) + 2 for index in drift[drift].index[:10]]
+            raise ValueError(f"CSV contains whitespace or text drift in {column} at rows {rows}")
+        df[column] = cleaned
 
-    blank_master = df["masterId"].eq("")
-    if blank_master.any():
-        raise ValueError(f"CSV contains {int(blank_master.sum())} blank masterId value(s).")
-    duplicates = df["masterId"].duplicated(keep=False)
-    if duplicates.any():
-        examples = sorted(df.loc[duplicates, "masterId"].unique().tolist())[:10]
+    for column in ("masterId", "meterNoNormalized"):
+        validate_identity_column(df, column)
+
+    if df["masterId"].eq("").any():
+        raise ValueError("CSV contains blank masterId values")
+    duplicate_ids = df["masterId"].duplicated(keep=False)
+    if duplicate_ids.any():
+        examples = sorted(df.loc[duplicate_ids, "masterId"].unique().tolist())[:10]
         raise ValueError(f"CSV contains duplicate masterId values. Examples: {examples}")
-    invalid_ids = df["masterId"].str.contains("/", regex=False)
-    if invalid_ids.any():
-        examples = df.loc[invalid_ids, "masterId"].head(10).tolist()
-        raise ValueError(f"masterId may not contain '/'. Examples: {examples}")
-    id_mismatch = df["masterId"] != df["meterNoNormalized"]
-    if id_mismatch.any():
-        sample = df.loc[id_mismatch, ["masterId", "meterNoNormalized"]].head(10)
+    mismatch = df["masterId"].ne(df["meterNoNormalized"])
+    if mismatch.any():
+        sample = df.loc[mismatch, ["masterId", "meterNoNormalized"]].head(10)
         raise ValueError(
             "masterId must equal meterNoNormalized. Examples:\n" + sample.to_string(index=False)
         )
     if df["meterNo"].eq("").any():
-        raise ValueError("CSV contains blank meterNo values.")
-    if df["provider"].eq("").any():
-        raise ValueError("CSV contains blank provider values.")
-    if not df["visibility"].isin(["VISIBLE", "INVISIBLE"]).all():
-        examples = df.loc[~df["visibility"].isin(["VISIBLE", "INVISIBLE"]), "visibility"].head(10).tolist()
-        raise ValueError(f"Invalid visibility values. Examples: {examples}")
+        raise ValueError("CSV contains blank meterNo values")
 
-    total_values = parse_int_series(df["totalAmountC"], "totalAmountC")
+    invalid_provider = df["provider"].ne(GOVERNED_PROVIDER)
+    if invalid_provider.any():
+        examples = [
+            {"row": int(index) + 2, "provider": df.at[index, "provider"]}
+            for index in df.index[invalid_provider][:10]
+        ]
+        raise ValueError(
+            f"Every Stage 08 row must have provider={GOVERNED_PROVIDER!r}; "
+            f"blank and alternate values are prohibited. Examples: {examples}"
+        )
+    providers = [GOVERNED_PROVIDER]
+
+    total_values = parse_integer_series(df["totalAmountC"], "totalAmountC")
     monthly_values = {
-        column: parse_int_series(df[column], column)
+        column: parse_integer_series(df[column], column)
         for column in monthly_columns
     }
     calculated = pd.DataFrame(monthly_values).sum(axis=1).astype("Int64")
-    mismatch = total_values != calculated
-    if mismatch.any():
-        sample = df.loc[mismatch, ["masterId", "totalAmountC"] + monthly_columns].head(10)
+    total_mismatch = total_values.ne(calculated)
+    if total_mismatch.any():
+        sample = df.loc[
+            total_mismatch,
+            ["masterId", "totalAmountC"] + monthly_columns,
+        ].head(10)
         raise ValueError(
             "totalAmountC does not equal the sum of dynamic monthly columns. Examples:\n"
             + sample.to_string(index=False)
         )
 
-    days_values = parse_int_series(
+    days_values = parse_integer_series(
         df["daysSinceLastPurchase"],
         "daysSinceLastPurchase",
         allow_blank=True,
@@ -333,17 +551,17 @@ def load_and_validate_csv(path: Path) -> tuple[pd.DataFrame, list[str], Prefligh
     if expected_range_text not in path.name:
         raise ValueError(
             "Input filename does not accurately state its monthly range. "
-            f"Expected {expected_range_text!r} in {path.name!r}."
+            f"Expected {expected_range_text!r} in {path.name!r}"
         )
 
+    ids = df["masterId"].tolist()
     result = PreflightResult(
         row_count=len(df),
         unique_master_ids=int(df["masterId"].nunique()),
-        csv_sha256=sha256_file(path),
+        csv_sha256=sha256_bytes(raw_bytes),
+        document_ids_sha256=document_ids_sha256(ids),
         months=months,
-        providers=sorted(value for value in df["provider"].unique().tolist() if value),
-        visible_count=int((df["visibility"] == "VISIBLE").sum()),
-        invisible_count=int((df["visibility"] == "INVISIBLE").sum()),
+        providers=providers,
         total_amount_c=int(total_values.sum()),
     )
     return df, monthly_columns, result
@@ -352,8 +570,8 @@ def load_and_validate_csv(path: Path) -> tuple[pd.DataFrame, list[str], Prefligh
 def dataframe_rows(df: pd.DataFrame) -> list[dict[str, str]]:
     columns = list(df.columns)
     return [
-        {column: safe_str(row.get(column)) for column in columns}
-        for _, row in df.iterrows()
+        {column: str(row.get(column, "")) for column in columns}
+        for row in df.to_dict("records")
     ]
 
 
@@ -362,47 +580,128 @@ def optional_int(value: Any) -> int | None:
     return None if not text else int(text)
 
 
-def build_document(row: Mapping[str, Any], monthly_columns: Sequence[str]) -> dict[str, Any]:
+def build_document(
+    row: Mapping[str, Any],
+    monthly_columns: Sequence[str],
+) -> dict[str, Any]:
     monthly_totals: dict[str, int] = {}
     for column in monthly_columns:
         match = MONTH_COLUMN_RE.fullmatch(column)
         if match is None:
             raise ValueError(f"Invalid monthly column passed to build_document: {column!r}")
         ym = f"{match.group(1)}-{match.group(2)}"
-        monthly_totals[ym] = int(safe_str(row.get(column)) or "0")
+        monthly_totals[ym] = int(str(row[column]))
 
     return {
-        "master": {
-            "id": safe_str(row.get("masterId")),
-            "visibility": safe_str(row.get("visibility")),
-        },
-        "meterNo": safe_str(row.get("meterNo")),
-        "meterNoNormalized": safe_str(row.get("meterNoNormalized")),
-        "provider": safe_str(row.get("provider")),
-        "customerNo": safe_str(row.get("customerNo")),
-        "accountNo": safe_str(row.get("accountNo")),
-        "totalAmountC": int(safe_str(row.get("totalAmountC")) or "0"),
+        "master": {"id": str(row["masterId"])},
+        "meterNo": str(row["meterNo"]),
+        "meterNoNormalized": str(row["meterNoNormalized"]),
+        "provider": str(row["provider"]),
+        "customerNo": str(row["customerNo"]),
+        "accountNo": str(row["accountNo"]),
+        "totalAmountC": int(str(row["totalAmountC"])),
         "monthlyTotalsC": monthly_totals,
-        "lastPurchaseAtISO": safe_str(row.get("lastPurchaseAtISO")) or None,
-        "daysSinceLastPurchase": optional_int(row.get("daysSinceLastPurchase")),
+        "lastPurchaseAtISO": str(row["lastPurchaseAtISO"]) or None,
+        "daysSinceLastPurchase": optional_int(row["daysSinceLastPurchase"]),
     }
 
 
-def compare_existing_document(existing: Mapping[str, Any], expected: Mapping[str, Any]) -> list[str]:
-    differences: list[str] = []
-    existing_keys = set(existing.keys())
-    missing = sorted(ALLOWED_TOP_LEVEL_FIELDS - existing_keys)
-    extra = sorted(existing_keys - ALLOWED_TOP_LEVEL_FIELDS)
-    if missing:
-        differences.append(f"missing top-level fields: {missing}")
-    if extra:
-        differences.append(f"unexpected top-level fields: {extra}")
+def is_strict_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
 
-    for field in sorted(ALLOWED_TOP_LEVEL_FIELDS):
-        if existing.get(field) != expected.get(field):
+
+def compare_existing_document(
+    existing: Mapping[str, Any],
+    expected: Mapping[str, Any],
+) -> list[str]:
+    """Compare only Stage 08-owned fields while preserving operational visibility."""
+    differences: list[str] = []
+
+    missing_top = sorted(PIPELINE_TOP_LEVEL_FIELDS - set(existing.keys()))
+    extra_top = sorted(set(existing.keys()) - PIPELINE_TOP_LEVEL_FIELDS)
+    if missing_top:
+        differences.append(f"missing top-level fields: {missing_top}")
+    if extra_top:
+        differences.append(f"unexpected top-level fields: {extra_top}")
+
+    master = existing.get("master")
+    expected_master = expected["master"]
+    if not isinstance(master, Mapping):
+        differences.append("master is missing or is not an object")
+    else:
+        extra_master = sorted(set(master.keys()) - ALLOWED_MASTER_FIELDS)
+        if extra_master:
+            differences.append(f"master has unexpected fields: {extra_master}")
+        master_id = master.get("id")
+        if not isinstance(master_id, str):
+            differences.append(f"master.id must be a string, found {type(master_id).__name__}")
+        elif master_id != expected_master["id"]:
             differences.append(
-                f"{field} differs: Firestore={existing.get(field)!r}; CSV={expected.get(field)!r}"
+                f"master.id differs: Firestore={master_id!r}; CSV={expected_master['id']!r}"
             )
+        # master.visibility is intentionally ignored and preserved. It is operationally owned.
+
+    for field in ("meterNo", "meterNoNormalized", "provider", "customerNo", "accountNo"):
+        actual = existing.get(field)
+        wanted = expected[field]
+        if not isinstance(actual, str):
+            differences.append(f"{field} must be a string, found {type(actual).__name__}")
+        elif actual != wanted:
+            differences.append(f"{field} differs: Firestore={actual!r}; CSV={wanted!r}")
+
+    total = existing.get("totalAmountC")
+    if not is_strict_int(total):
+        differences.append(f"totalAmountC must be an integer, found {type(total).__name__}")
+    elif total != expected["totalAmountC"]:
+        differences.append(
+            f"totalAmountC differs: Firestore={total!r}; CSV={expected['totalAmountC']!r}"
+        )
+
+    monthly = existing.get("monthlyTotalsC")
+    expected_monthly = expected["monthlyTotalsC"]
+    if not isinstance(monthly, Mapping):
+        differences.append("monthlyTotalsC is missing or is not an object")
+    else:
+        if set(monthly.keys()) != set(expected_monthly.keys()):
+            differences.append(
+                "monthlyTotalsC keys differ: "
+                f"Firestore={sorted(monthly.keys())}; CSV={sorted(expected_monthly.keys())}"
+            )
+        for ym, wanted in expected_monthly.items():
+            actual = monthly.get(ym)
+            if not is_strict_int(actual):
+                differences.append(
+                    f"monthlyTotalsC.{ym} must be an integer, found {type(actual).__name__}"
+                )
+            elif actual != wanted:
+                differences.append(
+                    f"monthlyTotalsC.{ym} differs: Firestore={actual!r}; CSV={wanted!r}"
+                )
+
+    last_purchase = existing.get("lastPurchaseAtISO")
+    expected_last = expected["lastPurchaseAtISO"]
+    if last_purchase is not None and not isinstance(last_purchase, str):
+        differences.append(
+            "lastPurchaseAtISO must be a string or null, "
+            f"found {type(last_purchase).__name__}"
+        )
+    elif last_purchase != expected_last:
+        differences.append(
+            f"lastPurchaseAtISO differs: Firestore={last_purchase!r}; CSV={expected_last!r}"
+        )
+
+    days = existing.get("daysSinceLastPurchase")
+    expected_days = expected["daysSinceLastPurchase"]
+    if days is not None and not is_strict_int(days):
+        differences.append(
+            "daysSinceLastPurchase must be an integer or null, "
+            f"found {type(days).__name__}"
+        )
+    elif days != expected_days:
+        differences.append(
+            f"daysSinceLastPurchase differs: Firestore={days!r}; CSV={expected_days!r}"
+        )
+
     return differences
 
 
@@ -419,8 +718,8 @@ def create_documents(
     db: firestore.Client,
     rows: Sequence[Mapping[str, Any]],
     monthly_columns: Sequence[str],
-) -> int:
-    written = 0
+    progress: UploadProgress,
+) -> None:
     row_batches = list(chunks(rows, BATCH_SIZE))
     for row_batch in tqdm(
         row_batches,
@@ -429,12 +728,12 @@ def create_documents(
     ):
         batch = db.batch()
         for row in row_batch:
-            doc_id = safe_str(row.get("masterId"))
+            doc_id = str(row["masterId"])
             doc_ref = db.collection(COLLECTION_NAME).document(doc_id)
             batch.create(doc_ref, build_document(row, monthly_columns))
         batch.commit()
-        written += len(row_batch)
-    return written
+        progress.committed_batches += 1
+        progress.documents_created += len(row_batch)
 
 
 def build_resume_plan(
@@ -446,7 +745,7 @@ def build_resume_plan(
     conflicts: list[dict[str, Any]] = []
     matching_count = 0
     row_by_id = {row["masterId"]: row for row in rows}
-    ids = list(row_by_id.keys())
+    ids = sorted(row_by_id.keys())
 
     for id_batch in tqdm(
         list(chunks(ids, BATCH_SIZE)),
@@ -474,7 +773,9 @@ def build_resume_plan(
         conflicts.append(
             {
                 "masterId": doc_id,
-                "differences": ["document exists in Firestore but is absent from the approved CSV"],
+                "differences": [
+                    "document exists in Firestore but is absent from the frozen Stage 06 CSV"
+                ],
             }
         )
 
@@ -486,6 +787,250 @@ def build_resume_plan(
     )
 
 
+def deterministic_sample_ids(ids: Sequence[str], sample_count: int = 7) -> list[str]:
+    ordered = sorted(ids)
+    if not ordered:
+        return []
+    count = min(sample_count, len(ordered))
+    if count == 1:
+        return [ordered[0]]
+    positions = sorted(
+        {round(index * (len(ordered) - 1) / (count - 1)) for index in range(count)}
+    )
+    return [ordered[position] for position in positions]
+
+
+def verify_post_upload(
+    db: firestore.Client,
+    rows: Sequence[dict[str, str]],
+    monthly_columns: Sequence[str],
+) -> dict[str, Any]:
+    expected_count = len(rows)
+    final_count = sum(1 for _ in db.collection(COLLECTION_NAME).stream())
+    if final_count != expected_count:
+        raise RuntimeError(
+            f"Post-upload count verification failed: expected={expected_count}, found={final_count}"
+        )
+
+    row_by_id = {row["masterId"]: row for row in rows}
+    samples: list[dict[str, Any]] = []
+    for doc_id in deterministic_sample_ids(list(row_by_id.keys())):
+        snapshot = db.collection(COLLECTION_NAME).document(doc_id).get()
+        if not snapshot.exists:
+            raise RuntimeError(f"Post-upload sample is missing: {COLLECTION_NAME}/{doc_id}")
+        expected = build_document(row_by_id[doc_id], monthly_columns)
+        actual = snapshot.to_dict() or {}
+        differences = compare_existing_document(actual, expected)
+        operational_visibility_present = (
+            isinstance(actual.get("master"), Mapping)
+            and "visibility" in actual["master"]
+        )
+        samples.append(
+            {
+                "masterId": doc_id,
+                "matchesPipelineFields": not differences,
+                "operationalVisibilityPresent": operational_visibility_present,
+            }
+        )
+        if differences:
+            raise RuntimeError(
+                f"Post-upload sample verification failed for {COLLECTION_NAME}/{doc_id}: "
+                f"{differences}"
+            )
+
+    return {
+        "expectedCount": expected_count,
+        "finalCount": final_count,
+        "countVerification": "PASS",
+        "sampleVerification": "PASS",
+        "samples": samples,
+    }
+
+
+def stage06_fingerprint_contract(manifest: Mapping[str, Any]) -> dict[str, Any]:
+    source = manifest.get("sourceContract")
+    output = manifest.get("outputContract")
+    stats = manifest.get("stats")
+    if not isinstance(source, Mapping) or not isinstance(output, Mapping) or not isinstance(stats, Mapping):
+        raise ValueError("Stage 06 manifest is missing sourceContract, outputContract, or stats")
+    stage05 = source.get("stage05Manifest")
+    master = source.get("meterMaster")
+    monthly = source.get("monthlyInputs")
+    if not isinstance(stage05, Mapping) or not isinstance(master, Mapping) or not isinstance(monthly, list):
+        raise ValueError("Stage 06 source contract is incomplete")
+    return {
+        "lmPcode": source.get("lmPcode"),
+        "fromMonth": source.get("fromMonth"),
+        "toMonth": source.get("toMonth"),
+        "includedMonths": source.get("includedMonths"),
+        "provider": source.get("provider"),
+        "asOfDate": source.get("asOfDate"),
+        "visibilityOwnership": source.get("visibilityOwnership"),
+        "stage05Manifest": {
+            "filename": stage05.get("filename"),
+            "sha256": stage05.get("sha256"),
+            "buildFingerprint": stage05.get("buildFingerprint"),
+        },
+        "meterMaster": {
+            "filename": master.get("filename"),
+            "rows": master.get("rows"),
+            "columns": master.get("columns"),
+            "sha256": master.get("sha256"),
+            "documentIdsSha256": master.get("documentIdsSha256"),
+        },
+        "monthlyInputs": [
+            {
+                "month": item.get("month"),
+                "filename": item.get("filename"),
+                "rows": item.get("rows"),
+                "columns": item.get("columns"),
+                "sha256": item.get("sha256"),
+            }
+            for item in monthly if isinstance(item, Mapping)
+        ],
+        "output": {
+            "filename": output.get("filename"),
+            "rows": output.get("rows"),
+            "columns": output.get("columns"),
+            "sha256": output.get("sha256"),
+            "documentIdsSha256": output.get("documentIdsSha256"),
+            "months": output.get("months"),
+            "provider": output.get("provider"),
+            "totalAmountC": output.get("totalAmountC"),
+            "visibilityColumn": output.get("visibilityColumn"),
+        },
+        "stats": dict(stats),
+    }
+
+
+def validate_stage06_manifest(
+    config: UploadConfig,
+    preflight: PreflightResult,
+    actual_columns: Sequence[str],
+    manifest_snapshot: JsonSnapshot,
+) -> dict[str, Any]:
+    manifest = manifest_snapshot.payload
+    if manifest.get("schemaVersion") != 1:
+        raise ValueError("Unsupported Stage 06 manifest schemaVersion")
+    if manifest.get("stage") != "06" or manifest.get("script") != "06_build_sales_all_meters.py":
+        raise ValueError("Manifest is not from Stage 06")
+    if manifest.get("status") != "PASS" or manifest.get("result") != "BUILD_WRITTEN":
+        raise ValueError("Stage 06 manifest is not a successful frozen build")
+
+    recorded = safe_str(manifest.get("buildFingerprint"))
+    calculated = canonical_json_sha256(stage06_fingerprint_contract(manifest))
+    if recorded != calculated:
+        raise ValueError("Stage 06 buildFingerprint is invalid; manifest may be edited or corrupt")
+
+    source = manifest.get("sourceContract")
+    output = manifest.get("outputContract")
+    if not isinstance(source, Mapping) or not isinstance(output, Mapping):
+        raise ValueError("Stage 06 manifest contracts are missing")
+    if source.get("includedMonths") != preflight.months:
+        raise ValueError("Stage 06 manifest includedMonths do not match the CSV")
+    if source.get("fromMonth") != preflight.months[0] or source.get("toMonth") != preflight.months[-1]:
+        raise ValueError("Stage 06 manifest range does not match the CSV")
+    if source.get("provider") != GOVERNED_PROVIDER:
+        raise ValueError("Stage 06 manifest provider is outside the governed contract")
+    if source.get("visibilityOwnership") != "OPERATIONAL_WRITERS_ONLY":
+        raise ValueError("Stage 06 manifest visibility ownership is invalid")
+    as_of_date = parse_manifest_as_of_date(source.get("asOfDate"))
+
+    expected = {
+        "filename": config.input_path.name,
+        "rows": preflight.row_count,
+        "columns": list(actual_columns),
+        "sha256": preflight.csv_sha256,
+        "documentIdsSha256": preflight.document_ids_sha256,
+        "months": preflight.months,
+        "provider": GOVERNED_PROVIDER,
+        "totalAmountC": preflight.total_amount_c,
+        "visibilityColumn": "ABSENT",
+    }
+    for field, wanted in expected.items():
+        if output.get(field) != wanted:
+            raise ValueError(
+                f"Stage 06 manifest outputContract.{field} does not match the supplied CSV"
+            )
+
+    return {
+        "path": str(manifest_snapshot.path),
+        "filename": manifest_snapshot.path.name,
+        "sha256": manifest_snapshot.sha256,
+        "buildFingerprint": recorded,
+        "stage05BuildFingerprint": (source.get("stage05Manifest") or {}).get("buildFingerprint"),
+        "asOfDate": as_of_date.isoformat(),
+        "lmPcode": source.get("lmPcode"),
+        "fromMonth": source.get("fromMonth"),
+        "toMonth": source.get("toMonth"),
+    }
+
+
+def make_upload_contract(
+    config: UploadConfig,
+    preflight: PreflightResult,
+    stage06_evidence: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "projectId": config.project_id,
+        "collection": COLLECTION_NAME,
+        "stage06ManifestFilename": stage06_evidence["filename"],
+        "stage06ManifestSha256": stage06_evidence["sha256"],
+        "stage06BuildFingerprint": stage06_evidence["buildFingerprint"],
+        "stage05BuildFingerprint": stage06_evidence["stage05BuildFingerprint"],
+        "lmPcode": stage06_evidence["lmPcode"],
+        "asOfDate": stage06_evidence["asOfDate"],
+        "csvFilename": config.input_path.name,
+        "csvSha256": preflight.csv_sha256,
+        "rows": preflight.row_count,
+        "documentIdsSha256": preflight.document_ids_sha256,
+        "months": preflight.months,
+        "providers": preflight.providers,
+        "totalAmountC": preflight.total_amount_c,
+        "visibilityColumn": "ABSENT",
+        "visibilityOwnership": "OPERATIONAL_WRITERS_ONLY",
+    }
+
+
+def validate_resume_report(
+    path: Path,
+    current_contract: Mapping[str, Any],
+    current_fingerprint: str,
+) -> dict[str, Any]:
+    previous = read_json(path, "Previous failed Stage 08 report")
+    if safe_str(previous.get("stage")) != "08":
+        raise ValueError("--resume-report is not a Stage 08 report")
+    if safe_str(previous.get("script")) != "08_upload_sales_all_meters.py":
+        raise ValueError("--resume-report script identity mismatch")
+    if safe_str(previous.get("operation")) != "sales_all_meters_upload":
+        raise ValueError("--resume-report operation identity mismatch")
+    if safe_str(previous.get("status")) != "FAIL" or safe_str(previous.get("result")) != "FAILED":
+        raise ValueError("--resume-report must be from a failed Stage 08 upload")
+
+    previous_contract = previous.get("uploadContract")
+    if not isinstance(previous_contract, Mapping):
+        raise ValueError("--resume-report has no uploadContract")
+    recorded_fingerprint = safe_str(previous.get("uploadFingerprint"))
+    recalculated_previous = canonical_json_sha256(previous_contract)
+    if recorded_fingerprint != recalculated_previous:
+        raise ValueError("--resume-report fingerprint is invalid; the report may be edited or corrupt")
+    if dict(previous_contract) != dict(current_contract):
+        raise ValueError(
+            "Resume blocked: current project, CSV SHA, row set, month range, provider or "
+            "sales total does not match the failed original Stage 08 upload"
+        )
+    if recorded_fingerprint != current_fingerprint:
+        raise ValueError("Resume blocked: upload fingerprint differs from the failed original upload")
+
+    return {
+        "path": str(path),
+        "sha256": sha256_file(path),
+        "previousStartedAt": previous.get("startedAt"),
+        "previousFinishedAt": previous.get("finishedAt"),
+        "previousMode": previous.get("mode"),
+    }
+
+
 def make_report_path(report_dir: Path, project_id: str) -> Path:
     timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     return report_dir / f"sales_all_meters_upload__{project_id}__{timestamp}.json"
@@ -493,44 +1038,59 @@ def make_report_path(report_dir: Path, project_id: str) -> Path:
 
 def write_report(report_path: Path, payload: Mapping[str, Any]) -> None:
     report_path.parent.mkdir(parents=True, exist_ok=True)
-    with report_path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, default=str)
-        handle.write("\n")
+    temporary = report_path.with_suffix(report_path.suffix + ".tmp")
+    try:
+        with temporary.open("w", encoding="utf-8", newline="\n") as target:
+            json.dump(payload, target, indent=2, sort_keys=True, default=str)
+            target.write("\n")
+        temporary.replace(report_path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 def build_config(args: argparse.Namespace) -> UploadConfig:
     project_id = safe_str(args.project_id)
     confirm_project = safe_str(args.confirm_project)
     if not project_id:
-        raise ValueError("--project-id may not be blank.")
+        raise ValueError("--project-id may not be blank")
     if confirm_project != project_id:
         raise ValueError(
             f"Project confirmation failed: --project-id={project_id!r}, "
             f"--confirm-project={confirm_project!r}"
         )
+    if args.mode == "resume" and args.resume_report is None:
+        raise ValueError("--mode resume requires --resume-report")
+    if args.mode == "create-only" and args.resume_report is not None:
+        raise ValueError("--resume-report may be used only with --mode resume")
+
     return UploadConfig(
         project_id=project_id,
-        service_account_path=resolve_project_path(args.service_account).resolve(),
-        input_path=resolve_project_path(args.input).resolve(),
+        service_account_path=resolve_project_path(args.service_account),
+        input_path=resolve_project_path(args.input),
+        manifest_path=resolve_project_path(args.manifest),
         mode=args.mode,
-        report_dir=resolve_project_path(args.report_dir).resolve(),
+        resume_report_path=(
+            resolve_project_path(args.resume_report) if args.resume_report is not None else None
+        ),
+        report_dir=resolve_project_path(args.report_dir),
     )
 
 
 def print_preflight(config: UploadConfig, result: PreflightResult) -> None:
     print("\n=== SALES ALL METERS UPLOAD PREFLIGHT ===")
-    print(f"Target project:     {config.project_id}")
-    print(f"Collection:         {COLLECTION_NAME}")
-    print(f"Mode:               {config.mode}")
-    print(f"Input CSV:          {config.input_path}")
-    print(f"Rows:               {result.row_count:,}")
-    print(f"Unique master IDs:  {result.unique_master_ids:,}")
-    print(f"Months:             {len(result.months)} ({result.months[0]} to {result.months[-1]})")
-    print(f"Providers:          {', '.join(result.providers)}")
-    print(f"Visible meters:     {result.visible_count:,}")
-    print(f"Invisible meters:   {result.invisible_count:,}")
-    print(f"Total amount cents: {result.total_amount_c:,}")
-    print(f"CSV SHA-256:        {result.csv_sha256}")
+    print(f"Target project:       {config.project_id}")
+    print(f"Collection:           {COLLECTION_NAME}")
+    print(f"Mode:                 {config.mode}")
+    print(f"Input CSV:            {config.input_path}")
+    print(f"Stage 06 manifest:   {config.manifest_path}")
+    print(f"Rows:                 {result.row_count:,}")
+    print(f"Unique master IDs:    {result.unique_master_ids:,}")
+    print(f"Months:               {len(result.months)} ({result.months[0]} to {result.months[-1]})")
+    print(f"Provider:             {', '.join(result.providers)}")
+    print(f"Total amount cents:   {result.total_amount_c:,}")
+    print(f"CSV SHA-256:          {result.csv_sha256}")
+    print("Visibility column:    ABSENT")
     print("===========================================\n")
 
 
@@ -539,20 +1099,26 @@ def main() -> None:
     config = build_config(args)
     started_at = datetime.now(UTC)
     report_path = make_report_path(config.report_dir, config.project_id)
+    progress = UploadProgress()
 
     report: dict[str, Any] = {
-        "operation": "sales_all_meters_once_off_upload",
+        "stage": "08",
+        "script": "08_upload_sales_all_meters.py",
+        "operation": "sales_all_meters_upload",
         "projectId": config.project_id,
         "collection": COLLECTION_NAME,
         "mode": config.mode,
         "inputPath": str(config.input_path),
+        "manifestPath": str(config.manifest_path),
         "serviceAccountPath": str(config.service_account_path),
         "startedAt": started_at.isoformat(),
         "status": "STARTED",
+        "result": "STARTED",
     }
 
     try:
         require_file(config.input_path, "Input CSV")
+        require_file(config.manifest_path, "Stage 06 manifest")
         require_file(config.service_account_path, "Service-account file")
 
         credential_project = read_service_account_project_id(config.service_account_path)
@@ -564,20 +1130,51 @@ def main() -> None:
             )
 
         df, monthly_columns, preflight = load_and_validate_csv(config.input_path)
+        manifest_snapshot = read_json_snapshot(config.manifest_path, "Stage 06 manifest")
+        stage06_evidence = validate_stage06_manifest(
+            config,
+            preflight,
+            list(df.columns),
+            manifest_snapshot,
+        )
+        validate_recency_contract(
+            df,
+            preflight.months,
+            parse_manifest_as_of_date(stage06_evidence["asOfDate"]),
+        )
         rows = dataframe_rows(df)
+        upload_contract = make_upload_contract(config, preflight, stage06_evidence)
+        upload_fingerprint = canonical_json_sha256(upload_contract)
         report.update(
             {
+                "uploadContract": upload_contract,
+                "uploadFingerprint": upload_fingerprint,
+                "stage06Evidence": dict(stage06_evidence),
                 "csvSha256": preflight.csv_sha256,
+                "documentIdsSha256": preflight.document_ids_sha256,
                 "rowsRead": preflight.row_count,
                 "uniqueMasterIds": preflight.unique_master_ids,
                 "months": preflight.months,
                 "providers": preflight.providers,
-                "visibleMeters": preflight.visible_count,
-                "invisibleMeters": preflight.invisible_count,
                 "totalAmountC": preflight.total_amount_c,
+                "visibilityColumn": "ABSENT",
             }
         )
+
+        if config.mode == "resume":
+            assert config.resume_report_path is not None
+            report["resumeEvidence"] = validate_resume_report(
+                config.resume_report_path,
+                upload_contract,
+                upload_fingerprint,
+            )
+
         print_preflight(config, preflight)
+
+        if firestore is None or service_account is None:
+            raise RuntimeError(
+                "google-cloud-firestore and google-auth are required for Stage 08 upload"
+            )
 
         credentials = service_account.Credentials.from_service_account_file(
             str(config.service_account_path)
@@ -588,11 +1185,11 @@ def main() -> None:
             if collection_has_documents(db):
                 raise RuntimeError(
                     f"Upload blocked: {COLLECTION_NAME} is not empty in {config.project_id}. "
-                    "Use --mode resume only for recovery from a verified partial upload."
+                    "Use --mode resume only for recovery from the exact failed upload report."
                 )
-            written = create_documents(db, rows, monthly_columns)
             matching = 0
             missing_before = len(rows)
+            create_documents(db, rows, monthly_columns, progress)
         else:
             plan = build_resume_plan(db, rows, monthly_columns)
             report["matchingDocuments"] = plan.matching_count
@@ -607,36 +1204,42 @@ def main() -> None:
                     f"Resume blocked: {len(plan.conflicts)} conflicting document(s) found. "
                     f"See report: {report_path}"
                 )
-            written = create_documents(db, plan.missing_rows, monthly_columns)
             matching = plan.matching_count
             missing_before = len(plan.missing_rows)
+            create_documents(db, plan.missing_rows, monthly_columns, progress)
 
-        final_count = sum(1 for _ in db.collection(COLLECTION_NAME).stream())
-        if final_count != preflight.unique_master_ids:
-            raise RuntimeError(
-                f"Post-upload verification failed: collection count={final_count}, "
-                f"expected exactly {preflight.unique_master_ids}."
-            )
-
+        verification = verify_post_upload(db, rows, monthly_columns)
         report.update(
             {
-                "documentsWritten": written,
+                "documentsCreated": progress.documents_created,
+                "committedBatches": progress.committed_batches,
                 "matchingDocuments": matching,
                 "missingDocumentsBeforeWrite": missing_before,
-                "finalCollectionCount": final_count,
-                "status": "PASSED",
+                "verification": verification,
+                "status": "PASS",
+                "result": "UPLOAD_VERIFIED",
             }
         )
+
         print("=== SALES ALL METERS UPLOAD COMPLETE ===")
         print(f"Project:            {config.project_id}")
-        print(f"Documents written:  {written:,}")
+        print(f"Documents created:  {progress.documents_created:,}")
         print(f"Existing matching:  {matching:,}")
-        print(f"Final collection:   {final_count:,}")
+        print(f"Final collection:   {verification['finalCount']:,}")
+        print("Visibility writes:  NONE")
         print(f"Run report:         {report_path}")
 
     except Exception as exc:
-        report["status"] = "FAILED"
-        report["error"] = f"{type(exc).__name__}: {exc}"
+        report.update(
+            {
+                "documentsCreated": progress.documents_created,
+                "committedBatches": progress.committed_batches,
+                "status": "FAIL",
+                "result": "FAILED",
+                "errorType": type(exc).__name__,
+                "error": str(exc),
+            }
+        )
         raise
     finally:
         report["finishedAt"] = datetime.now(UTC).isoformat()

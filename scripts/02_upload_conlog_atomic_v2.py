@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import hashlib
+import io
 import json
 import re
 import sys
@@ -75,6 +76,16 @@ ATOMIC_BUSINESS_COLUMNS = [
 ]
 
 DOCUMENT_FIELDS = [column for column in ATOMIC_COLUMNS if column != "atomicId"]
+INTEGER_DOCUMENT_FIELDS = {
+    "txAtMs",
+    "y",
+    "m",
+    "amountTotalC",
+    "costC",
+    "vatC",
+    "sourceRow",
+    "ingestedAtMs",
+}
 
 ATOMIC_FILENAME_RE = re.compile(
     r"^atomic__conlog_prepaid_sales__"
@@ -168,6 +179,14 @@ def parse_args() -> argparse.Namespace:
             "from a verified partial upload of the same CSV."
         ),
     )
+    parser.add_argument(
+        "--resume-report",
+        type=Path,
+        help=(
+            "Exact previous failed Stage 02 execute-upload report. Required only "
+            "with --mode resume."
+        ),
+    )
     operation = parser.add_mutually_exclusive_group(required=True)
     operation.add_argument(
         "--preflight-only",
@@ -227,12 +246,18 @@ def run_id(value: dt.datetime) -> str:
     return value.astimezone(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+def canonical_json_sha256(payload: Any) -> str:
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def document_ids_sha256(values: Iterable[str]) -> str:
+    return canonical_json_sha256(sorted(values))
 
 
 def dataframe_csv_bytes(frame: pd.DataFrame, columns: list[str]) -> bytes:
@@ -249,18 +274,35 @@ def sha1_text(value: str) -> str:
     return hashlib.sha1(value.encode("utf-8")).hexdigest()
 
 
-def read_json(path: Path) -> dict[str, Any]:
+def read_json(path: Path, label: str = "JSON file") -> dict[str, Any]:
     try:
         with path.open("r", encoding="utf-8") as source:
             payload = json.load(source)
     except FileNotFoundError as exc:
-        raise ValueError(f"Service-account file not found: {path}") from exc
+        raise ValueError(f"{label} not found: {path}") from exc
     except json.JSONDecodeError as exc:
-        raise ValueError(f"Service-account file is not valid JSON: {path}") from exc
+        raise ValueError(f"{label} is not valid JSON: {path}") from exc
 
     if not isinstance(payload, dict):
-        raise ValueError(f"Service-account JSON must contain an object: {path}")
+        raise ValueError(f"{label} must contain a JSON object: {path}")
     return payload
+
+
+def read_json_snapshot(
+    path: Path,
+    label: str = "JSON file",
+) -> tuple[dict[str, Any], str]:
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError as exc:
+        raise ValueError(f"{label} not found: {path}") from exc
+    try:
+        payload = json.loads(raw.decode("utf-8-sig"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{label} is not valid JSON: {path}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"{label} must contain a JSON object: {path}")
+    return payload, hashlib.sha256(raw).hexdigest()
 
 
 def validate_project_identity(args: argparse.Namespace) -> CredentialIdentity:
@@ -276,7 +318,7 @@ def validate_project_identity(args: argparse.Namespace) -> CredentialIdentity:
         )
 
     service_account_path = args.service_account.expanduser().resolve()
-    credential_payload = read_json(service_account_path)
+    credential_payload = read_json(service_account_path, "Service-account file")
     credential_project = clean_text(credential_payload.get("project_id"))
 
     if not credential_project:
@@ -324,15 +366,15 @@ def select_atomic_file(
     return matches[0]
 
 
-def read_csv_robust(path: Path) -> pd.DataFrame:
+def read_csv_robust(csv_bytes: bytes) -> pd.DataFrame:
     last_error: Optional[Exception] = None
     for encoding in ("utf-8-sig", "utf-8", "latin-1"):
         try:
-            return pd.read_csv(path, dtype=str, encoding=encoding)
+            return pd.read_csv(io.BytesIO(csv_bytes), dtype=str, encoding=encoding)
         except Exception as exc:  # pragma: no cover - final error is re-raised
             last_error = exc
     if last_error is None:
-        raise RuntimeError(f"Unable to read CSV: {path}")
+        raise RuntimeError("Unable to read Atomic CSV bytes")
     raise last_error
 
 
@@ -418,7 +460,15 @@ def validate_and_load_atomic(
             f"--month {expected_period!r}"
         )
 
-    frame = read_csv_robust(path)
+    # Read once and retain this immutable byte snapshot. Parsing and the recorded
+    # SHA-256 must describe exactly the same file version even if the path is
+    # replaced or edited concurrently after this read completes.
+    try:
+        csv_bytes = path.read_bytes()
+    except FileNotFoundError as exc:
+        raise ValueError(f"Atomic CSV not found: {path}") from exc
+    file_sha256 = hashlib.sha256(csv_bytes).hexdigest()
+    frame = read_csv_robust(csv_bytes)
     if list(frame.columns) != ATOMIC_COLUMNS:
         raise ValueError(
             "Atomic CSV schema mismatch. Expected exact columns and order: "
@@ -608,7 +658,7 @@ def validate_and_load_atomic(
         lm_pcode=expected_lm_pcode,
         period=expected_period,
         declared_rows=declared_rows,
-        file_sha256=sha256_file(path),
+        file_sha256=file_sha256,
         business_sha256=business_sha256(frame),
         unique_atomic_ids=int(frame["atomicId"].nunique()),
         unique_meters=int(frame["meterNo"].nunique()),
@@ -639,6 +689,55 @@ def row_to_document(row: pd.Series) -> dict[str, Any]:
         )
         for field in DOCUMENT_FIELDS
     }
+
+
+def is_strict_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def compare_atomic_document(
+    actual: Any,
+    expected: dict[str, Any],
+) -> list[str]:
+    """Return exact shape, type, and value differences for one Atomic document."""
+    if not isinstance(actual, dict):
+        return [f"document must be an object, found {type(actual).__name__}"]
+
+    differences: list[str] = []
+    actual_fields = set(actual.keys())
+    expected_fields = set(DOCUMENT_FIELDS)
+    missing = sorted(expected_fields - actual_fields)
+    extra = sorted(actual_fields - expected_fields)
+    if missing:
+        differences.append(f"missing fields: {missing}")
+    if extra:
+        differences.append(f"unexpected fields: {extra}")
+
+    for field in DOCUMENT_FIELDS:
+        if field not in actual:
+            continue
+        value = actual[field]
+        wanted = expected[field]
+        if field in INTEGER_DOCUMENT_FIELDS:
+            if not is_strict_int(value):
+                differences.append(
+                    f"{field} must be an integer, found {type(value).__name__}"
+                )
+            elif value != wanted:
+                differences.append(
+                    f"{field} differs: Firestore={value!r}; CSV={wanted!r}"
+                )
+        else:
+            if not isinstance(value, str):
+                differences.append(
+                    f"{field} must be a string, found {type(value).__name__}"
+                )
+            elif value != wanted:
+                differences.append(
+                    f"{field} differs: Firestore={value!r}; CSV={wanted!r}"
+                )
+
+    return differences
 
 
 def initialize_firestore(
@@ -749,22 +848,16 @@ def compare_existing_for_resume(
 
         expected = row_to_document(frame_by_id.loc[document_id])
         actual = snapshot.to_dict() or {}
-        if actual == expected:
+        differences = compare_atomic_document(actual, expected)
+        if not differences:
             matching += 1
         else:
             conflicts += 1
             if len(conflict_examples) < 5:
-                differing_fields = sorted(
-                    {
-                        key
-                        for key in set(actual) | set(expected)
-                        if actual.get(key) != expected.get(key)
-                    }
-                )
                 conflict_examples.append(
                     {
                         "atomicId": document_id,
-                        "differingFields": differing_fields,
+                        "differences": differences,
                     }
                 )
 
@@ -903,7 +996,8 @@ def verify_post_upload(
             )
         expected = row_to_document(frame_by_id.loc[document_id])
         actual = snapshot.to_dict() or {}
-        matches = actual == expected
+        differences = compare_atomic_document(actual, expected)
+        matches = not differences
         sample_results.append(
             {
                 "atomicId": document_id,
@@ -911,16 +1005,9 @@ def verify_post_upload(
             }
         )
         if not matches:
-            differing_fields = sorted(
-                {
-                    key
-                    for key in set(actual) | set(expected)
-                    if actual.get(key) != expected.get(key)
-                }
-            )
             raise ValueError(
                 "Post-upload sample verification failed for "
-                f"{document_id}: differing fields={differing_fields}"
+                f"{document_id}: differences={differences}"
             )
 
     return {
@@ -968,6 +1055,106 @@ def print_preflight(
     print(f"  extra documents:      {existing.extra:,}")
 
 
+def validate_resume_mode(args: argparse.Namespace) -> None:
+    resume_report = getattr(args, "resume_report", None)
+    if args.mode == "resume" and resume_report is None:
+        raise ValueError("--mode resume requires --resume-report")
+    if args.mode != "resume" and resume_report is not None:
+        raise ValueError("--resume-report may be used only with --mode resume")
+
+
+def make_upload_contract(
+    *,
+    args: argparse.Namespace,
+    atomic: AtomicFile,
+) -> dict[str, Any]:
+    return {
+        "projectId": clean_text(args.project_id),
+        "collection": COLLECTION,
+        "lmPcode": atomic.lm_pcode,
+        "month": atomic.period,
+        "providerId": clean_text(args.vending_provider_id),
+        "csvFilename": atomic.path.name,
+        "csvSha256": atomic.file_sha256,
+        "businessSha256": atomic.business_sha256,
+        "rows": len(atomic.frame),
+        "documentIdsSha256": document_ids_sha256(
+            atomic.frame["atomicId"].tolist()
+        ),
+        "uniqueMeters": atomic.unique_meters,
+        "amountTotalC": atomic.amount_total_cents,
+        "costC": atomic.cost_total_cents,
+        "vatC": atomic.vat_total_cents,
+        "earliestTransaction": atomic.earliest_tx_at_iso,
+        "latestTransaction": atomic.latest_tx_at_iso,
+    }
+
+
+def validate_resume_report(
+    path: Path,
+    *,
+    current_contract: dict[str, Any],
+    current_fingerprint: str,
+) -> dict[str, Any]:
+    resolved_path = path.expanduser().resolve()
+    previous, report_sha256 = read_json_snapshot(
+        resolved_path,
+        "Previous failed Stage 02 report",
+    )
+
+    recorded_report_fingerprint = clean_text(previous.get("reportFingerprint"))
+    report_payload = dict(previous)
+    report_payload.pop("reportFingerprint", None)
+    if not recorded_report_fingerprint or recorded_report_fingerprint != canonical_json_sha256(
+        report_payload
+    ):
+        raise ValueError(
+            "--resume-report fingerprint is invalid; the report may be edited or corrupt"
+        )
+
+    if clean_text(previous.get("stage")) != "02":
+        raise ValueError("--resume-report is not a Stage 02 report")
+    if clean_text(previous.get("script")) != "02_upload_conlog_atomic_v2.py":
+        raise ValueError("--resume-report script identity mismatch")
+    if clean_text(previous.get("operation")) != "execute-upload":
+        raise ValueError(
+            "--resume-report must be from a failed Stage 02 execute-upload attempt"
+        )
+    if (
+        clean_text(previous.get("status")) != "FAIL"
+        or clean_text(previous.get("result")) != "FAILED"
+    ):
+        raise ValueError("--resume-report must be from a failed Stage 02 upload")
+
+    previous_contract = previous.get("uploadContract")
+    if not isinstance(previous_contract, dict):
+        raise ValueError("--resume-report has no uploadContract")
+    recorded_upload_fingerprint = clean_text(previous.get("uploadFingerprint"))
+    if recorded_upload_fingerprint != canonical_json_sha256(previous_contract):
+        raise ValueError(
+            "--resume-report upload fingerprint is invalid; the report may be edited or corrupt"
+        )
+    if previous_contract != current_contract:
+        raise ValueError(
+            "Resume blocked: current project, LM, month, provider, CSV fingerprints, "
+            "row count or Atomic document-ID set does not match the failed original "
+            "Stage 02 upload"
+        )
+    if recorded_upload_fingerprint != current_fingerprint:
+        raise ValueError(
+            "Resume blocked: upload fingerprint differs from the failed original upload"
+        )
+
+    return {
+        "path": str(resolved_path),
+        "sha256": report_sha256,
+        "reportFingerprint": recorded_report_fingerprint,
+        "previousStartedAt": previous.get("startedAt"),
+        "previousFinishedAt": previous.get("finishedAt"),
+        "previousMode": previous.get("mode"),
+    }
+
+
 def base_report(
     *,
     args: argparse.Namespace,
@@ -1007,8 +1194,10 @@ def report_path(
 def write_report(path: Path, report: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
+    payload = dict(report)
+    payload["reportFingerprint"] = canonical_json_sha256(payload)
     with temporary.open("w", encoding="utf-8", newline="\n") as target:
-        json.dump(report, target, indent=2, sort_keys=True, ensure_ascii=False)
+        json.dump(payload, target, indent=2, sort_keys=True, ensure_ascii=False)
         target.write("\n")
     temporary.replace(path)
 
@@ -1030,6 +1219,7 @@ def main() -> int:
     committed_batches = 0
 
     try:
+        validate_resume_mode(args)
         validate_month(args.month)
         expected_lm = clean_text(args.lm_pcode).upper()
         if not expected_lm:
@@ -1055,6 +1245,8 @@ def main() -> int:
             expected_period=args.month,
             expected_provider_id=provider_id,
         )
+        upload_contract = make_upload_contract(args=args, atomic=atomic)
+        upload_fingerprint = canonical_json_sha256(upload_contract)
 
         report.update(
             {
@@ -1071,8 +1263,19 @@ def main() -> int:
                 "vatC": atomic.vat_total_cents,
                 "earliestTransaction": atomic.earliest_tx_at_iso,
                 "latestTransaction": atomic.latest_tx_at_iso,
+                "documentIdsSha256": upload_contract["documentIdsSha256"],
+                "uploadContract": upload_contract,
+                "uploadFingerprint": upload_fingerprint,
             }
         )
+
+        if args.mode == "resume":
+            assert args.resume_report is not None
+            report["resumeEvidence"] = validate_resume_report(
+                args.resume_report,
+                current_contract=upload_contract,
+                current_fingerprint=upload_fingerprint,
+            )
 
         firebase_admin_module, firebase_app, db = initialize_firestore(
             credential=credential,

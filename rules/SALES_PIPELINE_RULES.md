@@ -1,11 +1,11 @@
-﻿# iREPS Sales Pipeline Rules
+# iREPS Sales Pipeline Rules
 
 **File:** `rules/SALES_PIPELINE_RULES.md`
 **Project:** `C:\dev\ireps-pipeline-sales`
 **Status:** Governing project rules
-**Version:** 1.8
+**Version:** 1.8.5
 **Effective date:** 2026-07-16
-**Current phase:** Meter Master governance correction before backend-writer reassessment
+**Current phase:** Confirmed Stage 02, 04, 05, 06 and 08 blocking-contract corrections
 **Current provider:** Conlog
 **Current LM / workbase:** Lesedi — `ZA7423`
 
@@ -431,7 +431,7 @@ Total amount cents:        9,728,029,408
 CSV SHA-256: 139e1775ed4404696077ccf5df4355288eabcb0357fbb7ddeebe578d69179087
 ```
 
-All current Sales All Meters records are `INVISIBLE` because the approved staging Meter Master CSV contained blank `astId` values. This is a derived staging result, not proof that no corresponding operational AST exists anywhere in iREPS.
+The current TEST baseline contains historical pipeline-derived `master.visibility = "INVISIBLE"` values because the earlier Stage 06 implementation treated blank Meter Master `astId` values as `INVISIBLE`. That derivation is no longer approved. A blank `astId` does not prove operational visibility or invisibility. Future Sales Pipeline builds and uploads must omit visibility entirely; any cleanup or migration of the existing TEST values requires a separate approved operational decision.
 
 Earlier Meter Master or Sales All Meters files ending at February 2026 are historical and are not the approved TEST baseline.
 
@@ -727,6 +727,8 @@ Atomic processing must preserve enough source lineage to support reconciliation,
 
 Atomic files must not be manually edited after successful generation except through an agreed correction and rerun process.
 
+The Stage 02 uploader must derive its parsed rows and recorded CSV SHA-256 from one immutable byte snapshot. It must validate the exact Firestore field shape and actual field types, including rejecting booleans where an integer is required. `resume` is permitted only with the exact previous failed Stage 02 execute-upload report. That report must be fingerprint-valid and must bind the same project, collection, LM, month, provider, CSV filename, original file SHA-256, business-content SHA-256, row count, planned document-ID fingerprint, meter count, monetary totals and first/last transaction timestamps. An edited report, changed CSV, mismatched upload contract, unexpected document or type/value conflict must stop recovery.
+
 ---
 
 ## 16. Monthly-sales rule
@@ -823,6 +825,8 @@ one Firebase project + one LM + one month per execution
 
 Stage 04 must consume a Stage 03 manifest for exactly the same one LM/month. It must not consume a multi-month manifest or upload a date range in one execution.
 
+The Stage 03 manifest must identify Stage 03 and the approved builder, have `status = PASS` and `result = BUILD_WRITTEN`, and contain exactly one LM, exactly one month and exactly three output entries with no extras: the approved meter-month, LM-month and LM-month-group CSVs. Stage 04 must validate the manifest identity, selected atomic input evidence, the complete governed reconciliation evidence, each output collection/type/filename/path/schema/row-count/SHA contract, and the equality of the three reconciled monthly layers before Firebase starts.
+
 Stage 04 must:
 
 - require explicit `--project-id`;
@@ -842,6 +846,8 @@ Stage 04 must:
 - never silently update, overwrite, delete, or skip a conflicting document;
 - verify final counts and deterministic sample documents;
 - create a JSON audit report for every preflight and execute attempt.
+
+Stage 04 must derive every parsed CSV and its accepted SHA-256 from the same immutable byte snapshot. Existing Firestore documents used for resume or verification must match the exact governed field set and actual types; numeric equality alone must not allow a boolean, float, string or other wrong Firestore type to pass as an integer.
 
 In `create-only` mode, all three target LM/month scopes must be empty.
 
@@ -1006,6 +1012,7 @@ Stage 05 must require:
 --lm-pcode
 --from-month
 --to-month
+--stage03-manifest-dir
 ```
 
 For the selected LM and continuous range, Stage 05 must dynamically discover and validate exactly one approved monthly meter-level file for every required month:
@@ -1024,6 +1031,10 @@ input/reference/90_Days_No_Purchase_Report.csv
 ```
 
 The builder does not read raw Conlog source files directly. Every included Conlog month must first pass through the approved preparation, Atomic, monthly aggregation, upload, and verification stages.
+
+`--stage03-manifest-dir` defaults to the governed `output/logs/monthly_build` directory. For each required month, Stage 05 must select one unambiguous matching successful Stage 03 source contract from that approved manifest directory; repeated manifests are acceptable only when they prove the identical Atomic and output evidence. The selected manifest must prove the exact LM/month, approved Stage 03 script, `operation = build-write`, `status = PASS`, `result = BUILD_WRITTEN`, exact three-output set, complete reconciliation evidence, and the exact meter-month filename, schema, row count and SHA-256 used by Stage 05. This local frozen-build evidence check does not replace the separate pre-Trials orchestration check for upload order and verified Firestore completion.
+
+Stage 05 must parse each monthly/reference input and calculate the hash recorded in its manifest from one immutable byte snapshot, so the validated data and recorded SHA-256 cannot describe different file versions. Its deterministic build fingerprint must cover the nested Stage 03 manifest, Atomic-input and reconciliation evidence recorded for every monthly input.
 
 One successful Stage 05 execution produces one complete Meter Master staging CSV for the explicit approved range. The output must record the LM, from-month, to-month, included months, row counts, reconciliation results, and SHA-256 fingerprint.
 
@@ -1086,7 +1097,7 @@ For Customer Details duplicates:
 4. remaining competing non-placeholder identities may be resolved only by the latest valid `LastPurchaseDate`;
 5. tied dates, missing dates or remaining conflicts stop the build.
 
-For 90 Days No Purchase duplicates, a customer number equal to the meter identifier is a weak placeholder. A different non-empty customer number may replace it. Remaining competing non-placeholder customer numbers may be resolved only by the latest valid purchase date; unresolved conflicts stop the build.
+For 90 Days No Purchase duplicates, a customer number equal to the meter identifier is a weak placeholder. A different non-empty customer number may replace it. A blank customer number has no precedence and must never replace a valid placeholder or real customer number. Remaining competing non-placeholder customer numbers may be resolved only by the latest valid purchase date; unresolved conflicts stop the build.
 
 The builder must report the count resolved by each approved rule.
 ### 19.4 Firestore document identity
@@ -1342,8 +1353,12 @@ It dynamically discovers and validates every monthly meter-level file in that ra
 Stage 07 operates at:
 
 ```text
-one explicit Firebase project + one approved frozen full-period Meter Master CSV
+one explicit Firebase project
++ one approved frozen full-period Meter Master CSV
++ the matching successful Stage 05 BUILD_WRITTEN manifest
 ```
+
+Before any Firestore connection or write, Stage 07 must verify the Stage 05 manifest schema, status, result, deterministic build fingerprint, governed LM/range/provider/meter type, output row count, exact ten-column schema, output filename, and output SHA-256 against the supplied CSV.
 
 The normal Stage 07 mode is `create-only` against an empty target collection.
 
@@ -1357,10 +1372,13 @@ If the target collection is already established, contains operational Meter Mast
 
 ```text
 the same Firebase project
-the same approved frozen full-period CSV
-the same CSV SHA-256 fingerprint
-the same planned document set
+the same approved Stage 05 manifest and build fingerprint
+the same approved frozen full-period CSV and CSV SHA-256
+the same row count and canonical planned document-ID set
+the same LM, range, provider, and meter type
 ```
+
+Stage 07 `resume` must require `--resume-report` pointing to the previous failed Stage 07 report. The report must itself contain a valid untampered upload-contract fingerprint and must match the current upload contract exactly. A changed or expanded CSV must never be treated as recovery.
 
 In `resume` mode:
 
@@ -1368,8 +1386,17 @@ In `resume` mode:
 missing planned creation
     -> create it
 
-existing exact matching planned result
+existing exact matching pipeline-created result
     -> skip it
+
+existing null in place of a governed empty string
+    -> stop and report the type conflict
+
+invalid or non-pipeline metadata actor/timestamp
+    -> stop and report the metadata conflict
+
+populated or changed operational refs.asts.id
+    -> stop; use a separate reviewed reconciliation or migration process
 
 existing conflicting result
     -> stop and report the conflict
@@ -1399,8 +1426,11 @@ It must require explicit runtime values for:
 --confirm-project
 --service-account
 --input
+--manifest
 --mode
 ```
+
+`--resume-report` is additionally mandatory when `--mode resume` is selected and is prohibited in normal `create-only` mode.
 
 The value supplied through `--confirm-project` must exactly match `--project-id`.
 
@@ -1424,15 +1454,16 @@ The uploader must calculate and report the CSV SHA-256 fingerprint so that uploa
 
 Before upload, the uploader must verify:
 
-- the exact ten-column staging schema and column order;
-- non-empty `masterId`;
-- unique `masterId`;
-- `masterId = meterNoNormalized`;
-- `salesId = meterNoNormalized`;
+- the matching successful and untampered Stage 05 manifest and build fingerprint;
+- the CSV SHA-256, row count, filename, exact ten-column schema and column order against that manifest;
+- non-empty, unique, already canonical `masterId` values;
+- `masterId = meterNoNormalized` and `salesId = meterNoNormalized` after canonical verification;
+- current governed values `salesProvider = conlog` and `meterType = electricity`;
+- blank pipeline `astId` values so Stage 07 cannot create operational AST links;
 - the explicit approved full-period range represented by the input;
 - valid project confirmation;
 - service-account project match;
-- approved upload mode;
+- approved upload mode and, for resume, the exact failed original upload report;
 - target collection state appropriate to that mode.
 
 The uploader must display a preflight summary containing at least:
@@ -1460,7 +1491,7 @@ output/logs/meter_master
 
 The report must record the project, collection, input file, fingerprint, approved range, mode, counts, result, and any conflict or failure.
 
-No Meter Master upload is complete until the resulting Firestore document count and a sample of document shapes have been verified.
+No Meter Master upload is complete until the resulting Firestore document count and deterministic document samples have been verified. Sample verification must confirm exact nested shape, actual string types rather than `null`, canonical identity values, governed Conlog/electricity values, Firestore Timestamp-compatible metadata values, and the exact pipeline metadata actors.
 
 The identity design must be reviewed before multi-LM or multi-provider Production rollout.
 
@@ -1485,13 +1516,29 @@ Uploader: scripts/08_upload_sales_all_meters.py
 
 The builder combines one approved Meter Master CSV with every valid monthly meter-level file in an explicit continuous `--from-month` to `--to-month` range.
 
+Stage 06 must require the matching successful Stage 05 manifest through `--master-manifest`. Before building, it must verify the Stage 05 build fingerprint, Meter Master filename, schema, row count and SHA-256, together with the exact monthly filenames, row counts and SHA-256 values recorded by Stage 05.
+
+Stage 06 must read each validated Stage 05 manifest, Meter Master CSV and monthly CSV as an immutable byte snapshot. Every parsed input and accepted or recorded hash must come from that same snapshot.
+
+`--as-of-date` is mandatory. It must not default to the machine date because identical source files must produce the same `daysSinceLastPurchase` values on every approved rebuild.
+
+A successful Stage 06 execution must atomically write both:
+
+```text
+sales_all_meters__<lmPcode>__FULL__<from-month>_to_<to-month>.csv
+sales_all_meters__<lmPcode>__FULL__<from-month>_to_<to-month>.manifest.json
+```
+
+Both files must be written under `output/sales_all_meters`. The CSV filename and directory are exact governed identities; aliases, alternate directories and merely range-containing filenames are not approved.
+
+The Stage 06 manifest must record the Stage 05 manifest fingerprint, Meter Master SHA-256, every included monthly input SHA-256, LM, range, included months, explicit as-of date, provider, output schema, output row count, output SHA-256, planned document-ID fingerprint, total sales amount, visibility ownership, build statistics and one deterministic build fingerprint.
+
 ### 20.2 Staging contract
 
 Fixed columns:
 
 ```text
 masterId
-visibility
 meterNo
 meterNoNormalized
 provider
@@ -1502,32 +1549,42 @@ lastPurchaseAtISO
 daysSinceLastPurchase
 ```
 
+The Stage 06 staging CSV must not contain a `visibility` column.
+
 They are followed by one dynamic integer-cent column per included month:
 
 ```text
 amount_YYYY_MM_C
 ```
 
-`totalAmountC` must equal the sum of all included monthly amount columns. `lastPurchaseAtISO` is the latest valid purchase across the included range. `daysSinceLastPurchase` is calculated from the explicit build as-of date when reproducibility is required.
+`totalAmountC` must equal the sum of all included monthly amount columns. Every positive monthly sales amount must have a valid timezone-aware `lastPurchaseAtISO` belonging to that same applicable sales month and therefore to the approved continuous range. `lastPurchaseAtISO` is the latest valid purchase across the included range. Every positive `totalAmountC` must have populated recency fields. `daysSinceLastPurchase` is calculated from the explicit build as-of date when reproducibility is required.
 
 Every Meter Master identity remains present. A meter with no sales has zero totals and blank CSV last-purchase fields.
 
-### 20.3 Visibility projection
+### 20.3 Operational visibility ownership
+
+The Sales Pipeline has no authoritative evidence that a meter is operationally `VISIBLE` or `INVISIBLE`.
+
+The Sales Pipeline must not create, derive, default, merge, overwrite, or clear `master.visibility` in `sales-all-meters`.
+
+Mandatory stage ownership:
 
 ```text
-astId populated -> VISIBLE
-astId blank     -> INVISIBLE
+Stage 05 may carry astId as part of the Meter Master staging contract.
+Stage 06 must ignore astId for visibility and must not output a visibility column.
+Stage 08 must not create, upload, overwrite, default, merge, or clear master.visibility.
 ```
 
-This is a supporting projection and must not be written back into Meter Master.
+`master.visibility` is owned exclusively by approved operational meter-registration, Meter Discovery, and Meter Installation writers. The exact backend writer functions must be confirmed during the separate writer assessment.
+
+A blank Meter Master `astId` means only that the pipeline staging record has no AST link. It is not evidence that the physical meter is invisible, undiscovered, or unregistered.
 
 ### 20.4 Firestore shape
 
 ```json
 {
   "master": {
-    "id": "04085345850",
-    "visibility": "INVISIBLE"
+    "id": "04085345850"
   },
   "meterNo": "04085345850",
   "meterNoNormalized": "04085345850",
@@ -1552,15 +1609,36 @@ This is a supporting projection and must not be written back into Meter Master.
 }
 ```
 
-The `monthlyTotalsC` keys are dynamic. The current TEST schema does not add metadata to Sales All Meters.
+The `monthlyTotalsC` keys are dynamic. The current TEST schema does not add metadata to Sales All Meters. The Sales Pipeline-created document must omit `master.visibility`; an approved operational writer may add or update that field later.
 
 ### 20.5 Upload safety
 
-The uploader requires explicit `--project-id`, `--confirm-project`, `--service-account`, `--input` and `--mode` values.
+The uploader requires explicit `--project-id`, `--confirm-project`, `--service-account`, `--input`, `--manifest` and `--mode` values.
 
-Normal mode is `create-only` against an empty collection. `resume` is restricted to recovery from a verified partial upload of the same frozen CSV. Missing documents may be created, exact matches skipped, and conflicts or unexpected documents must stop the upload.
+Stage 08 must validate the successful Stage 06 manifest before connecting to Firestore. The manifest build fingerprint, CSV filename, CSV SHA-256, row count, columns, document-ID fingerprint, month range, provider, total amount and visibility ownership must match the supplied CSV exactly. A missing, edited, stale or mismatched manifest must stop the upload.
 
-Firestore create operations are required. Broad merge writes are prohibited. Every run records the CSV SHA-256, writes a JSON report and verifies the final collection count.
+The Stage 08 preflight must reject any staging CSV that:
+
+- contains a `visibility` column;
+- contains a provider other than the currently governed `conlog` value;
+- contains any blank provider value; every row must use exactly `conlog`;
+- contains a noncanonical `masterId` or `meterNoNormalized` value;
+- contains blank, negative, non-integer or unreconciled monetary values;
+- contains a broken last-purchase and days-since-last-purchase pair;
+- contains positive sales with either recency field blank;
+- contains a purchase timestamp outside the manifest range or outside the latest applicable positive sales month;
+- contains a `daysSinceLastPurchase` value that does not equal the day difference between the UTC purchase date and the Stage 06 manifest `asOfDate`;
+- contains a non-contiguous dynamic month range.
+
+Normal mode is `create-only` against an empty collection. `resume` is restricted to recovery from a verified partial upload of the exact same frozen CSV and upload contract.
+
+`resume` must require the previous failed Stage 08 JSON report. The report fingerprint must match the same Firebase project, Stage 06 manifest SHA-256 and build fingerprint, Stage 05 upstream fingerprint, CSV SHA-256, row count, planned document-ID set, month range, provider, explicit as-of date and total sales amount. A changed or edited report, a different CSV, conflicts, or unexpected documents must stop recovery.
+
+Stage 08 compares and verifies only Sales Pipeline-owned fields. An existing operational `master.visibility` field is outside Stage 08 ownership and must be preserved and ignored during resume and post-upload verification. Stage 08 must not use that exception to tolerate changes to `master.id` or any other Sales Pipeline-owned field.
+
+Firestore create operations are required. Broad merge, update, delete and overwrite operations are prohibited. Every run must record the CSV SHA-256 and deterministic upload fingerprint, write an atomic JSON report, verify the final collection count, and verify deterministic document samples against the exact pipeline-owned Firestore shape and types.
+
+Stage 08 must parse the supplied CSV and calculate the accepted CSV SHA-256 from one immutable byte snapshot. A file version read after parsing must not be used as the hash evidence for the already parsed rows.
 
 ### 20.6 Completed TEST baseline
 
@@ -1574,19 +1652,21 @@ Total amount cents:    9,728,029,408
 Upload result:         PASS
 ```
 
+The document count and sales totals remain the approved historical TEST baseline. Its pipeline-derived `master.visibility` values are not authoritative and are governed by the correction in Section 20.3.
+
 ---
 
 ## 21. Visibility rule
 
 Visibility terminology must follow the iREPS Master Dictionary.
 
-The backend remains the authority.
+Operational backend writers remain the authority for `master.visibility`.
 
-A form-side indication may assist the user, but it must not be treated as final truth.
+The Sales Pipeline is not a visibility writer. It must not infer visibility from sales history, Meter Master presence, a blank or populated `astId`, customer references, or any other pipeline field.
 
-The pipeline must not infer operational linkage beyond what the approved Meter Master and backend rules support.
+A form-side or report-side indication may assist the user, but it must not be treated as final truth unless it comes from the approved operational visibility field.
 
-Any change to `VISIBLE` or `INVISIBLE` behaviour requires review across pipeline, backend, mobile, web, Meter Master, Master Dictionary, and rules.
+Any change to `VISIBLE` or `INVISIBLE` behaviour requires review across pipeline, backend, mobile, web, Meter Master, Master Dictionary, canonical schemas, and rules.
 
 ---
 
@@ -2008,6 +2088,10 @@ The earlier universal month-by-month statement for Stages 05 through 08 was inco
 
 ### 2026-07-14 — Lesedi TEST Sales Pipeline baseline completed
 
+---
+
+### 2026-07-14 — Lesedi TEST Sales Pipeline baseline completed
+
 The complete Conlog Sales Pipeline baseline for Lesedi `ZA7423`, covering September 2025 through June 2026, was built, reconciled and uploaded to `ireps-test`.
 
 ```text
@@ -2071,3 +2155,108 @@ Every amendment must include:
 - any migration action required.
 
 A rules update and the related code change should be committed together whenever practical.
+
+### 2026-07-16 — Sales All Meters visibility ownership corrected
+
+Changed rule:
+
+- the Sales Pipeline must not create, derive, default, merge, overwrite, or clear `master.visibility` in `sales-all-meters`;
+- Stage 06 must not output a `visibility` column and must not derive visibility from Meter Master `astId`;
+- Stage 08 must omit `master.visibility` from pipeline-created documents;
+- approved operational meter-registration, Meter Discovery, and Meter Installation writers exclusively own the field.
+
+Reason:
+
+Sales data and pipeline staging cannot prove whether a physical meter has been registered, discovered, installed, or made operationally visible in iREPS. A blank `astId` is not evidence of invisibility.
+
+Effect on code or data:
+
+- `scripts/06_build_sales_all_meters.py` must remove the visibility projection and related statistics;
+- `scripts/08_upload_sales_all_meters.py` must be corrected separately before the next governed upload;
+- existing TEST `master.visibility = "INVISIBLE"` values are historical pipeline-derived values and require a separate approved cleanup or migration decision.
+
+### 2026-07-16 — Stage 07 frozen-build and resume controls strengthened
+
+Changed rule:
+
+- Stage 07 must require and verify the matching successful Stage 05 manifest before connecting to Firestore;
+- Meter Master identity columns must already satisfy the canonical whitespace-removal and uppercase rule, not merely equal one another;
+- `resume` must require the exact previous failed Stage 07 report and match its manifest, CSV SHA-256, row count, planned document-ID fingerprint, project, LM, range, provider, and meter type;
+- resume comparison must distinguish `null` from governed empty strings and validate actual metadata timestamp types and pipeline actor values;
+- operational `refs.asts.id` changes are outside upload recovery and must block Stage 07 resume;
+- post-upload completion requires count verification plus deterministic document-shape samples.
+
+Reason:
+
+Equality-only checks and count-only verification could accept noncanonical IDs, type drift, invalid metadata, a different recovery source, or an operationally changed collection.
+
+Effect on code or data:
+
+- `scripts/07_upload_meter_master_v3.py` requires `--manifest` for all uploads and `--resume-report` for resume;
+- old Stage 07 reports without the frozen upload contract cannot authorise resume;
+- no Firestore data is changed by this rules amendment; established or operationally modified collections require a separate reviewed reconciliation or migration plan.
+
+### 2026-07-16 — Stage 08 frozen-upload and visibility-preservation controls strengthened
+
+Changed rule:
+
+- Stage 08 must consume the visibility-free Stage 06 CSV contract and must reject a `visibility` column;
+- the current governed provider is exactly `conlog`;
+- `masterId` and `meterNoNormalized` must already satisfy the canonical uppercase whitespace-removal rule;
+- `resume` must require the exact previous failed Stage 08 report and match its project, CSV SHA-256, row count, planned document-ID fingerprint, month range, provider and total amount;
+- Stage 08 must preserve and ignore operational `master.visibility` while comparing every Sales Pipeline-owned field strictly;
+- post-upload completion requires exact collection-count verification plus deterministic document-shape and type samples.
+
+Reason:
+
+The previous uploader could consume the obsolete visibility-bearing CSV, accept unsupported providers, treat a different CSV as resume input, and declare success from count verification alone. These behaviours could create or validate incorrect Sales All Meters documents and could overwrite the established visibility ownership boundary.
+
+Effect on code or data:
+
+- `scripts/08_upload_sales_all_meters.py` now requires the visibility-free Stage 06 shape and `provider = conlog`;
+- old Stage 08 reports without the frozen upload contract cannot authorise resume;
+- pipeline-created documents contain `master.id` but no `master.visibility`;
+- an operationally added `master.visibility` is preserved during recovery and verification;
+- no existing Firestore data is changed by this amendment; historical pipeline-derived TEST visibility values still require a separate approved migration decision.
+
+### 2026-07-16 — Stage 06 to Stage 08 frozen manifest chain completed
+
+Changed rule:
+
+- Stage 06 must require and validate the exact successful Stage 05 manifest and the exact monthly files recorded by that manifest;
+- `--as-of-date` is mandatory and may not default to the machine date;
+- Stage 06 must atomically produce a matching successful JSON manifest containing source hashes, output hash, document-ID fingerprint, totals and a deterministic build fingerprint;
+- Stage 08 must require and validate that Stage 06 manifest before opening Firestore;
+- Stage 08 resume must be bound to both the Stage 06 build fingerprint and the exact failed Stage 08 upload contract.
+
+Reason:
+
+A CSV SHA proves only the file currently supplied. Without the Stage 06 manifest, Stage 08 could not prove that the CSV came from the approved Stage 05 Meter Master, the exact governed monthly inputs and the explicit reproducible as-of date.
+
+Effect on code or data:
+
+- `scripts/06_build_sales_all_meters.py` now requires `--master-manifest` and `--as-of-date`, rejects blank required monthly amounts, writes the output CSV atomically and creates the Stage 06 frozen-build manifest;
+- `scripts/08_upload_sales_all_meters.py` now requires `--manifest` and validates the complete Stage 06 proof chain before Firestore access;
+- old Stage 06 CSVs without a matching Stage 06 manifest are not approved inputs for the corrected Stage 08 uploader;
+- no existing Firestore data is changed by this amendment.
+
+### 2026-07-16 — Confirmed blocking upload and frozen-input defects corrected
+
+Changed rule:
+
+- Stage 02 resume is bound to the fingerprint-valid failed report and exact original Atomic CSV contract, and its Firestore comparisons are shape/type-strict;
+- Stage 04 accepts only the exact one-LM, one-month, three-output Stage 03 manifest and validates its complete identity, Atomic and reconciliation evidence;
+- Stage 05 requires matching Stage 03 frozen-build evidence for every monthly input, prevents blank NPR customer numbers from replacing populated values, and fingerprints the nested evidence;
+- Stage 06 accepts only immutable validated input snapshots, enforces its exact governed output identity, and rejects positive sales without a purchase date in the applicable approved month;
+- Stage 08 requires every provider value to be exactly `conlog`, validates purchase recency against the latest applicable month, and recomputes days since purchase from the Stage 06 manifest `asOfDate`;
+- Stages 02, 04, 05, 06 and 08 must calculate accepted input hashes from the same immutable bytes they parse.
+
+Reason:
+
+Separate file reads, incomplete manifest checks, value-only Firestore comparisons, blank-provider filtering, weak NPR precedence and unrecomputed recency could approve a different source version or incorrect data while presenting a passing fingerprint or verification result.
+
+Effect on code or data:
+
+- the five corrected scripts fail closed on stale, incomplete, type-invalid or internally inconsistent offline inputs;
+- the corrections do not connect to Firebase and do not change existing Firestore data;
+- unresolved upload-order and verified-completion orchestration remains assigned to the separate pre-Trials validation/orchestration script and is not implemented inside these stage scripts.

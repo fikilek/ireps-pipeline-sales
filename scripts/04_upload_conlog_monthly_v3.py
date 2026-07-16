@@ -15,7 +15,8 @@ Safety model:
     - Stage 03 manifest, exact CSV schemas, SHA-256, identities, and reconciliation;
     - Conlog provider document must exist and be active;
     - create-only for normal uploads;
-    - resume only for verified recovery from a partial upload;
+    - resume only with a previous failed Stage 04 execute-upload report that proves
+      the exact same project, LM, month, Stage 03 manifest, input SHA set, and planned IDs;
     - Firestore create operations only: no merge, update, delete, or silent skip;
     - all three target scopes are preflighted before any write;
     - post-upload counts and deterministic sample verification;
@@ -27,6 +28,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import hashlib
+import io
 import json
 import re
 import sys
@@ -48,6 +50,35 @@ PROVIDER_COLLECTION = "vending_providers"
 CONLOG_VENDING_PROVIDER_ID = "vpr_7f4d3c91a2b84e6f"
 CONLOG_PROVIDER_CODE = "CONLOG"
 BATCH_SIZE = 400
+STAGE03_SCRIPT = "03_aggregate_monthly_from_atomic_outputs.py"
+STAGE03_OPERATION = "build-write"
+SHA256_RE = re.compile(r"[0-9a-f]{64}")
+ATOMIC_FILENAME_RE = re.compile(
+    r"^atomic__conlog_prepaid_sales__"
+    r"(?P<lm_pcode>[A-Za-z0-9_-]+)__"
+    r"(?P<period>\d{4}-\d{2})__"
+    r"(?P<rows>\d+)\.csv$"
+)
+
+ATOMIC_COLUMNS = [
+    "atomicId",
+    "vendingProviderId",
+    "lmPcode",
+    "meterNo",
+    "txAtISO",
+    "txAtMs",
+    "ym",
+    "y",
+    "m",
+    "amountTotalC",
+    "costC",
+    "vatC",
+    "currency",
+    "sourceFileId",
+    "sourceRow",
+    "ingestedAtISO",
+    "ingestedAtMs",
+]
 
 MONTHLY_COLUMNS = [
     "docId",
@@ -124,6 +155,28 @@ EXPECTED_COLUMNS = {
     "monthly_lm_groups": MONTHLY_LM_GROUP_COLUMNS,
 }
 
+APPROVED_OUTPUT_LOCATIONS = {
+    "monthly": ("monthly", "monthly__FULL__{month}__from_atomic.csv"),
+    "monthly_lm": (
+        "monthly_lm",
+        "monthly_lm__FULL__{month}__from_atomic.csv",
+    ),
+    "monthly_lm_groups": (
+        "monthly_lm_groups",
+        "monthly_lm_groups__FULL__{month}__from_atomic.csv",
+    ),
+}
+
+STAGE03_RECONCILIATION_FIELDS = [
+    "lmPcode",
+    "month",
+    "purchasesCount",
+    "metersCount",
+    "amountTotalC",
+    "costC",
+    "vatC",
+]
+
 
 @dataclass(frozen=True)
 class CredentialIdentity:
@@ -173,6 +226,14 @@ def parse_args() -> argparse.Namespace:
         choices=("create-only", "resume"),
         help="create-only is normal; resume is only for verified partial-upload recovery.",
     )
+    parser.add_argument(
+        "--resume-report",
+        type=Path,
+        help=(
+            "Required when --mode resume. Path to the previous failed Stage 04 "
+            "execute-upload JSON report for the exact same source contract."
+        ),
+    )
     operation = parser.add_mutually_exclusive_group(required=True)
     operation.add_argument("--preflight-only", action="store_true")
     operation.add_argument("--execute-upload", action="store_true")
@@ -213,16 +274,32 @@ def run_id(value: dt.datetime) -> str:
     return value.astimezone(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+def sha256_bytes(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
 
 
-def sha1_text(value: str) -> str:
-    return hashlib.sha1(value.encode("utf-8")).hexdigest()
+def read_file_snapshot(path: Path, *, label: str) -> bytes:
+    resolved = path.expanduser().resolve()
+    try:
+        return resolved.read_bytes()
+    except FileNotFoundError as exc:
+        raise ValueError(f"{label} is missing: {resolved}") from exc
+    except OSError as exc:
+        raise ValueError(f"Could not read {label}: {resolved}: {exc}") from exc
+
+
+def sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def canonical_json_sha256(value: object) -> str:
+    payload = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return sha256_text(payload)
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -236,6 +313,49 @@ def read_json(path: Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError(f"JSON file must contain an object: {path}")
     return payload
+
+
+def read_json_snapshot(path: Path) -> tuple[dict[str, Any], str]:
+    payload_bytes = read_file_snapshot(path, label="JSON file")
+    try:
+        payload = json.loads(payload_bytes.decode("utf-8-sig"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Invalid JSON file: {path.expanduser().resolve()}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"JSON file must contain an object: {path}")
+    return payload, sha256_bytes(payload_bytes)
+
+
+def require_json_int(
+    value: object,
+    *,
+    label: str,
+    minimum: Optional[int] = None,
+) -> int:
+    if type(value) is not int:
+        raise ValueError(f"{label} must be a JSON integer")
+    if minimum is not None and value < minimum:
+        raise ValueError(f"{label} must be at least {minimum}; found {value}")
+    return value
+
+
+def require_sha256(value: object, *, label: str) -> str:
+    cleaned = clean_text(value)
+    if SHA256_RE.fullmatch(cleaned) is None:
+        raise ValueError(f"{label} must be a lowercase SHA-256 fingerprint")
+    return cleaned
+
+
+def parse_stage03_timestamp(value: object, *, label: str) -> dt.datetime:
+    text = clean_text(value)
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", text):
+        raise ValueError(f"{label} must be a UTC timestamp ending in Z")
+    try:
+        return dt.datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=dt.timezone.utc
+        )
+    except ValueError as exc:
+        raise ValueError(f"{label} is not a valid UTC timestamp") from exc
 
 
 def validate_project_identity(args: argparse.Namespace) -> CredentialIdentity:
@@ -261,11 +381,11 @@ def validate_project_identity(args: argparse.Namespace) -> CredentialIdentity:
     return CredentialIdentity(path=path, project_id=credential_project)
 
 
-def read_csv_robust(path: Path) -> pd.DataFrame:
+def read_csv_robust_bytes(payload: bytes, path: Path) -> pd.DataFrame:
     last_error: Optional[Exception] = None
     for encoding in ("utf-8-sig", "utf-8", "latin-1"):
         try:
-            return pd.read_csv(path, dtype=str, encoding=encoding)
+            return pd.read_csv(io.BytesIO(payload), dtype=str, encoding=encoding)
         except Exception as exc:
             last_error = exc
     if last_error is None:
@@ -311,38 +431,144 @@ def load_manifest_outputs(
     *,
     expected_lm_pcode: str,
     expected_month: str,
-) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
-    manifest = read_json(manifest_path)
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]], str]:
+    manifest, manifest_sha256 = read_json_snapshot(manifest_path)
     if clean_text(manifest.get("stage")) != "03":
         raise ValueError("Manifest is not a Stage 03 report")
+    if clean_text(manifest.get("script")) != STAGE03_SCRIPT:
+        raise ValueError(
+            f"Stage 03 manifest script must be {STAGE03_SCRIPT!r}"
+        )
+    if clean_text(manifest.get("operation")) != STAGE03_OPERATION:
+        raise ValueError(
+            f"Stage 03 manifest operation must be {STAGE03_OPERATION!r}"
+        )
     if clean_text(manifest.get("status")) != "PASS":
         raise ValueError("Stage 03 manifest status is not PASS")
     if clean_text(manifest.get("result")) != "BUILD_WRITTEN":
         raise ValueError("Stage 03 manifest must have result BUILD_WRITTEN")
-    if clean_text(manifest.get("lmPcode")).upper() != expected_lm_pcode:
+    if clean_text(manifest.get("lmPcode")) != expected_lm_pcode:
         raise ValueError("Stage 03 manifest LM does not match --lm-pcode")
     if clean_text(manifest.get("month")) != expected_month:
         raise ValueError("Stage 03 manifest month does not match --month")
 
+    started_at = parse_stage03_timestamp(
+        manifest.get("startedAt"), label="Stage 03 manifest startedAt"
+    )
+    finished_at = parse_stage03_timestamp(
+        manifest.get("finishedAt"), label="Stage 03 manifest finishedAt"
+    )
+    if finished_at < started_at:
+        raise ValueError("Stage 03 manifest finishedAt precedes startedAt")
+
+    outputs = manifest.get("outputs")
+    if not isinstance(outputs, list) or len(outputs) != len(COLLECTIONS):
+        raise ValueError(
+            "Stage 03 manifest must contain exactly three monthly output entries"
+        )
+
     selected: dict[str, dict[str, Any]] = {}
-    for item in manifest.get("outputs") or []:
+    for position, item in enumerate(outputs):
         if not isinstance(item, dict):
-            continue
+            raise ValueError(
+                f"Stage 03 manifest output entry {position} must be an object"
+            )
         dataset = clean_text(item.get("dataset"))
-        month = clean_text(item.get("month"))
-        if dataset in COLLECTIONS and month == expected_month:
-            if dataset in selected:
+        if dataset not in COLLECTIONS:
+            raise ValueError(
+                f"Stage 03 manifest contains an unapproved output dataset: {dataset!r}"
+            )
+        if dataset in selected:
+            raise ValueError(
+                f"Stage 03 manifest contains duplicate {dataset}/{expected_month} outputs"
+            )
+        if clean_text(item.get("month")) != expected_month:
+            raise ValueError(
+                f"Stage 03 manifest output {dataset} is not for {expected_month}"
+            )
+
+        directory, filename_template = APPROVED_OUTPUT_LOCATIONS[dataset]
+        expected_path = (
+            PROJECT_ROOT
+            / "output"
+            / directory
+            / filename_template.format(month=expected_month)
+        ).resolve()
+        path_text = clean_text(item.get("path"))
+        if not path_text:
+            raise ValueError(f"Stage 03 manifest output {dataset} has no path")
+        actual_path = Path(path_text).expanduser().resolve()
+        if actual_path != expected_path:
+            raise ValueError(
+                f"Stage 03 manifest output {dataset} must use approved path "
+                f"{expected_path}; found {actual_path}"
+            )
+        if clean_text(item.get("filename")) != expected_path.name:
+            raise ValueError(
+                f"Stage 03 manifest output {dataset} filename mismatch"
+            )
+
+        require_json_int(
+            item.get("rows"),
+            label=f"Stage 03 manifest output {dataset} rows",
+            minimum=1,
+        )
+        output_sha = require_sha256(
+            item.get("sha256"),
+            label=f"Stage 03 manifest output {dataset} sha256",
+        )
+        existing_state = clean_text(item.get("existingState"))
+        existing_sha = clean_text(item.get("existingSha256"))
+        if existing_state not in {"MISSING", "IDENTICAL", "DIFFERENT"}:
+            raise ValueError(
+                f"Stage 03 manifest output {dataset} has invalid existingState"
+            )
+        if existing_state == "MISSING":
+            if existing_sha:
                 raise ValueError(
-                    f"Stage 03 manifest contains duplicate {dataset}/{expected_month} outputs"
+                    f"Stage 03 manifest output {dataset} was MISSING but has an existing SHA"
                 )
-            selected[dataset] = item
+        else:
+            require_sha256(
+                existing_sha,
+                label=f"Stage 03 manifest output {dataset} existingSha256",
+            )
+            if existing_state == "IDENTICAL" and existing_sha != output_sha:
+                raise ValueError(
+                    f"Stage 03 manifest output {dataset} IDENTICAL SHA mismatch"
+                )
+            if existing_state == "DIFFERENT" and existing_sha == output_sha:
+                raise ValueError(
+                    f"Stage 03 manifest output {dataset} DIFFERENT SHA is identical"
+                )
+
+        selected[dataset] = item
 
     missing = sorted(set(COLLECTIONS) - set(selected))
     if missing:
         raise ValueError(
             f"Stage 03 manifest is missing monthly outputs for {missing}"
         )
-    return manifest, selected
+
+    write_summary = manifest.get("writeSummary")
+    if not isinstance(write_summary, dict):
+        raise ValueError("Stage 03 manifest writeSummary must be an object")
+    written = require_json_int(
+        write_summary.get("written"),
+        label="Stage 03 manifest writeSummary.written",
+        minimum=0,
+    )
+    unchanged = require_json_int(
+        write_summary.get("unchanged"),
+        label="Stage 03 manifest writeSummary.unchanged",
+        minimum=0,
+    )
+    if written + unchanged != len(COLLECTIONS):
+        raise ValueError(
+            "Stage 03 manifest writeSummary must account for exactly three outputs"
+        )
+
+    return manifest, selected, manifest_sha256
 
 
 def validate_iso_ms_pair(
@@ -376,15 +602,22 @@ def validate_dataset(
     if not path.is_file():
         raise ValueError(f"Stage 03 output is missing: {path}")
 
-    expected_sha = clean_text(manifest_entry.get("sha256"))
-    actual_sha = sha256_file(path)
+    expected_sha = require_sha256(
+        manifest_entry.get("sha256"),
+        label=f"Stage 03 output {dataset} sha256",
+    )
+    csv_payload = read_file_snapshot(path, label=f"Stage 03 output {dataset}")
+    actual_sha = sha256_bytes(csv_payload)
     if actual_sha != expected_sha:
         raise ValueError(
             f"Stage 03 output SHA-256 mismatch for {path.name}: "
             f"manifest={expected_sha}, actual={actual_sha}"
         )
 
-    frame = read_csv_robust(path)
+    # Parse the exact byte snapshot that was fingerprinted. Reopening the path here
+    # would allow the accepted SHA and the rows prepared for upload to describe
+    # different file versions if the file changed between operations.
+    frame = read_csv_robust_bytes(csv_payload, path)
     expected_columns = EXPECTED_COLUMNS[dataset]
     if list(frame.columns) != expected_columns:
         raise ValueError(
@@ -515,7 +748,11 @@ def validate_dataset(
         if not frame["metersCount"].gt(0).all():
             raise ValueError("monthly_lm_groups: metersCount must be positive")
 
-    declared_rows = int(manifest_entry.get("rows", -1))
+    declared_rows = require_json_int(
+        manifest_entry.get("rows"),
+        label=f"Stage 03 manifest output {dataset} rows",
+        minimum=1,
+    )
     if len(frame) != declared_rows:
         raise ValueError(
             f"{dataset}: manifest declares {declared_rows} rows but CSV has {len(frame)}"
@@ -552,6 +789,56 @@ def reconcile_datasets(datasets: dict[str, MonthlyDataset]) -> dict[str, int]:
                 f"{value} != {int(lm_row[field])}"
             )
 
+    monthly_by_group = (
+        monthly.groupby(
+            ["salesGroupId", "salesGroupLabel"],
+            as_index=False,
+            sort=True,
+        )
+        .agg(
+            metersCount=("meterNo", "count"),
+            purchasesCount=("purchasesCount", "sum"),
+            amountTotalC=("amountTotalC", "sum"),
+            costC=("costC", "sum"),
+            vatC=("vatC", "sum"),
+            firstPurchaseAtMs=("firstPurchaseAtMs", "min"),
+            lastPurchaseAtMs=("lastPurchaseAtMs", "max"),
+        )
+    )
+    group_fields = [
+        "metersCount",
+        "purchasesCount",
+        "amountTotalC",
+        "costC",
+        "vatC",
+        "firstPurchaseAtMs",
+        "lastPurchaseAtMs",
+    ]
+    expected_group_ids = set(monthly_by_group["salesGroupId"])
+    actual_group_ids = set(groups["salesGroupId"])
+    if actual_group_ids != expected_group_ids:
+        raise ValueError(
+            "monthly_lm_groups group-set reconciliation failed: "
+            f"expected={sorted(expected_group_ids)}, actual={sorted(actual_group_ids)}"
+        )
+    actual_groups = groups.set_index("salesGroupId", drop=False)
+    for expected_group in monthly_by_group.itertuples(index=False):
+        actual_group = actual_groups.loc[expected_group.salesGroupId]
+        if clean_text(actual_group["salesGroupLabel"]) != expected_group.salesGroupLabel:
+            raise ValueError(
+                "monthly_lm_groups label reconciliation failed for "
+                f"{expected_group.salesGroupId}"
+            )
+        for field in group_fields:
+            expected_value = int(getattr(expected_group, field))
+            actual_value = int(actual_group[field])
+            if actual_value != expected_value:
+                raise ValueError(
+                    "monthly_lm_groups per-group reconciliation failed for "
+                    f"{expected_group.salesGroupId}.{field}: "
+                    f"{actual_value} != {expected_value}"
+                )
+
     group_totals = {
         "purchasesCount": int(groups["purchasesCount"].sum()),
         "metersCount": int(groups["metersCount"].sum()),
@@ -568,6 +855,224 @@ def reconcile_datasets(datasets: dict[str, MonthlyDataset]) -> dict[str, int]:
                 f"{group_totals[field]} != {value}"
             )
     return expected
+
+
+def validate_atomic_manifest_evidence(
+    manifest: dict[str, Any],
+    *,
+    expected_lm_pcode: str,
+    expected_month: str,
+) -> dict[str, Any]:
+    atomic_file = manifest.get("atomicFile")
+    if not isinstance(atomic_file, dict):
+        raise ValueError("Stage 03 manifest atomicFile must be an object")
+    if clean_text(atomic_file.get("month")) != expected_month:
+        raise ValueError("Stage 03 manifest Atomic month mismatch")
+
+    path_text = clean_text(atomic_file.get("path"))
+    if not path_text:
+        raise ValueError("Stage 03 manifest Atomic path is blank")
+    atomic_path = Path(path_text).expanduser().resolve()
+    approved_atomic_dir = (PROJECT_ROOT / "output" / "atomic").resolve()
+    if atomic_path.parent != approved_atomic_dir:
+        raise ValueError(
+            f"Stage 03 Atomic evidence must use {approved_atomic_dir}; "
+            f"found {atomic_path.parent}"
+        )
+    if clean_text(atomic_file.get("filename")) != atomic_path.name:
+        raise ValueError("Stage 03 manifest Atomic filename/path mismatch")
+
+    filename_match = ATOMIC_FILENAME_RE.fullmatch(atomic_path.name)
+    if filename_match is None:
+        raise ValueError(f"Invalid Stage 03 Atomic filename: {atomic_path.name}")
+    if filename_match.group("lm_pcode") != expected_lm_pcode:
+        raise ValueError("Stage 03 Atomic filename LM mismatch")
+    if filename_match.group("period") != expected_month:
+        raise ValueError("Stage 03 Atomic filename month mismatch")
+
+    declared_rows = require_json_int(
+        atomic_file.get("rows"),
+        label="Stage 03 manifest atomicFile.rows",
+        minimum=1,
+    )
+    if int(filename_match.group("rows")) != declared_rows:
+        raise ValueError("Stage 03 Atomic filename row count mismatch")
+
+    expected_sha = require_sha256(
+        atomic_file.get("sha256"),
+        label="Stage 03 manifest atomicFile.sha256",
+    )
+    atomic_payload = read_file_snapshot(atomic_path, label="Stage 03 Atomic input")
+    actual_sha = sha256_bytes(atomic_payload)
+    if actual_sha != expected_sha:
+        raise ValueError(
+            "Stage 03 Atomic SHA-256 mismatch: "
+            f"manifest={expected_sha}, actual={actual_sha}"
+        )
+
+    atomic = read_csv_robust_bytes(atomic_payload, atomic_path)
+    if list(atomic.columns) != ATOMIC_COLUMNS:
+        raise ValueError(
+            f"Stage 03 Atomic schema mismatch. Expected {ATOMIC_COLUMNS}; "
+            f"found {list(atomic.columns)}"
+        )
+    if atomic.empty or len(atomic) != declared_rows:
+        raise ValueError(
+            f"Stage 03 Atomic row count mismatch: declared={declared_rows}, "
+            f"actual={len(atomic)}"
+        )
+
+    for column in ("atomicId", "vendingProviderId", "lmPcode", "meterNo", "ym"):
+        cleaned = atomic[column].map(clean_text)
+        if cleaned.eq("").any():
+            raise ValueError(f"Stage 03 Atomic evidence has blank {column}")
+        if atomic[column].astype(str).ne(cleaned).any():
+            raise ValueError(f"Stage 03 Atomic evidence has whitespace drift in {column}")
+        atomic[column] = cleaned
+
+    if atomic["atomicId"].duplicated().any():
+        raise ValueError("Stage 03 Atomic evidence has duplicate atomicId values")
+    if not atomic["vendingProviderId"].eq(CONLOG_VENDING_PROVIDER_ID).all():
+        raise ValueError("Stage 03 Atomic evidence has an unexpected provider")
+    if not atomic["lmPcode"].eq(expected_lm_pcode).all():
+        raise ValueError("Stage 03 Atomic evidence LM mismatch")
+    if not atomic["ym"].eq(expected_month).all():
+        raise ValueError("Stage 03 Atomic evidence month mismatch")
+    normalized_meter = atomic["meterNo"].map(normalize_meter_no)
+    if not atomic["meterNo"].eq(normalized_meter).all():
+        raise ValueError("Stage 03 Atomic evidence contains noncanonical meter numbers")
+
+    for column in ("txAtMs", "amountTotalC", "costC", "vatC"):
+        atomic[column] = strict_integer_series(atomic, column)
+    if not (
+        atomic["amountTotalC"].ge(0)
+        & atomic["costC"].ge(0)
+        & atomic["vatC"].ge(0)
+    ).all():
+        raise ValueError("Stage 03 Atomic evidence contains negative money")
+    if not atomic["amountTotalC"].eq(atomic["costC"] + atomic["vatC"]).all():
+        raise ValueError("Stage 03 Atomic evidence monetary reconciliation failed")
+
+    parsed_tx = pd.to_datetime(
+        atomic["txAtISO"],
+        format="%Y-%m-%dT%H:%M:%S",
+        errors="coerce",
+    )
+    if parsed_tx.isna().any():
+        raise ValueError("Stage 03 Atomic evidence contains invalid txAtISO")
+    if not parsed_tx.dt.strftime("%Y-%m").eq(expected_month).all():
+        raise ValueError("Stage 03 Atomic evidence contains a transaction outside the month")
+    expected_tx_ms = (parsed_tx.astype("int64") // 1_000_000).astype("int64")
+    if not atomic["txAtMs"].eq(expected_tx_ms).all():
+        raise ValueError("Stage 03 Atomic evidence txAtMs does not match txAtISO")
+
+    return {
+        "purchasesCount": len(atomic),
+        "metersCount": int(atomic["meterNo"].nunique()),
+        "amountTotalC": int(atomic["amountTotalC"].sum()),
+        "costC": int(atomic["costC"].sum()),
+        "vatC": int(atomic["vatC"].sum()),
+        "firstPurchaseAtMs": int(atomic["txAtMs"].min()),
+        "lastPurchaseAtMs": int(atomic["txAtMs"].max()),
+        "rows": len(atomic),
+        "sha256": actual_sha,
+        "path": str(atomic_path),
+    }
+
+
+def validate_manifest_evidence(
+    manifest: dict[str, Any],
+    datasets: dict[str, MonthlyDataset],
+    reconciliation: dict[str, int],
+    *,
+    expected_lm_pcode: str,
+    expected_month: str,
+) -> dict[str, Any]:
+    atomic = validate_atomic_manifest_evidence(
+        manifest,
+        expected_lm_pcode=expected_lm_pcode,
+        expected_month=expected_month,
+    )
+    for field in (
+        "purchasesCount",
+        "metersCount",
+        "amountTotalC",
+        "costC",
+        "vatC",
+        "firstPurchaseAtMs",
+        "lastPurchaseAtMs",
+    ):
+        if atomic[field] != reconciliation[field]:
+            raise ValueError(
+                f"Stage 03 Atomic-to-monthly reconciliation failed for {field}: "
+                f"{atomic[field]} != {reconciliation[field]}"
+            )
+
+    count_evidence = {
+        "atomicRows": atomic["rows"],
+        "atomicUniqueMeters": reconciliation["metersCount"],
+        "monthlyRows": len(datasets["monthly"].frame),
+        "monthlyLmRows": len(datasets["monthly_lm"].frame),
+        "monthlyLmGroupRows": len(datasets["monthly_lm_groups"].frame),
+    }
+    for field, expected_value in count_evidence.items():
+        actual_value = require_json_int(
+            manifest.get(field),
+            label=f"Stage 03 manifest {field}",
+            minimum=1,
+        )
+        if actual_value != expected_value:
+            raise ValueError(
+                f"Stage 03 manifest {field} mismatch: "
+                f"{actual_value} != {expected_value}"
+            )
+
+    recorded_reconciliation = manifest.get("reconciliation")
+    if not isinstance(recorded_reconciliation, list) or len(recorded_reconciliation) != 1:
+        raise ValueError(
+            "Stage 03 manifest reconciliation must contain exactly one LM/month entry"
+        )
+    recorded = recorded_reconciliation[0]
+    if not isinstance(recorded, dict):
+        raise ValueError("Stage 03 manifest reconciliation entry must be an object")
+    if set(recorded) != set(STAGE03_RECONCILIATION_FIELDS):
+        raise ValueError(
+            "Stage 03 manifest reconciliation entry has an unexpected constitution"
+        )
+
+    expected_recorded = {
+        "lmPcode": expected_lm_pcode,
+        "month": expected_month,
+        "purchasesCount": reconciliation["purchasesCount"],
+        "metersCount": reconciliation["metersCount"],
+        "amountTotalC": reconciliation["amountTotalC"],
+        "costC": reconciliation["costC"],
+        "vatC": reconciliation["vatC"],
+    }
+    for field in STAGE03_RECONCILIATION_FIELDS:
+        if field in {"lmPcode", "month"}:
+            if type(recorded[field]) is not str:
+                raise ValueError(
+                    f"Stage 03 reconciliation {field} must be a JSON string"
+                )
+        else:
+            require_json_int(
+                recorded[field],
+                label=f"Stage 03 reconciliation {field}",
+                minimum=0,
+            )
+        if recorded[field] != expected_recorded[field]:
+            raise ValueError(
+                f"Stage 03 reconciliation {field} mismatch: "
+                f"{recorded[field]!r} != {expected_recorded[field]!r}"
+            )
+
+    return {
+        "verification": "PASS",
+        "atomic": atomic,
+        "recordedReconciliation": expected_recorded,
+        "countEvidence": count_evidence,
+    }
 
 
 def row_to_document(dataset: str, row: pd.Series) -> dict[str, Any]:
@@ -587,6 +1092,160 @@ def row_to_document(dataset: str, row: pd.Series) -> dict[str, Any]:
             int(row[column]) if column in integer_fields else str(row[column])
         )
         for column in DOCUMENT_COLUMNS[dataset]
+    }
+
+
+def sorted_doc_id_sha256(frame: pd.DataFrame) -> str:
+    document_ids = sorted(frame["docId"].map(clean_text).tolist())
+    return sha256_text("\n".join(document_ids))
+
+
+def source_contract_core(contract: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "version": contract.get("version"),
+        "projectId": contract.get("projectId"),
+        "lmPcode": contract.get("lmPcode"),
+        "month": contract.get("month"),
+        "stage03ManifestSha256": contract.get("stage03ManifestSha256"),
+        "datasets": contract.get("datasets"),
+    }
+
+
+def build_source_contract(
+    *,
+    project_id: str,
+    lm_pcode: str,
+    month: str,
+    manifest_path: Path,
+    manifest_sha256: str,
+    datasets: dict[str, MonthlyDataset],
+) -> dict[str, Any]:
+    resolved_manifest = manifest_path.expanduser().resolve()
+    require_sha256(
+        manifest_sha256,
+        label="Accepted Stage 03 manifest sha256",
+    )
+
+    contract_core = {
+        "version": 1,
+        "projectId": clean_text(project_id),
+        "lmPcode": clean_text(lm_pcode).upper(),
+        "month": clean_text(month),
+        "stage03ManifestSha256": manifest_sha256,
+        "datasets": {
+            dataset: {
+                "collection": value.collection,
+                "sha256": value.file_sha256,
+                "rows": len(value.frame),
+                "docIdsSha256": sorted_doc_id_sha256(value.frame),
+            }
+            for dataset, value in sorted(datasets.items())
+        },
+    }
+
+    return {
+        **contract_core,
+        "stage03ManifestPath": str(resolved_manifest),
+        "fingerprint": canonical_json_sha256(contract_core),
+    }
+
+
+def validate_resume_contract(
+    args: argparse.Namespace,
+    *,
+    source_contract: dict[str, Any],
+) -> Optional[dict[str, Any]]:
+    if args.mode == "create-only":
+        if args.resume_report is not None:
+            raise ValueError(
+                "--resume-report is only valid when --mode resume"
+            )
+        return None
+
+    if args.resume_report is None:
+        raise ValueError(
+            "--mode resume requires --resume-report pointing to the previous "
+            "failed Stage 04 execute-upload report"
+        )
+
+    report_path = args.resume_report.expanduser().resolve()
+    previous = read_json(report_path)
+
+    if clean_text(previous.get("stage")) != "04":
+        raise ValueError("Resume report is not a Stage 04 report")
+    if clean_text(previous.get("script")) != "04_upload_conlog_monthly_v3.py":
+        raise ValueError("Resume report was not produced by the Stage 04 v3 uploader")
+    if clean_text(previous.get("operation")) != "execute-upload":
+        raise ValueError("Resume report must come from a failed execute-upload attempt")
+    if clean_text(previous.get("status")) != "FAIL":
+        raise ValueError("Resume report status must be FAIL")
+    if clean_text(previous.get("result")) != "FAILED":
+        raise ValueError("Resume report result must be FAILED")
+
+    expected_identity = {
+        "targetProject": clean_text(args.project_id),
+        "lmPcode": clean_text(args.lm_pcode).upper(),
+        "month": clean_text(args.month),
+    }
+    actual_identity = {
+        "targetProject": clean_text(previous.get("targetProject")),
+        "lmPcode": clean_text(previous.get("lmPcode")).upper(),
+        "month": clean_text(previous.get("month")),
+    }
+    if actual_identity != expected_identity:
+        raise ValueError(
+            "Resume report identity mismatch. "
+            f"Expected={expected_identity}; report={actual_identity}"
+        )
+
+    previous_contract = previous.get("sourceContract")
+    if not isinstance(previous_contract, dict):
+        raise ValueError(
+            "Resume report has no governed sourceContract. "
+            "Do not resume from a legacy report; perform a controlled review."
+        )
+
+    previous_fingerprint = clean_text(previous_contract.get("fingerprint"))
+    recomputed_previous_fingerprint = canonical_json_sha256(
+        source_contract_core(previous_contract)
+    )
+    if (
+        not previous_fingerprint
+        or previous_fingerprint != recomputed_previous_fingerprint
+    ):
+        raise ValueError(
+            "Resume report sourceContract fingerprint is missing or internally "
+            "inconsistent. The failed report may have been edited or corrupted."
+        )
+
+    current_fingerprint = clean_text(source_contract.get("fingerprint"))
+    recomputed_current_fingerprint = canonical_json_sha256(
+        source_contract_core(source_contract)
+    )
+    if (
+        not current_fingerprint
+        or current_fingerprint != recomputed_current_fingerprint
+    ):
+        raise ValueError(
+            "Current sourceContract fingerprint is internally inconsistent."
+        )
+
+    if previous_fingerprint != current_fingerprint:
+        raise ValueError(
+            "Resume source contract mismatch. The current Stage 03 manifest, "
+            "input SHA set, row counts, or planned document IDs differ from "
+            "the failed upload."
+        )
+
+    return {
+        "reportPath": str(report_path),
+        "previousRunStartedAt": previous.get("startedAt"),
+        "previousRunFinishedAt": previous.get("finishedAt"),
+        "previousMode": previous.get("mode"),
+        "previousErrorType": previous.get("errorType"),
+        "previousError": previous.get("error"),
+        "sourceContractFingerprint": current_fingerprint,
+        "verification": "PASS",
     }
 
 
@@ -663,6 +1322,24 @@ def query_count(query: Any) -> int:
     return sum(1 for _ in query.stream())
 
 
+def strict_document_differences(
+    actual: object,
+    expected: dict[str, Any],
+) -> list[str]:
+    if type(actual) is not dict:
+        return ["<document>"]
+
+    differences = set(actual) ^ set(expected)
+    for field in set(actual) & set(expected):
+        actual_value = actual[field]
+        expected_value = expected[field]
+        # bool is a subclass of int in Python, and ordinary equality also treats
+        # 100.0 as equal to 100. Firestore schema verification must reject both.
+        if type(actual_value) is not type(expected_value) or actual_value != expected_value:
+            differences.add(field)
+    return sorted(differences)
+
+
 def inspect_existing_state(
     db: Any,
     dataset: MonthlyDataset,
@@ -705,18 +1382,12 @@ def inspect_existing_state(
             continue
         expected = row_to_document(dataset.dataset, frame_by_id.loc[document_id])
         actual = snapshot.to_dict() or {}
-        if actual == expected:
+        differing = strict_document_differences(actual, expected)
+        if not differing:
             matching += 1
         else:
             conflicts += 1
             if len(conflict_examples) < 5:
-                differing = sorted(
-                    {
-                        key
-                        for key in set(actual) | set(expected)
-                        if actual.get(key) != expected.get(key)
-                    }
-                )
                 conflict_examples.append(
                     {"docId": document_id, "differingFields": differing}
                 )
@@ -809,16 +1480,10 @@ def verify_post_upload(
             )
         expected = row_to_document(dataset.dataset, frame_by_id.loc[document_id])
         actual = snapshot.to_dict() or {}
-        matches = actual == expected
+        differing = strict_document_differences(actual, expected)
+        matches = not differing
         samples.append({"docId": document_id, "matches": matches})
         if not matches:
-            differing = sorted(
-                {
-                    key
-                    for key in set(actual) | set(expected)
-                    if actual.get(key) != expected.get(key)
-                }
-            )
             raise ValueError(
                 f"Sample verification failed for {dataset.collection}/{document_id}: "
                 f"{differing}"
@@ -846,6 +1511,11 @@ def base_report(args: argparse.Namespace, started: dt.datetime) -> dict[str, Any
         "lmPcode": clean_text(args.lm_pcode).upper(),
         "month": clean_text(args.month),
         "manifestPath": str(args.manifest.expanduser().resolve()),
+        "resumeReportPath": (
+            str(args.resume_report.expanduser().resolve())
+            if args.resume_report is not None
+            else None
+        ),
         "startedAt": utc_iso(started),
     }
 
@@ -893,7 +1563,7 @@ def main() -> int:
             )
 
         credential = validate_project_identity(args)
-        manifest, selected = load_manifest_outputs(
+        manifest, selected, manifest_sha256 = load_manifest_outputs(
             args.manifest,
             expected_lm_pcode=lm_pcode,
             expected_month=args.month,
@@ -908,6 +1578,25 @@ def main() -> int:
             for dataset in COLLECTIONS
         }
         reconciliation = reconcile_datasets(datasets)
+        manifest_evidence = validate_manifest_evidence(
+            manifest,
+            datasets,
+            reconciliation,
+            expected_lm_pcode=lm_pcode,
+            expected_month=args.month,
+        )
+        source_contract = build_source_contract(
+            project_id=args.project_id,
+            lm_pcode=lm_pcode,
+            month=args.month,
+            manifest_path=args.manifest,
+            manifest_sha256=manifest_sha256,
+            datasets=datasets,
+        )
+        recovery = validate_resume_contract(
+            args,
+            source_contract=source_contract,
+        )
 
         report.update(
             {
@@ -915,6 +1604,8 @@ def main() -> int:
                 "serviceAccountPath": str(credential.path),
                 "stage03ManifestResult": manifest.get("result"),
                 "stage03Month": manifest.get("month"),
+                "stage03ManifestSha256": manifest_sha256,
+                "stage03Evidence": manifest_evidence,
                 "inputs": {
                     dataset: {
                         "path": str(value.path),
@@ -926,6 +1617,8 @@ def main() -> int:
                     for dataset, value in datasets.items()
                 },
                 "reconciliation": reconciliation,
+                "sourceContract": source_contract,
+                "recovery": recovery,
             }
         )
 
@@ -966,6 +1659,10 @@ def main() -> int:
         print(f"  credential project: {credential.project_id}")
         print(f"  LM / month:         {lm_pcode} / {args.month}")
         print(f"  Stage 03 manifest:  {args.manifest.expanduser().resolve()}")
+        print(f"  source fingerprint: {source_contract['fingerprint']}")
+        if recovery is not None:
+            print(f"  resume report:      {recovery['reportPath']}")
+            print("  resume contract:    PASS")
         print("  cross-reconciliation: PASS")
         for dataset, value in datasets.items():
             state = states[dataset]

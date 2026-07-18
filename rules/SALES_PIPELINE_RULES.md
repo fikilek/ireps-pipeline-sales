@@ -3,9 +3,9 @@
 **File:** `rules/SALES_PIPELINE_RULES.md`
 **Project:** `C:\dev\ireps-pipeline-sales`
 **Status:** Governing project rules
-**Version:** 1.8.5
-**Effective date:** 2026-07-16
-**Current phase:** Confirmed Stage 02, 04, 05, 06 and 08 blocking-contract corrections
+**Version:** 1.8.6
+**Effective date:** 2026-07-19
+**Current phase:** Meter Master lifecycle and recurring-refresh governance approved
 **Current provider:** Conlog
 **Current LM / workbase:** Lesedi — `ZA7423`
 
@@ -1287,6 +1287,8 @@ meterType
 
 The first writer creates them. Later writers must validate and preserve them. A conflicting non-empty value must stop the operation for reconciliation; it must not be silently overwritten.
 
+The Firestore document ID and `meterNo.normalized` are immutable shared identity. `lmPcode` and `meterType` are controlled values supplied by the first approved creator; later writers validate equality and compatibility and must not migrate them during ordinary creation, matching, refresh or resume. `meterNo.raw` is supplied by the first approved creator and is preserved after creation.
+
 Meter Discovery and Meter Installation own:
 
 ```text
@@ -1329,6 +1331,8 @@ batch.set(document_ref, broad_document, merge=True)
 
 A governed create may use a strict create operation after confirming that the deterministic document does not exist. A governed update must use explicit field-level paths.
 
+New-document creation must use strict create semantics or an equivalent create precondition. No writer may broadly replace the complete Meter Master document, `refs`, `meterNo`, or `metadata` map.
+
 Meter Discovery and Meter Installation must use the exact Section 17 normalisation rule:
 
 ```javascript
@@ -1339,6 +1343,35 @@ String(value ?? "")
 ```
 
 They must reject an empty normalized result, preserve leading zeroes, impose no fixed length, and create or update only the canonical Meter Master shape.
+
+### 19.7.1 Derived lifecycle classifications
+
+Meter Master lifecycle classifications are derived from the canonical references and are not persisted as a status, visibility or lifecycle field:
+
+| Classification | `refs.asts.id` | `refs.sales.id` |
+|---|---|---|
+| `SALES_ONLY` | Blank | Populated |
+| `FIELD_ONLY` | Populated | Blank |
+| `MATCHED` | Populated | Populated |
+| `EMPTY_OR_INCOMPLETE` | Blank | Blank |
+
+When the Sales Pipeline creates a missing document, it must create the complete canonical shape, populate approved sales-owned values, set `refs.sales.id` to the canonical normalized meter number, set `refs.sales.provider` to the governed Conlog provider value, leave `refs.asts.id = ""`, and populate both creation and update metadata with the approved pipeline actor. This produces `SALES_ONLY`.
+
+When Meter Discovery or Meter Installation creates a missing document, it must create the complete canonical shape, populate `refs.asts.id`, leave the sales reference, sales provider and unknown customer/account values as `""`, and populate both creation and update metadata with the operational actor. It must not invent sales data or write prohibited fields. This produces `FIELD_ONLY`.
+
+When an operational writer finds a compatible `SALES_ONLY` document, it may update only `refs.asts.id` and `metadata.updated*`. It must preserve every identity, classification, sales-owned and `metadata.created*` field. The derived transition is `SALES_ONLY -> MATCHED`.
+
+When the Sales Pipeline finds a compatible `FIELD_ONLY` document, it may update only `customerNo`, `accountNo`, `refs.sales.id`, `refs.sales.provider` and `metadata.updated*`. It must preserve `refs.asts.id`, all identity and classification fields, and `metadata.created*`. The derived transition is `FIELD_ONLY -> MATCHED`.
+
+### 19.7.2 Blank-value preservation
+
+A blank incoming value must not erase an existing valid value. Ordinary creation, matching, recurring refresh and resume are not deletion or correction processes.
+
+In particular, a blank incoming value must not clear a populated `refs.asts.id`, `refs.sales.id`, `refs.sales.provider`, `customerNo` or `accountNo`. Intentionally clearing a protected value requires a separately governed correction or migration process.
+
+### 19.7.3 Cloud Function and backend writer responsibilities
+
+Every Cloud Function or backend writer touching Meter Master must use the canonical normalization rule; create the complete canonical shape with strict create semantics when absent; use exact writer-owned field paths when present; preserve other workflows' fields and `metadata.created*`; use native Firestore Timestamp values for Meter Master metadata; use `""`, not `null`, for missing canonical strings; reject prohibited fields and broad merges; validate identity, `lmPcode`, `meterType`, canonical shape, ownership and Firestore types before writing; remain idempotent; and produce or return stable conflict information for an unsafe record.
 
 ### 19.8 Stage 05 build and Stage 07 upload operating rule
 
@@ -1360,11 +1393,35 @@ one explicit Firebase project
 
 Before any Firestore connection or write, Stage 07 must verify the Stage 05 manifest schema, status, result, deterministic build fingerprint, governed LM/range/provider/meter type, output row count, exact ten-column schema, output filename, and output SHA-256 against the supplied CSV.
 
-The normal Stage 07 mode is `create-only` against an empty target collection.
+Stage 07 has three distinct governed modes:
 
-Stage 07 does not perform normal month-by-month enrichment and does not broadly merge into existing documents.
+```text
+create-only
+refresh
+resume
+```
 
-If the target collection is already established, contains operational Meter Master documents, or requires preservation of project-specific field-workflow links, the upload must stop. Replacing, reconciling, or migrating an established collection requires a separate reviewed refresh or migration plan.
+`create-only` is the first approved load into an empty Meter Master collection and creates complete canonical sales-originated documents.
+
+`refresh` applies a newly approved full-period Stage 05 build to an established Meter Master collection under Section 19.8.1.
+
+`resume` is restricted recovery under Section 19.9 from a failed execution of the exact same frozen upload contract. It is not a refresh, enrichment, migration or correction mode.
+
+Stage 07 must never broadly merge an existing Meter Master document.
+
+### 19.8.1 Recurring Meter Master refresh
+
+For every incoming row, `refresh` must independently classify the record as `CREATED`, `UPDATED`, `UNCHANGED`, `CONFLICT` or `FAILED`.
+
+- A missing document is `CREATED` using the complete canonical sales-originated shape and strict create semantics.
+- A compatible document requiring sales enrichment is `UPDATED` only at exact approved sales-owned paths and `metadata.updated*`. Operational fields, identity fields and `metadata.created*` are preserved.
+- A compatible document with identical approved sales-owned values is `UNCHANGED`. It receives no Firestore write and `metadata.updated*` does not change.
+- A conflicting or unsafe document is `CONFLICT`. It receives no write, is added to the conflict report, and does not stop remaining valid records.
+- An isolated record write failure is `FAILED`, is reported, and does not automatically stop remaining valid records. A systemic failure is governed by Section 19.11.
+
+No Meter Master document may be deleted merely because it is absent from a refreshed sales build.
+
+Refresh must be idempotent. Reapplying the same approved input to the same final document state must produce the same classifications, must not create unnecessary writes, and must classify compatible identical records as `UNCHANGED`.
 
 ### 19.9 Controlled resume rule
 
@@ -1406,6 +1463,31 @@ unexpected extra document
 ```
 
 `resume` is not a general update, refresh, migration, or enrichment mode. It must not introduce a different CSV, range, fingerprint, or changed business data.
+
+### 19.9.1 Record-level conflict continuation
+
+An isolated identity, LM, meter-type, reference, metadata, type or shape conflict is record-level. Stage 07 must skip the affected record, record existing and incoming evidence plus the source writer or stage, assign a stable conflict code, and continue processing all remaining valid records.
+
+Stable conflict codes include:
+
+```text
+MM_DOCUMENT_ID_NONCANONICAL
+MM_NORMALIZED_IDENTITY_CONFLICT
+MM_LM_CONFLICT
+MM_METER_TYPE_CONFLICT
+MM_AST_REFERENCE_CONFLICT
+MM_SALES_REFERENCE_CONFLICT
+MM_SALES_PROVIDER_CONFLICT
+MM_CREATED_METADATA_INVALID
+MM_GOVERNED_FIELD_TYPE_INVALID
+MM_DOCUMENT_SHAPE_UNSAFE
+MM_CANONICAL_FIELD_MISSING
+MM_BLANK_WOULD_ERASE_VALID_VALUE
+MM_TRANSACTION_PRECONDITION_CHANGED
+MM_RECORD_WRITE_FAILED
+```
+
+A widespread or systemic form of the same problem may be promoted to a run-level failure. The governing record-level rule is: skip the affected record, report it, and continue.
 
 ### 19.10 Reusable cross-project uploader rule
 
@@ -1483,13 +1565,23 @@ CSV SHA-256
 upload mode
 ```
 
-Every run must produce a JSON report under:
+Every run must produce a local JSON report under:
 
 ```text
 output/logs/meter_master
 ```
 
-The report must record the project, collection, input file, fingerprint, approved range, mode, counts, result, and any conflict or failure.
+The report must record at least `runId`, `stage`, `script`, `operation`, `mode`, `projectId`, `collection`, Stage 05 manifest identity, CSV fingerprint, manifest fingerprint, `lmPcode`, approved from-month, approved to-month, included months, `startedAt`, `finishedAt`, `status`, `result`, `rowsRead`, created, updated, unchanged, conflict and failed counts, write-attempt and write-success counts, verification evidence, and the conflict-report path when conflicts exist.
+
+Every incoming row must be accounted for exactly once:
+
+```text
+created + updated + unchanged + conflicts + failed = rowsRead
+```
+
+The companion local conflict report must record at least `runId`, `masterId`, `lmPcode`, source row when applicable, conflict code, conflicting paths, existing and incoming values, message, `detectedAt`, `writeAttempted`, and an investigation recommendation. No Firestore reporting collection may be created.
+
+Allowed final run results are `COMPLETED`, `COMPLETED_WITH_CONFLICTS`, and `FAILED`. `COMPLETED_WITH_CONFLICTS` means all safely processable records completed while conflicts were skipped and reported. `FAILED` is reserved for a genuine run-level failure such as an invalid input contract or fingerprint, project or credential mismatch, systemic Firestore failure, inability to produce the mandatory report, invalid final accounting, or final verification failure that prevents trust in the complete run.
 
 No Meter Master upload is complete until the resulting Firestore document count and deterministic document samples have been verified. Sample verification must confirm exact nested shape, actual string types rather than `null`, canonical identity values, governed Conlog/electricity values, Firestore Timestamp-compatible metadata values, and the exact pipeline metadata actors.
 
@@ -1904,6 +1996,10 @@ Governance close-out is complete after this rules update and the authoritative s
 
 ## 31. Decision history
 
+### 2026-07-19 — Meter Master lifecycle and recurring-refresh governance approved
+
+Version 1.8.6 locks the source-neutral Meter Master lifecycle classifications, cross-writer ownership boundaries, blank-value preservation, native Firestore Timestamp metadata, and exact-path update rules. Stage 07 now has separate `create-only`, `refresh`, and `resume` modes, record-level conflict continuation, idempotent no-write handling for unchanged records, local run and conflict reporting, and run-level failure criteria. Lifecycle classifications remain derived and no status field or Firestore reporting collection is introduced.
+
 ### 2026-07-13 — Governing rules file required
 
 Every substantial iREPS analysis, design, and coding sprint must have an authoritative Markdown rules file under a `rules` folder.
@@ -1964,7 +2060,7 @@ All Meter Master documents require six-field metadata. Pipeline reruns must pres
 
 Stage 07 uploads one approved frozen full-period Meter Master CSV to one explicitly selected Firebase project.
 
-The normal mode is `create-only` against an empty collection. `resume` is restricted to recovery from a partial upload of the same approved CSV and fingerprint.
+At the time of this decision, the approved mode was `create-only` against an empty collection and `resume` was restricted recovery from a partial upload of the same approved CSV and fingerprint. The 2026-07-19 decision supersedes the mode summary by adding the distinct governed `refresh` mode while preserving the restricted meaning of `resume`.
 
 The uploader is not a normal month-by-month enrichment mechanism. Any replacement, reconciliation, or migration of an established Meter Master collection requires a separate reviewed plan that protects workflow-owned fields and immutable creation metadata.
 
@@ -2080,7 +2176,7 @@ Stages 07–08
 
 Stages 05 and 06 must dynamically discover and validate all months inside the explicit range and must not contain a fixed historical month list.
 
-Stages 07 and 08 use `create-only` as the normal mode. `resume` is restricted to recovery from a partial upload of the same frozen CSV and fingerprint.
+Stage 08 uses `create-only` as its normal mode. Stage 07 supports the separately governed `create-only`, `refresh`, and `resume` modes under the 2026-07-19 Meter Master decision. For both stages, `resume` remains restricted to recovery from a partial upload of the same frozen CSV and fingerprint.
 
 The earlier universal month-by-month statement for Stages 05 through 08 was incorrect and is not governing.
 

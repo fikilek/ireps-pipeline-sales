@@ -3,9 +3,9 @@
 **File:** `rules/SALES_PIPELINE_RULES.md`
 **Project:** `C:\dev\ireps-pipeline-sales`
 **Status:** Governing project rules
-**Version:** 1.8.6
+**Version:** 1.8.7
 **Effective date:** 2026-07-19
-**Current phase:** Meter Master lifecycle and recurring-refresh governance approved
+**Current phase:** Meter Master canonical migration and Sales All Meters operational bridge governance confirmed
 **Current provider:** Conlog
 **Current LM / workbase:** Lesedi — `ZA7423`
 
@@ -76,7 +76,7 @@ The official dictionary is maintained in:
 
 ```text
 C:\dev\ireps-academy\15-dictionary\
-iREPS_Master_Dictionary_v1.3.md
+iREPS_Master_Dictionary_v1.6.md
 ```
 
 The Master Dictionary is the single source of truth for iREPS terminology.
@@ -431,7 +431,7 @@ Total amount cents:        9,728,029,408
 CSV SHA-256: 139e1775ed4404696077ccf5df4355288eabcb0357fbb7ddeebe578d69179087
 ```
 
-The current TEST baseline contains historical pipeline-derived `master.visibility = "INVISIBLE"` values because the earlier Stage 06 implementation treated blank Meter Master `astId` values as `INVISIBLE`. That derivation is no longer approved. A blank `astId` does not prove operational visibility or invisibility. Future Sales Pipeline builds and uploads must omit visibility entirely; any cleanup or migration of the existing TEST values requires a separate approved operational decision.
+The current TEST baseline contains historical pipeline-derived `master.visibility = "INVISIBLE"` values because the earlier Stage 06 implementation wrote visibility from offline pipeline staging. That writer ownership is no longer approved. Future Sales Pipeline builds and uploads must omit visibility entirely. Under the confirmed operational bridge contract, a canonical Meter Master with both AST and sales references is projected as `VISIBLE`; any other canonical reference combination is projected as `INVISIBLE`. Cleanup or reconciliation of historical TEST values requires a separate approved operational action.
 
 Earlier Meter Master or Sales All Meters files ending at February 2026 are historical and are not the approved TEST baseline.
 
@@ -1655,7 +1655,7 @@ Every Meter Master identity remains present. A meter with no sales has zero tota
 
 ### 20.3 Operational visibility ownership
 
-The Sales Pipeline has no authoritative evidence that a meter is operationally `VISIBLE` or `INVISIBLE`.
+The Sales Pipeline has no authority to write operational visibility. It prepares and uploads Sales All Meters sales-awareness fields only.
 
 The Sales Pipeline must not create, derive, default, merge, overwrite, or clear `master.visibility` in `sales-all-meters`.
 
@@ -1667,9 +1667,42 @@ Stage 06 must ignore astId for visibility and must not output a visibility colum
 Stage 08 must not create, upload, overwrite, default, merge, or clear master.visibility.
 ```
 
-`master.visibility` is owned exclusively by approved operational meter-registration, Meter Discovery, and Meter Installation writers. The exact backend writer functions must be confirmed during the separate writer assessment.
+`master.visibility` is owned exclusively by the approved operational Meter Master to Sales All Meters bridge used by Meter Discovery, Meter Installation, and other approved meter-registration workflows.
 
-A blank Meter Master `astId` means only that the pipeline staging record has no AST link. It is not evidence that the physical meter is invisible, undiscovered, or unregistered.
+The operational bridge derives visibility from the canonical Meter Master references:
+
+```text
+refs.asts.id populated
+AND
+refs.sales.id populated
+    -> MATCHED
+    -> master.visibility = VISIBLE
+
+any other canonical reference combination
+    -> SALES_ONLY, FIELD_ONLY, or EMPTY_OR_INCOMPLETE
+    -> master.visibility = INVISIBLE
+```
+
+This visibility is a Sales All Meters operational projection. It is not stored in Meter Master and it does not change the derived Meter Master lifecycle classification.
+
+A sales link by itself does not make a meter `VISIBLE`. An AST link by itself does not make a meter `VISIBLE`. Both canonical links are required.
+
+### 20.3.1 Operational bridge write contract
+
+The approved bridge must:
+
+- normalize and use the canonical Meter Master document ID;
+- preserve all Sales Pipeline-owned Sales All Meters fields;
+- update only `master.id` and `master.visibility`;
+- remain idempotent and perform no write when the relevant Meter Master references and derived visibility have not changed;
+- never create, merge, overwrite, or clear sales totals, monthly totals, customer, account, provider, purchase date, or purchase-recency fields;
+- never add `metadata` or any other field that is absent from the authoritative Sales All Meters schema;
+- report a missing Sales All Meters projection when a sales-linked Meter Master exists but the expected projection document is absent;
+- avoid broad complete-document writes.
+
+The current operational implementation must be corrected if it writes `metadata.updated*` into Sales All Meters, because the locked current Sales All Meters shape has no metadata contract.
+
+A blank Meter Master `refs.asts.id` means only that no operational AST relationship is linked. It does not prove that sales data is absent. A blank `refs.sales.id` means only that no approved sales relationship is linked. It does not prove that the physical meter is absent.
 
 ### 20.4 Firestore shape
 
@@ -1701,7 +1734,16 @@ A blank Meter Master `astId` means only that the pipeline staging record has no 
 }
 ```
 
-The `monthlyTotalsC` keys are dynamic. The current TEST schema does not add metadata to Sales All Meters. The Sales Pipeline-created document must omit `master.visibility`; an approved operational writer may add or update that field later.
+The `monthlyTotalsC` keys are dynamic. The current Sales All Meters schema does not contain metadata.
+
+The Sales Pipeline-created document must omit `master.visibility`. The approved operational bridge may add or update only:
+
+```text
+master.id
+master.visibility
+```
+
+An operational bridge must preserve every Sales Pipeline-owned field and must not add `metadata.updated*` unless a future governed schema amendment explicitly introduces metadata.
 
 ### 20.5 Upload safety
 
@@ -1752,13 +1794,24 @@ The document count and sales totals remain the approved historical TEST baseline
 
 Visibility terminology must follow the iREPS Master Dictionary.
 
-Operational backend writers remain the authority for `master.visibility`.
+The approved operational Meter Master to Sales All Meters bridge is the authority for `master.visibility`.
 
-The Sales Pipeline is not a visibility writer. It must not infer visibility from sales history, Meter Master presence, a blank or populated `astId`, customer references, or any other pipeline field.
+The governing derivation is:
 
-A form-side or report-side indication may assist the user, but it must not be treated as final truth unless it comes from the approved operational visibility field.
+```text
+MATCHED Meter Master
+refs.asts.id populated + refs.sales.id populated
+    -> VISIBLE
 
-Any change to `VISIBLE` or `INVISIBLE` behaviour requires review across pipeline, backend, mobile, web, Meter Master, Master Dictionary, canonical schemas, and rules.
+SALES_ONLY, FIELD_ONLY, or EMPTY_OR_INCOMPLETE
+    -> INVISIBLE
+```
+
+The Sales Pipeline is not a visibility writer. Stages 06 and 08 must not calculate or upload this field even though the operational bridge derives it from the canonical Meter Master links.
+
+A form-side or report-side indication may assist the user, but it must not be treated as final truth unless it comes from the approved operational `master.visibility` field in Sales All Meters.
+
+Any change to `VISIBLE` or `INVISIBLE` behaviour requires review across pipeline, backend, mobile, web, Meter Master, Sales All Meters, Master Dictionary, canonical schemas, and rules.
 
 ---
 
@@ -2356,3 +2409,37 @@ Effect on code or data:
 - the five corrected scripts fail closed on stale, incomplete, type-invalid or internally inconsistent offline inputs;
 - the corrections do not connect to Firebase and do not change existing Firestore data;
 - unresolved upload-order and verified-completion orchestration remains assigned to the separate pre-Trials validation/orchestration script and is not implemented inside these stage scripts.
+
+### 2026-07-19 — Meter Master to Sales All Meters bridge contract confirmed
+
+Changed rule:
+
+- Meter Master lifecycle classifications remain derived and are not stored;
+- `MATCHED` means both `refs.asts.id` and `refs.sales.id` are populated;
+- the approved operational bridge projects `MATCHED` as `master.visibility = "VISIBLE"` in Sales All Meters;
+- `SALES_ONLY`, `FIELD_ONLY`, and `EMPTY_OR_INCOMPLETE` project as `master.visibility = "INVISIBLE"` when a Sales All Meters document exists;
+- Stages 06 and 08 remain prohibited from writing visibility;
+- the operational bridge may update only `master.id` and `master.visibility`;
+- Sales All Meters metadata is not approved under the current locked schema.
+
+Reason:
+
+DEV tests proved both supported field-entry paths:
+
+```text
+Meter Discovery:
+SALES_ONLY -> MATCHED -> VISIBLE
+
+Meter Installation:
+SALES_ONLY -> MATCHED -> VISIBLE
+```
+
+They also proved that an LM mismatch is rejected and that an already-linked different AST is rejected without replacing the existing Meter Master link.
+
+Effect on code or data:
+
+- `onMeterMasterUpdated` may synchronize visibility only when the relevant Meter Master references or derived visibility change;
+- the bridge must preserve every Sales Pipeline-owned Sales All Meters field;
+- any current `metadata.updated*` write by the bridge is a schema-contract defect and must be removed before the writer is declared fully approved;
+- the full Meter Master canonical migration does not require Sales All Meters rewrites when Meter Master references and derived visibility remain unchanged;
+- Stage 08 recurring refresh remains a separate pending implementation and is not provided by `create-only` or `resume`.

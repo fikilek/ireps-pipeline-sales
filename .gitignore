@@ -84,3 +84,6 @@ Thumbs.db
 
 # Operational reference CSV archives
 archive/*.csv
+
+# Generated Sales All Meters assessment and remediation outputs
+scripts/tools/sales-all/reports/

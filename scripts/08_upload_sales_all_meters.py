@@ -14,8 +14,11 @@ Safety contract
 - resume requires the failed report from the exact original Stage 08 upload contract;
 - resume creates only missing documents and rejects changed sources, conflicting
   pipeline-owned fields and unexpected extra documents;
-- ``master.visibility`` is operationally owned: Stage 08 never creates, defaults,
-  overwrites or clears it, and resume comparison preserves/ignores it;
+- Stage 08 initializes required ``master.visibility`` to ``INVISIBLE`` only when
+  strictly creating a new document;
+- resume requires existing ``master.visibility`` to be exactly ``VISIBLE`` or
+  ``INVISIBLE`` and preserves the valid existing value without resetting it;
+- the operational bridge owns all subsequent visibility lifecycle changes;
 - Firestore create operations only: no merge, update, delete or silent overwrite;
 - final collection count and deterministic document samples are verified;
 - every run writes an atomic JSON report.
@@ -98,6 +101,8 @@ PIPELINE_TOP_LEVEL_FIELDS = {
     "daysSinceLastPurchase",
 }
 ALLOWED_MASTER_FIELDS = {"id", "visibility"}
+ALLOWED_MASTER_VISIBILITIES = {"VISIBLE", "INVISIBLE"}
+DEFAULT_MASTER_VISIBILITY = "INVISIBLE"
 
 
 @dataclass(frozen=True)
@@ -472,7 +477,8 @@ def load_and_validate_csv(
         )
     if "visibility" in actual_columns:
         raise ValueError(
-            "Stage 08 must not consume a visibility column; master.visibility is operationally owned"
+            "Stage 06 must not provide a visibility column; Stage 08 initializes "
+            "master.visibility to INVISIBLE only during strict document creation"
         )
     if df.empty:
         raise ValueError("Sales All Meters CSV contains zero rows")
@@ -593,7 +599,10 @@ def build_document(
         monthly_totals[ym] = int(str(row[column]))
 
     return {
-        "master": {"id": str(row["masterId"])},
+        "master": {
+            "id": str(row["masterId"]),
+            "visibility": DEFAULT_MASTER_VISIBILITY,
+        },
         "meterNo": str(row["meterNo"]),
         "meterNoNormalized": str(row["meterNoNormalized"]),
         "provider": str(row["provider"]),
@@ -614,7 +623,7 @@ def compare_existing_document(
     existing: Mapping[str, Any],
     expected: Mapping[str, Any],
 ) -> list[str]:
-    """Compare only Stage 08-owned fields while preserving operational visibility."""
+    """Validate canonical existing data while preserving valid operational visibility."""
     differences: list[str] = []
 
     missing_top = sorted(PIPELINE_TOP_LEVEL_FIELDS - set(existing.keys()))
@@ -639,7 +648,22 @@ def compare_existing_document(
             differences.append(
                 f"master.id differs: Firestore={master_id!r}; CSV={expected_master['id']!r}"
             )
-        # master.visibility is intentionally ignored and preserved. It is operationally owned.
+        if "visibility" not in master:
+            differences.append("master.visibility is required")
+        else:
+            visibility = master.get("visibility")
+            if not isinstance(visibility, str):
+                differences.append(
+                    "master.visibility must be a string, "
+                    f"found {type(visibility).__name__}"
+                )
+            elif visibility not in ALLOWED_MASTER_VISIBILITIES:
+                differences.append(
+                    "master.visibility must be exactly VISIBLE or INVISIBLE, "
+                    f"found {visibility!r}"
+                )
+        # A valid existing visibility is preserved. It is not compared with the
+        # Stage 08 creation default because the operational bridge owns later changes.
 
     for field in ("meterNo", "meterNoNormalized", "provider", "customerNo", "accountNo"):
         actual = existing.get(field)
@@ -988,6 +1012,9 @@ def make_upload_contract(
         "providers": preflight.providers,
         "totalAmountC": preflight.total_amount_c,
         "visibilityColumn": "ABSENT",
+        "visibilityCreationDefault": DEFAULT_MASTER_VISIBILITY,
+        "visibilityResumePolicy": "PRESERVE_VALID_EXISTING_OR_BLOCK",
+        "visibilityLifecycleOwner": "OPERATIONAL_BRIDGE",
         "visibilityOwnership": "OPERATIONAL_WRITERS_ONLY",
     }
 
@@ -1090,7 +1117,9 @@ def print_preflight(config: UploadConfig, result: PreflightResult) -> None:
     print(f"Provider:             {', '.join(result.providers)}")
     print(f"Total amount cents:   {result.total_amount_c:,}")
     print(f"CSV SHA-256:          {result.csv_sha256}")
-    print("Visibility column:    ABSENT")
+    print("Visibility column:    ABSENT (Stage 06)")
+    print(f"Stage 08 default:     {DEFAULT_MASTER_VISIBILITY}")
+    print("Resume visibility:    PRESERVE VALID / BLOCK INVALID")
     print("===========================================\n")
 
 
@@ -1158,6 +1187,9 @@ def main() -> None:
                 "providers": preflight.providers,
                 "totalAmountC": preflight.total_amount_c,
                 "visibilityColumn": "ABSENT",
+                "visibilityCreationDefault": DEFAULT_MASTER_VISIBILITY,
+                "visibilityResumePolicy": "PRESERVE_VALID_EXISTING_OR_BLOCK",
+                "visibilityLifecycleOwner": "OPERATIONAL_BRIDGE",
             }
         )
 
@@ -1226,7 +1258,8 @@ def main() -> None:
         print(f"Documents created:  {progress.documents_created:,}")
         print(f"Existing matching:  {matching:,}")
         print(f"Final collection:   {verification['finalCount']:,}")
-        print("Visibility writes:  NONE")
+        print(f"Creation visibility: {DEFAULT_MASTER_VISIBILITY}")
+        print("Existing visibility: PRESERVED WHEN VALID")
         print(f"Run report:         {report_path}")
 
     except Exception as exc:

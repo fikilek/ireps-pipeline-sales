@@ -1,8 +1,7 @@
-"""Source contracts, merge model, and enrichment logic for Stage M02."""
+"""Source contracts, one-to-one SG linkage, and enrichment logic for Stage M02."""
 
 from __future__ import annotations
 
-import csv
 import json
 import math
 import re
@@ -15,7 +14,7 @@ from lib.xlsx_stream import XlsxReader
 
 
 END_SHEET_NAME = "Sheet1"
-ELM_SHEET_NAME = "ELM METERS"
+BRIDGE_SHEET_NAME = "CsmValRollB_2026_MPA_260731_113"
 
 END_IDENTITY_COLUMNS = [
     ("A", "Customer"), ("B", "TariffInstance"), ("C", "MeterNumber"),
@@ -54,17 +53,18 @@ UNITS_MONTH_COLUMNS = [
     ("BZ", "2026-06"),
 ]
 
-ELM_COLUMNS = {"D": "ACCOUNT NO", "E": "ERF NUMBER"}
-LOOKUP_REQUIRED_COLUMNS = [
-    "erfId", "erfNumber", "erfNumberNormalized", "wardNumber",
-    "wardPcode", "lmPcode", "latitude", "longitude", "geometryJson",
-]
+BRIDGE_COLUMNS = {
+    "D": "OWNER_ACCOUNT_NO",
+    "W": "GIS_KEY",
+}
+
+ERF_PIPELINE_PREFIX = "K241"
 
 
 @dataclass(frozen=True)
-class ElmErfLink:
+class BridgeAccountLink:
     account_number_normalized: str
-    erf_number: str
+    gis_keys: tuple[str, ...]
     source_rows: tuple[int, ...]
 
 
@@ -77,9 +77,9 @@ class ErfCandidate:
     lm_pcode: str
     latitude: float
     longitude: float
-    geometry: dict[str, Any]
 
     def as_document(self) -> dict[str, Any]:
+        # Geometry is deliberately excluded from the PSD.
         return {
             "ErfNumber": self.erf_number,
             "ErfId": self.erf_id,
@@ -88,7 +88,6 @@ class ErfCandidate:
             "LmPcode": self.lm_pcode,
             "Latitude": self.latitude,
             "Longitude": self.longitude,
-            "Geometry": self.geometry,
         }
 
 
@@ -107,13 +106,19 @@ class EnrichedMeter:
 
     @property
     def has_usable_gps(self) -> bool:
-        return bool(self.candidates)
+        return len(self.candidates) == 1
 
     def as_json_document(self) -> dict[str, Any]:
+        if len(self.candidates) > 1:
+            raise ValueError(
+                f"Meter {self.identity['MeterNumber']} has more than one ERF candidate"
+            )
+
         return {
             "SourceEndRow": self.source_end_row,
             **self.identity,
             "AccountNumberNormalized": self.account_number_normalized,
+            # Legacy field names are intentionally preserved for frontend compatibility.
             "ElmAccountMatched": bool(self.elm_source_rows),
             "ErfNumbers": self.erf_numbers,
             "MissingErfNumbers": self.missing_erf_numbers,
@@ -128,6 +133,11 @@ class EnrichedMeter:
         }
 
     def as_csv_row(self) -> dict[str, Any]:
+        if len(self.candidates) > 1:
+            raise ValueError(
+                f"Meter {self.identity['MeterNumber']} has more than one ERF candidate"
+            )
+
         candidate_documents = [candidate.as_document() for candidate in self.candidates]
         return {
             "SourceEndRow": self.source_end_row,
@@ -145,7 +155,8 @@ class EnrichedMeter:
             "LmPcode": join_unique(candidate.lm_pcode for candidate in self.candidates),
             "Latitude": join_unique(format_number(candidate.latitude) for candidate in self.candidates),
             "Longitude": join_unique(format_number(candidate.longitude) for candidate in self.candidates),
-            "Geometry": compact_json([candidate.geometry for candidate in self.candidates]),
+            # Keep the historic CSV column but never place geometry in it.
+            "Geometry": "",
             "ErfCandidatesJson": compact_json(candidate_documents),
             "ElmSourceRows": join_unique(str(row) for row in self.elm_source_rows),
             "trnBatchIds": "[]",
@@ -159,7 +170,10 @@ def clean_text(value: Any) -> str:
 
 
 def normalize_account_number(value: Any) -> str:
-    text = re.sub(r"\s+", "", clean_text(value))
+    text = clean_text(value)
+    while text.startswith("'"):
+        text = text[1:].strip()
+    text = re.sub(r"\s+", "", text)
     if text.endswith(".0") and text[:-2].isdigit():
         text = text[:-2]
     return text
@@ -172,17 +186,18 @@ def normalize_erf_number(value: Any) -> str:
     return str(int(text)) if text.isdigit() else text
 
 
-def extract_elm_erf_number(value: Any) -> str:
-    text = clean_text(value).upper()
-    if not text:
-        return ""
-    parts = text.split("-")
-    if len(parts) != 4 or not parts[1].isdigit():
-        raise ValueError(
-            "Invalid ELM ERF NUMBER format. Expected four hyphen-separated "
-            f"segments with a numeric second segment: {text!r}"
-        )
-    return normalize_erf_number(parts[1])
+def normalize_gis_key(value: Any) -> str:
+    text = clean_text(value)
+    while text.startswith("'"):
+        text = text[1:].strip()
+    return re.sub(r"[^A-Za-z0-9]", "", text).upper()
+
+
+def normalize_pipeline_prcl_key(value: Any) -> str:
+    text = normalize_gis_key(value)
+    if text.startswith(ERF_PIPELINE_PREFIX):
+        text = text[len(ERF_PIPELINE_PREFIX):]
+    return text
 
 
 def normalize_date(value: Any) -> str:
@@ -202,11 +217,10 @@ def join_unique(values: Iterable[str]) -> str:
     return "|".join(dict.fromkeys(clean_text(value) for value in values if clean_text(value)))
 
 
-def erf_sort_key(value: str) -> tuple[int, Any]:
-    return (0, int(value)) if value.isdigit() else (1, value)
-
-
-def read_end_workbook(path: Path, expected_record_count: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def read_end_workbook(
+    path: Path,
+    expected_record_count: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     expected_headers = {
         **dict(END_IDENTITY_COLUMNS),
         **dict(SALES_MONTH_COLUMNS),
@@ -216,7 +230,10 @@ def read_end_workbook(path: Path, expected_record_count: int) -> tuple[list[dict
     rows: list[dict[str, Any]] = []
     header_seen = False
 
-    for row_number, values in XlsxReader(path).iter_sheet_rows(END_SHEET_NAME, wanted_columns):
+    for row_number, values in XlsxReader(path).iter_sheet_rows(
+        END_SHEET_NAME,
+        wanted_columns,
+    ):
         if row_number == 1:
             header_seen = True
             for column, expected_header in expected_headers.items():
@@ -241,10 +258,19 @@ def read_end_workbook(path: Path, expected_record_count: int) -> tuple[list[dict
             {
                 "source_row": row_number,
                 "identity": identity,
-                "sales": {month: clean_text(values.get(column, "")) for column, month in SALES_MONTH_COLUMNS},
-                "units": {month: clean_text(values.get(column, "")) for column, month in UNITS_MONTH_COLUMNS},
+                "sales": {
+                    month: clean_text(values.get(column, ""))
+                    for column, month in SALES_MONTH_COLUMNS
+                },
+                "units": {
+                    month: clean_text(values.get(column, ""))
+                    for column, month in UNITS_MONTH_COLUMNS
+                },
                 "account_normalized": normalize_account_number(identity["AccountNumber"]),
-                "previous_date_placeholder_cleared": bool(original_previous_date) and not identity["PreviousInstallationDate"],
+                "previous_date_placeholder_cleared": (
+                    bool(original_previous_date)
+                    and not identity["PreviousInstallationDate"]
+                ),
             }
         )
 
@@ -252,217 +278,401 @@ def read_end_workbook(path: Path, expected_record_count: int) -> tuple[list[dict
         raise ValueError("END workbook header row was not found")
     if len(rows) != expected_record_count:
         raise ValueError(
-            f"END record-count mismatch. Expected {expected_record_count:,}, found {len(rows):,}."
+            f"END record-count mismatch. Expected {expected_record_count:,}, "
+            f"found {len(rows):,}."
         )
 
     meter_numbers = [row["identity"]["MeterNumber"] for row in rows]
     blank_meters = sum(not meter for meter in meter_numbers)
-    duplicate_meter_groups = sum(count > 1 for count in Counter(meter_numbers).values() if count)
+    duplicate_meter_groups = sum(
+        count > 1
+        for meter, count in Counter(meter_numbers).items()
+        if meter
+    )
     if blank_meters:
         raise ValueError(f"END contains {blank_meters:,} blank MeterNumber row(s)")
     if duplicate_meter_groups:
-        raise ValueError(f"END contains {duplicate_meter_groups:,} duplicate MeterNumber group(s)")
+        raise ValueError(
+            f"END contains {duplicate_meter_groups:,} duplicate MeterNumber group(s)"
+        )
 
     accounts = [row["account_normalized"] for row in rows]
     return rows, {
         "records": len(rows),
         "uniqueMeterNumbers": len(set(meter_numbers)),
         "blankAccountNumbers": sum(not account for account in accounts),
-        "uniqueNonblankAccountNumbers": len(set(account for account in accounts if account)),
-        "previousInstallationDatePlaceholdersCleared": sum(row["previous_date_placeholder_cleared"] for row in rows),
+        "uniqueNonblankAccountNumbers": len(
+            set(account for account in accounts if account)
+        ),
+        "previousInstallationDatePlaceholdersCleared": sum(
+            row["previous_date_placeholder_cleared"]
+            for row in rows
+        ),
     }
 
 
-def read_elm_workbook(path: Path, expected_record_count: int) -> tuple[dict[str, list[ElmErfLink]], dict[str, Any]]:
+def read_bridge_workbook(
+    path: Path,
+    expected_record_count: int,
+) -> tuple[dict[str, BridgeAccountLink], dict[str, Any]]:
+    account_rows: dict[str, list[int]] = defaultdict(list)
+    account_gis_keys: dict[str, set[str]] = defaultdict(set)
     pair_rows: dict[tuple[str, str], list[int]] = defaultdict(list)
+
     blank_accounts = 0
-    blank_erf_numbers = 0
+    blank_gis_key_rows = 0
     data_rows = 0
     header_seen = False
 
-    for row_number, values in XlsxReader(path).iter_sheet_rows(ELM_SHEET_NAME, set(ELM_COLUMNS)):
+    for row_number, values in XlsxReader(path).iter_sheet_rows(
+        BRIDGE_SHEET_NAME,
+        set(BRIDGE_COLUMNS),
+    ):
         if row_number == 1:
             header_seen = True
-            for column, expected_header in ELM_COLUMNS.items():
+            for column, expected_header in BRIDGE_COLUMNS.items():
                 actual_header = clean_text(values.get(column, ""))
                 if actual_header != expected_header:
                     raise ValueError(
-                        f"ELM header mismatch at {column}1. Expected {expected_header!r}, found {actual_header!r}."
+                        f"Valuation bridge header mismatch at {column}1. Expected "
+                        f"{expected_header!r}, found {actual_header!r}."
                     )
             continue
 
         data_rows += 1
         account = normalize_account_number(values.get("D", ""))
+        gis_key = normalize_gis_key(values.get("W", ""))
+
         if not account:
             blank_accounts += 1
             continue
-        erf_number = extract_elm_erf_number(values.get("E", ""))
-        if not erf_number:
-            blank_erf_numbers += 1
+
+        account_rows[account].append(row_number)
+
+        if not gis_key:
+            blank_gis_key_rows += 1
             continue
-        pair_rows[(account, erf_number)].append(row_number)
+
+        account_gis_keys[account].add(gis_key)
+        pair_rows[(account, gis_key)].append(row_number)
 
     if not header_seen:
-        raise ValueError("ELM workbook header row was not found")
+        raise ValueError("Valuation bridge workbook header row was not found")
     if data_rows != expected_record_count:
         raise ValueError(
-            f"ELM record-count mismatch. Expected {expected_record_count:,}, found {data_rows:,}."
+            f"Valuation bridge record-count mismatch. "
+            f"Expected {expected_record_count:,}, found {data_rows:,}."
         )
 
-    by_account: dict[str, list[ElmErfLink]] = defaultdict(list)
-    for (account, erf_number), source_rows in sorted(pair_rows.items()):
-        by_account[account].append(ElmErfLink(account, erf_number, tuple(source_rows)))
+    by_account = {
+        account: BridgeAccountLink(
+            account_number_normalized=account,
+            gis_keys=tuple(sorted(account_gis_keys.get(account, set()))),
+            source_rows=tuple(sorted(source_rows)),
+        )
+        for account, source_rows in sorted(account_rows.items())
+    }
 
-    account_row_counts = Counter()
-    for (account, _erf), source_rows in pair_rows.items():
-        account_row_counts[account] += len(source_rows)
+    all_gis_keys = {
+        gis_key
+        for link in by_account.values()
+        for gis_key in link.gis_keys
+    }
 
-    return dict(by_account), {
+    return by_account, {
         "records": data_rows,
         "blankAccountNumbers": blank_accounts,
-        "blankErfNumbers": blank_erf_numbers,
+        "blankGisKeyRowsForPopulatedAccounts": blank_gis_key_rows,
         "uniqueAccounts": len(by_account),
-        "uniqueAccountErfPairs": len(pair_rows),
-        "duplicateExactAccountErfPairGroups": sum(len(rows) > 1 for rows in pair_rows.values()),
-        "duplicateExactAccountErfRowsSuppressed": sum(len(rows) - 1 for rows in pair_rows.values() if len(rows) > 1),
-        "accountsWithMultipleRows": sum(count > 1 for count in account_row_counts.values()),
-        "accountsWithMultipleDistinctErfNumbers": sum(len(links) > 1 for links in by_account.values()),
+        "accountsWithGisKey": sum(bool(link.gis_keys) for link in by_account.values()),
+        "accountsWithoutGisKey": sum(not link.gis_keys for link in by_account.values()),
+        "accountsWithMultipleDistinctGisKeys": sum(
+            len(link.gis_keys) > 1 for link in by_account.values()
+        ),
+        "uniqueGisKeys": len(all_gis_keys),
+        "uniqueAccountGisPairs": len(pair_rows),
+        "duplicateExactAccountGisPairGroups": sum(
+            len(rows) > 1 for rows in pair_rows.values()
+        ),
+        "duplicateExactAccountGisRowsSuppressed": sum(
+            len(rows) - 1 for rows in pair_rows.values() if len(rows) > 1
+        ),
     }
 
 
-def _finite_float(value: Any, field_name: str, row_number: int) -> float:
+def _finite_float(value: Any, field_name: str, line_number: int) -> float:
     try:
-        result = float(clean_text(value))
+        result = float(value)
     except (TypeError, ValueError) as exc:
-        raise ValueError(f"Invalid {field_name} at ERF lookup row {row_number}") from exc
+        raise ValueError(
+            f"Invalid {field_name} at ERF JSONL line {line_number}"
+        ) from exc
     if not math.isfinite(result):
-        raise ValueError(f"Non-finite {field_name} at ERF lookup row {row_number}")
+        raise ValueError(
+            f"Non-finite {field_name} at ERF JSONL line {line_number}"
+        )
     return result
 
 
-def read_erf_lookup(path: Path, expected_lm_pcode: str, expected_record_count: int) -> tuple[dict[str, list[ErfCandidate]], dict[str, Any]]:
-    by_erf_number: dict[str, list[ErfCandidate]] = defaultdict(list)
+def _require_object(
+    value: Any,
+    field_name: str,
+    line_number: int,
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(
+            f"Expected object {field_name} at ERF JSONL line {line_number}"
+        )
+    return value
+
+
+def read_erf_documents(
+    path: Path,
+    expected_lm_pcode: str,
+    expected_record_count: int,
+    progress_every: int,
+) -> tuple[dict[str, list[ErfCandidate]], dict[str, Any]]:
+    by_comparison_key: dict[str, list[ErfCandidate]] = defaultdict(list)
     seen_erf_ids: set[str] = set()
-    geometry_types = Counter()
     row_count = 0
 
-    with path.open("r", encoding="utf-8-sig", newline="") as source:
-        reader = csv.DictReader(source)
-        if reader.fieldnames != LOOKUP_REQUIRED_COLUMNS:
-            raise ValueError(
-                "ERF lookup schema mismatch. Expected exact columns and order: "
-                f"{LOOKUP_REQUIRED_COLUMNS}. Found: {reader.fieldnames}"
-            )
-
-        for row_count, row in enumerate(reader, start=1):
-            csv_row = row_count + 1
-            erf_id = clean_text(row["erfId"])
-            if not erf_id:
-                raise ValueError(f"Blank erfId at ERF lookup row {csv_row}")
-            if erf_id in seen_erf_ids:
-                raise ValueError(f"Duplicate erfId in ERF lookup: {erf_id}")
-            seen_erf_ids.add(erf_id)
-
-            erf_number = normalize_erf_number(row["erfNumberNormalized"])
-            lm_pcode = clean_text(row["lmPcode"]).upper()
-            if not erf_number:
-                raise ValueError(f"Blank normalized ERF number at ERF lookup row {csv_row}")
-            if lm_pcode != expected_lm_pcode:
-                raise ValueError(f"Wrong LM pCode at ERF lookup row {csv_row}: {lm_pcode!r}")
-
-            latitude = _finite_float(row["latitude"], "latitude", csv_row)
-            longitude = _finite_float(row["longitude"], "longitude", csv_row)
-            if not -90 <= latitude <= 90 or not -180 <= longitude <= 180:
-                raise ValueError(f"Coordinate out of range at ERF lookup row {csv_row}")
+    with path.open("r", encoding="utf-8-sig") as source:
+        for line_number, raw_line in enumerate(source, start=1):
+            raw_line = raw_line.strip()
+            if not raw_line:
+                continue
 
             try:
-                geometry = json.loads(row["geometryJson"])
+                record = json.loads(raw_line)
             except json.JSONDecodeError as exc:
-                raise ValueError(f"Invalid geometryJson at ERF lookup row {csv_row}: {exc.msg}") from exc
-            geometry_type = clean_text(geometry.get("type")) if isinstance(geometry, dict) else ""
-            if geometry_type not in {"Polygon", "MultiPolygon"}:
-                raise ValueError(f"Unsupported geometry type at ERF lookup row {csv_row}: {geometry_type!r}")
-            geometry_types[geometry_type] += 1
+                raise ValueError(
+                    f"Invalid JSON at ERF JSONL line {line_number}: {exc.msg}"
+                ) from exc
 
-            by_erf_number[erf_number].append(
-                ErfCandidate(
-                    erf_number=erf_number,
-                    erf_id=erf_id,
-                    ward_number=clean_text(row["wardNumber"]),
-                    ward_pcode=clean_text(row["wardPcode"]),
-                    lm_pcode=lm_pcode,
-                    latitude=latitude,
-                    longitude=longitude,
-                    geometry=geometry,
+            row_count += 1
+            if progress_every > 0 and row_count % progress_every == 0:
+                print(
+                    f"[PROGRESS] Read {row_count:,} / "
+                    f"{expected_record_count:,} ERF pipeline records"
                 )
+
+            erf_id = clean_text(record.get("erfId"))
+            if not erf_id:
+                raise ValueError(f"Blank erfId at ERF JSONL line {line_number}")
+            if erf_id in seen_erf_ids:
+                raise ValueError(f"Duplicate erfId in ERF JSONL: {erf_id}")
+            seen_erf_ids.add(erf_id)
+
+            sg = _require_object(record.get("sg"), "sg", line_number)
+            prcl_key = clean_text(sg.get("prclKey"))
+            if not prcl_key:
+                raise ValueError(
+                    f"Blank sg.prclKey at ERF JSONL line {line_number}"
+                )
+            if erf_id != prcl_key:
+                raise ValueError(
+                    f"erfId/sg.prclKey mismatch at ERF JSONL line {line_number}"
+                )
+
+            comparison_key = normalize_pipeline_prcl_key(prcl_key)
+            if not comparison_key:
+                raise ValueError(
+                    f"Invalid sg.prclKey at ERF JSONL line {line_number}"
+                )
+
+            admin = _require_object(record.get("admin"), "admin", line_number)
+            lm = _require_object(
+                admin.get("localMunicipality"),
+                "admin.localMunicipality",
+                line_number,
             )
+            ward = _require_object(
+                admin.get("ward"),
+                "admin.ward",
+                line_number,
+            )
+            centroid = _require_object(
+                record.get("centroid"),
+                "centroid",
+                line_number,
+            )
+
+            lm_pcode = clean_text(lm.get("pcode")).upper()
+            if lm_pcode != expected_lm_pcode:
+                raise ValueError(
+                    f"Wrong LM pCode at ERF JSONL line {line_number}: "
+                    f"{lm_pcode!r}"
+                )
+
+            latitude = _finite_float(
+                centroid.get("lat"),
+                "centroid.lat",
+                line_number,
+            )
+            longitude = _finite_float(
+                centroid.get("lng"),
+                "centroid.lng",
+                line_number,
+            )
+            if not -90 <= latitude <= 90 or not -180 <= longitude <= 180:
+                raise ValueError(
+                    f"Coordinate out of range at ERF JSONL line {line_number}"
+                )
+
+            erf_number = normalize_erf_number(
+                sg.get("erfNo")
+                if sg.get("erfNo") is not None
+                else sg.get("parcelNo")
+            )
+            if not erf_number:
+                raise ValueError(
+                    f"Blank sg.erfNo/sg.parcelNo at ERF JSONL line {line_number}"
+                )
+
+            candidate = ErfCandidate(
+                erf_number=erf_number,
+                erf_id=erf_id,
+                ward_number=clean_text(ward.get("name")),
+                ward_pcode=clean_text(ward.get("pcode")),
+                lm_pcode=lm_pcode,
+                latitude=latitude,
+                longitude=longitude,
+            )
+            by_comparison_key[comparison_key].append(candidate)
 
     if row_count != expected_record_count:
         raise ValueError(
-            f"ERF lookup record-count mismatch. Expected {expected_record_count:,}, found {row_count:,}."
+            f"ERF JSONL record-count mismatch. Expected "
+            f"{expected_record_count:,}, found {row_count:,}."
         )
-    for candidates in by_erf_number.values():
+
+    for candidates in by_comparison_key.values():
         candidates.sort(key=lambda candidate: candidate.erf_id)
 
-    return dict(by_erf_number), {
+    return dict(by_comparison_key), {
         "records": row_count,
         "uniqueErfIds": len(seen_erf_ids),
-        "uniqueNormalizedErfNumbers": len(by_erf_number),
-        "duplicateErfNumberGroups": sum(len(candidates) > 1 for candidates in by_erf_number.values()),
-        "geometryTypeDistribution": dict(sorted(geometry_types.items())),
+        "uniqueNormalizedParcelKeys": len(by_comparison_key),
+        "duplicateNormalizedParcelKeyGroups": sum(
+            len(candidates) > 1
+            for candidates in by_comparison_key.values()
+        ),
+        "erfPipelinePrefixRemovedForComparison": ERF_PIPELINE_PREFIX,
+        "geometryReadForPsd": False,
     }
+
+
+def resolve_gis_key(
+    gis_key: str,
+    lookup_by_comparison_key: dict[str, list[ErfCandidate]],
+) -> tuple[list[ErfCandidate], str]:
+    matching: dict[str, ErfCandidate] = {}
+    matched_rules: list[str] = []
+
+    exact = lookup_by_comparison_key.get(gis_key, [])
+    if exact:
+        matched_rules.append("EXACT_FORMAT")
+        for candidate in exact:
+            matching[candidate.erf_id] = candidate
+
+    with_trailing_zero = lookup_by_comparison_key.get(f"{gis_key}0", [])
+    if with_trailing_zero:
+        matched_rules.append("APPEND_ONE_TRAILING_ZERO")
+        for candidate in with_trailing_zero:
+            matching[candidate.erf_id] = candidate
+
+    if not matching:
+        return [], "NO_MATCH"
+    if len(matched_rules) > 1:
+        return sorted(matching.values(), key=lambda item: item.erf_id), (
+            "MULTIPLE_COMPARISON_FORMATS"
+        )
+    return sorted(matching.values(), key=lambda item: item.erf_id), matched_rules[0]
 
 
 def enrich_end_rows(
     end_rows: list[dict[str, Any]],
-    elm_by_account: dict[str, list[ElmErfLink]],
-    lookup_by_erf_number: dict[str, list[ErfCandidate]],
+    bridge_by_account: dict[str, BridgeAccountLink],
+    lookup_by_comparison_key: dict[str, list[ErfCandidate]],
     progress_every: int,
 ) -> tuple[list[EnrichedMeter], dict[str, Any]]:
     enriched: list[EnrichedMeter] = []
     status_counts = Counter()
+    detail_counts = Counter()
+    normalization_rule_counts = Counter()
+
     matched_end_rows = 0
-    multiple_elm_erf_rows = 0
-    multiple_candidate_rows = 0
+    multiple_bridge_gis_rows = 0
     candidate_relationships = 0
 
     for index, source in enumerate(end_rows, start=1):
         if progress_every > 0 and index % progress_every == 0:
-            print(f"[PROGRESS] Enriched {index:,} / {len(end_rows):,} END meters")
+            print(
+                f"[PROGRESS] Enriched {index:,} / "
+                f"{len(end_rows):,} END meters"
+            )
 
         account = source["account_normalized"]
-        elm_links = elm_by_account.get(account, []) if account else []
-        elm_source_rows = sorted({row for link in elm_links for row in link.source_rows})
-        erf_numbers = sorted({link.erf_number for link in elm_links}, key=erf_sort_key)
+        bridge_link = bridge_by_account.get(account) if account else None
+        bridge_source_rows = (
+            list(bridge_link.source_rows)
+            if bridge_link is not None
+            else []
+        )
+        gis_keys = (
+            list(bridge_link.gis_keys)
+            if bridge_link is not None
+            else []
+        )
 
-        candidates_by_id: dict[str, ErfCandidate] = {}
-        missing_erf_numbers: list[str] = []
-        for erf_number in erf_numbers:
-            lookup_candidates = lookup_by_erf_number.get(erf_number, [])
-            if not lookup_candidates:
-                missing_erf_numbers.append(erf_number)
-            for candidate in lookup_candidates:
-                candidates_by_id[candidate.erf_id] = candidate
-        candidates = sorted(candidates_by_id.values(), key=lambda candidate: candidate.erf_id)
+        candidates: list[ErfCandidate] = []
+        normalization_rule = "NONE"
 
         if not account:
             status = "BLANK_ACCOUNT_NUMBER"
-        elif not elm_links:
+            detail_status = "BLANK_ACCOUNT"
+        elif bridge_link is None:
+            # Legacy PSD status value retained.
             status = "ACCOUNT_NOT_FOUND_IN_ELM"
-        elif not candidates:
+            detail_status = "ACCOUNT_NOT_IN_BRIDGE"
+        elif not gis_keys:
+            # Legacy PSD status value retained.
             status = "ERF_NUMBER_NOT_FOUND_IN_PIPELINE_LOOKUP"
-        elif missing_erf_numbers:
+            detail_status = "ACCOUNT_HAS_NO_GIS_KEY"
+        elif len(gis_keys) > 1:
             status = "PARTIAL_ERF_LOOKUP_MATCH"
-        elif len(candidates) == 1:
-            status = "MATCHED_SINGLE_GPS"
+            detail_status = "ACCOUNT_MULTIPLE_GIS_KEYS"
+            multiple_bridge_gis_rows += 1
         else:
-            status = "MATCHED_MULTIPLE_GPS"
+            candidates_found, normalization_rule = resolve_gis_key(
+                gis_keys[0],
+                lookup_by_comparison_key,
+            )
+            if len(candidates_found) == 0:
+                status = "ERF_NUMBER_NOT_FOUND_IN_PIPELINE_LOOKUP"
+                detail_status = "GIS_KEY_NOT_FOUND_IN_PIPELINE"
+            elif len(candidates_found) > 1:
+                # Never place multiple locations in the PSD.
+                status = "PARTIAL_ERF_LOOKUP_MATCH"
+                detail_status = "GIS_KEY_MULTIPLE_ERFS"
+            else:
+                candidates = candidates_found
+                status = "MATCHED_SINGLE_GPS"
+                detail_status = "EXACT_ONE_TO_ONE"
 
-        matched_end_rows += bool(elm_links)
-        multiple_elm_erf_rows += len(erf_numbers) > 1
-        multiple_candidate_rows += len(candidates) > 1
+        if len(candidates) > 1:
+            raise ValueError(
+                f"One-to-one gate failed for meter "
+                f"{source['identity']['MeterNumber']}"
+            )
+
+        matched_end_rows += bridge_link is not None
         candidate_relationships += len(candidates)
         status_counts[status] += 1
+        detail_counts[detail_status] += 1
+        normalization_rule_counts[normalization_rule] += 1
+
+        erf_numbers = [candidate.erf_number for candidate in candidates]
 
         enriched.append(
             EnrichedMeter(
@@ -471,22 +681,30 @@ def enrich_end_rows(
                 sales=source["sales"],
                 units=source["units"],
                 account_number_normalized=account,
-                elm_source_rows=elm_source_rows,
+                elm_source_rows=bridge_source_rows,
                 erf_numbers=erf_numbers,
-                missing_erf_numbers=missing_erf_numbers,
+                missing_erf_numbers=[],
                 candidates=candidates,
                 gps_match_status=status,
             )
         )
 
+    meters_with_gps = sum(item.has_usable_gps for item in enriched)
+    meters_without_gps = len(enriched) - meters_with_gps
+
     return enriched, {
         "records": len(enriched),
         "matchedEndRowsByAccount": matched_end_rows,
         "unmatchedEndRowsByAccount": len(enriched) - matched_end_rows,
-        "endRowsWithMultipleElmErfNumbers": multiple_elm_erf_rows,
-        "endRowsWithMultipleGpsCandidates": multiple_candidate_rows,
-        "metersWithUsableGps": sum(item.has_usable_gps for item in enriched),
-        "metersWithoutUsableGps": sum(not item.has_usable_gps for item in enriched),
+        # Legacy summary key retained, now measuring multiple bridge GIS keys.
+        "endRowsWithMultipleElmErfNumbers": multiple_bridge_gis_rows,
+        "endRowsWithMultipleGpsCandidates": 0,
+        "metersWithUsableGps": meters_with_gps,
+        "metersWithoutUsableGps": meters_without_gps,
         "candidateLocationRelationships": candidate_relationships,
         "statusCounts": dict(sorted(status_counts.items())),
+        "linkageDetailCounts": dict(sorted(detail_counts.items())),
+        "comparisonNormalizationCounts": dict(
+            sorted(normalization_rule_counts.items())
+        ),
     }

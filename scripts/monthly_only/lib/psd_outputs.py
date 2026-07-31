@@ -33,6 +33,8 @@ CANDIDATE_COLUMNS = [
     "Longitude", "GeometryJson",
 ]
 
+FORBIDDEN_GEOMETRY_KEYS = {"geometry", "geometryjson"}
+
 
 def output_paths(output_dir: Path, lm_pcode: str) -> dict[str, Path]:
     stem = f"enriched_psd__{lm_pcode}__2023-12_to_2026-06"
@@ -45,20 +47,73 @@ def output_paths(output_dir: Path, lm_pcode: str) -> dict[str, Path]:
     }
 
 
-def build_jsonl(records: list[EnrichedMeter]) -> tuple[bytes, dict[str, int]]:
+def _find_forbidden_geometry_keys(
+    value: Any,
+    path: str = "",
+) -> list[str]:
+    found: list[str] = []
+
+    if isinstance(value, dict):
+        for key, child in value.items():
+            child_path = f"{path}.{key}" if path else str(key)
+            if str(key).lower() in FORBIDDEN_GEOMETRY_KEYS:
+                found.append(child_path)
+            found.extend(_find_forbidden_geometry_keys(child, child_path))
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            found.extend(
+                _find_forbidden_geometry_keys(
+                    child,
+                    f"{path}[{index}]",
+                )
+            )
+
+    return found
+
+
+def build_jsonl(
+    records: list[EnrichedMeter],
+) -> tuple[bytes, dict[str, int]]:
     lines: list[str] = []
     max_document_bytes = 0
     documents_over_900kb = 0
+    max_candidate_count = 0
+    documents_with_multiple_candidates = 0
+    forbidden_geometry_occurrences = 0
+
     for record in records:
-        line = compact_json(record.as_json_document())
+        document = record.as_json_document()
+        candidate_count = len(document.get("ErfCandidates", []))
+        max_candidate_count = max(max_candidate_count, candidate_count)
+        documents_with_multiple_candidates += candidate_count > 1
+
+        forbidden_paths = _find_forbidden_geometry_keys(document)
+        forbidden_geometry_occurrences += len(forbidden_paths)
+        if forbidden_paths:
+            raise ValueError(
+                f"Geometry is prohibited in PSD meter "
+                f"{record.identity['MeterNumber']}: {forbidden_paths[:5]}"
+            )
+
+        line = compact_json(document)
         line_bytes = len(line.encode("utf-8"))
         max_document_bytes = max(max_document_bytes, line_bytes)
         documents_over_900kb += line_bytes > 900_000
         lines.append(line)
+
+    if documents_with_multiple_candidates:
+        raise ValueError(
+            f"{documents_with_multiple_candidates:,} PSD documents contain "
+            "more than one ERF candidate"
+        )
+
     payload = ("\n".join(lines) + "\n").encode("utf-8")
     return payload, {
         "maxJsonlDocumentBytes": max_document_bytes,
         "jsonlDocumentsOver900000Bytes": documents_over_900kb,
+        "maxErfCandidateCount": max_candidate_count,
+        "documentsWithMultipleErfCandidates": documents_with_multiple_candidates,
+        "forbiddenGeometryKeyOccurrences": forbidden_geometry_occurrences,
     }
 
 
@@ -71,7 +126,11 @@ def build_main_csv(records: list[EnrichedMeter]) -> bytes:
         + [f"Units_{month}" for _column, month in UNITS_MONTH_COLUMNS]
     )
     buffer = StringIO(newline="")
-    writer = csv.DictWriter(buffer, fieldnames=columns, lineterminator="\n")
+    writer = csv.DictWriter(
+        buffer,
+        fieldnames=columns,
+        lineterminator="\n",
+    )
     writer.writeheader()
     for record in records:
         writer.writerow(record.as_csv_row())
@@ -80,7 +139,11 @@ def build_main_csv(records: list[EnrichedMeter]) -> bytes:
 
 def build_candidate_csv(records: list[EnrichedMeter]) -> bytes:
     buffer = StringIO(newline="")
-    writer = csv.DictWriter(buffer, fieldnames=CANDIDATE_COLUMNS, lineterminator="\n")
+    writer = csv.DictWriter(
+        buffer,
+        fieldnames=CANDIDATE_COLUMNS,
+        lineterminator="\n",
+    )
     writer.writeheader()
     for record in records:
         for candidate in record.candidates:
@@ -97,7 +160,8 @@ def build_candidate_csv(records: list[EnrichedMeter]) -> bytes:
                     "LmPcode": candidate.lm_pcode,
                     "Latitude": format_number(candidate.latitude),
                     "Longitude": format_number(candidate.longitude),
-                    "GeometryJson": compact_json(candidate.geometry),
+                    # Historic column retained, geometry content prohibited.
+                    "GeometryJson": "",
                 }
             )
     return buffer.getvalue().encode("utf-8-sig")
@@ -105,7 +169,11 @@ def build_candidate_csv(records: list[EnrichedMeter]) -> bytes:
 
 def build_unmatched_csv(records: list[EnrichedMeter]) -> bytes:
     buffer = StringIO(newline="")
-    writer = csv.DictWriter(buffer, fieldnames=UNMATCHED_COLUMNS, lineterminator="\n")
+    writer = csv.DictWriter(
+        buffer,
+        fieldnames=UNMATCHED_COLUMNS,
+        lineterminator="\n",
+    )
     writer.writeheader()
     for record in records:
         if record.has_usable_gps:
@@ -119,14 +187,24 @@ def build_unmatched_csv(records: list[EnrichedMeter]) -> bytes:
                 "GpsMatchStatus": record.gps_match_status,
                 "ErfNumber": join_unique(record.erf_numbers),
                 "MissingErfNumbers": join_unique(record.missing_erf_numbers),
-                "ElmSourceRows": join_unique(str(row) for row in record.elm_source_rows),
+                "ElmSourceRows": join_unique(
+                    str(row) for row in record.elm_source_rows
+                ),
             }
         )
     return buffer.getvalue().encode("utf-8-sig")
 
 
 def json_bytes(value: Any) -> bytes:
-    return (json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    return (
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("utf-8")
 
 
 def sha256_file(path: Path) -> str:

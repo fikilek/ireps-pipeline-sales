@@ -3,11 +3,212 @@
 **File:** `rules/SALES_PIPELINE_RULES.md`
 **Project:** `C:\dev\ireps-pipeline-sales`
 **Status:** Governing project rules
-**Version:** 1.8.9
-**Effective date:** 2026-07-20
-**Current phase:** Sales All Meters visibility governance and schema alignment
-**Current provider:** Conlog
-**Current LM / workbase:** Lesedi — `ZA7423`
+**Version:** 1.9.0
+**Effective date:** 2026-08-13
+**Current phase:** Sales Enrich v1 — canonical structured address projection
+**Canonical Atomic provider:** Conlog; approved monthly-source providers remain bound by frozen source contracts
+**Current Sales Enrich regression LM / workbase:** Endumeni — `ZA5241`
+
+---
+
+## 0A. Version 1.9.0 — Sales Enrich v1 superseding amendment
+
+This section is the controlling amendment for Sales Enrich v1. Where an older Stage 06, Stage 08, provider, root-shape, or refresh statement later in this historical rules file conflicts with this section and the locked `sales_all_meters` schema v1.2.0, this section and the locked schema govern. Unrelated historical rules remain unchanged.
+
+### 0A.1 Locked objective
+
+Sales Enrich v1 adds a deterministic canonical physical-address projection for all approved Sales All rows. The enrichment population is not limited to no-GPS meters.
+
+For the frozen ZA5241 release regression:
+
+```text
+Input / output rows       10,216 / 10,216
+Enriched                  10,117
+Unresolved                    99
+No-GPS total               2,633
+No-GPS enriched            2,567
+No-GPS unresolved             66
+Rows lost / duplicated         0 / 0
+```
+
+These counts are a regression oracle for the approved ZA5241 dataset, not universal constants for future LMs.
+
+### 0A.2 One shared record-local parser
+
+One shared deterministic helper must serve both `atomic` and `monthly_source` Stage 06 origins. A separate monthly-only parser is prohibited.
+
+Runtime parsing is record-local. It may use `addressLine1` and `addressLine2` from the same frozen Sales source record, but must not infer an address fact from neighbouring Sales records.
+
+Enrichment success requires both `strNo` and `strName`. `strType` does not determine success. When the same source record explicitly states a supported type, normalize it. Otherwise use `-`.
+
+Approved aliases are:
+
+```text
+ST / STREET / STR -> Street
+ROAD / RD         -> Road
+DRIVE / DR        -> Drive
+PLACE             -> Place
+LANE              -> Lane
+AVENUE / AVE      -> Avenue
+CRESCENT/CRES/CR  -> Crescent
+```
+
+The approved alias rule supersedes the older assessment-manifest type values for explicit `STR` / `CR` records and same-record separated type evidence. The later-approved MGADI/MNGADI fail-closed amendment changes the locked full-population classification to 10,117 enriched / 99 unresolved while leaving the no-GPS counts unchanged.
+
+No spelling correction is allowed. Display normalization may change casing while preserving the source spelling, punctuation, digits, and meaning.
+
+Compound MGADI/MNGADI numeric forms such as `MGADI 577-1` and `562/1 MNGADI` are not proven physical street numbers from same-record evidence. They must fail closed as `MULTIPLE_RANGE_OR_CONFLICTING_ADDRESS_CANDIDATES`; no special-case parser rule may promote them merely because similar neighbouring records exist. This amendment affects 13 GPS-enabled ZA5241 records and does not change the locked no-GPS counts.
+
+### 0A.3 Stage 06 staging contract
+
+When Sales Enrich is enabled, Stage 06 must add exactly these flat staging columns together:
+
+```text
+strNo
+strName
+strType
+```
+
+Resolved:
+
+```text
+strNo   = nonblank string
+strName = nonblank string
+strType = supported type or "-"
+```
+
+Unresolved:
+
+```text
+strNo   = ""
+strName = ""
+strType = "-"
+```
+
+A partial canonical address is invalid.
+
+The flat column names are a CSV staging contract only. They must never become separate Firestore root fields.
+
+Stage 06 must compute raw-address preservation from a governed before/after projection, fail closed if the computed mutation count is non-zero, produce a machine-readable address-enrichment report, and bind its filename/SHA-256, computed mutation count, counts, and zero fabricated spatial relationships into the frozen Stage 06 manifest/fingerprint.
+
+### 0A.4 Atomic safety boundary
+
+Atomic remains the canonical/main Sales origin.
+
+An Atomic Stage 06 build may join an approved frozen commercial source solely to obtain address evidence. That source must be recorded as:
+
+```text
+role = ADDRESS_EVIDENCE_ONLY
+salesTruthAuthority = ATOMIC
+```
+
+The address-evidence join must be exact one-to-one by canonical Meter Master identity and fail closed on missing, extra, or duplicate identities. It must not change Atomic-derived identity, provider, monthly amounts, totals, purchase timestamps, or recency.
+
+### 0A.5 Monthly-source compatibility
+
+The existing rich `monthly_source` Stage 06 path must call the same shared address helper after canonical row construction and before final validation/write. It must preserve every raw commercial address field unchanged.
+
+No Atomic transaction fact may be fabricated when the monthly source does not provide transaction-level truth.
+
+### 0A.6 Firestore projection — governed root `adr`
+
+Stage 08 is the sole Sales Pipeline projection boundary from flat staging fields into Firestore.
+
+The canonical Firestore shape is exactly:
+
+```json
+"adr": {
+  "strNo": "42",
+  "strName": "Mckenzie",
+  "strType": "Street"
+}
+```
+
+For unresolved rows:
+
+```json
+"adr": {
+  "strNo": "",
+  "strName": "",
+  "strType": "-"
+}
+```
+
+Root `strNo`, root `strName`, and root `strType` are prohibited. `adr` contains exactly the three approved nested keys in v1.
+
+Every document produced under the new enriched contract must contain `adr`.
+
+### 0A.7 Strict root governance remains
+
+Do not remove or relax authoritative root governance merely to accommodate `adr`. The locked schema explicitly governs `adr` as one approved root map. Unknown roots are not canonical simply because an operational reader tolerates them.
+
+The intended separation is:
+
+```text
+Operational readers/writers -> additive-field tolerant, targeted, preservation-oriented
+Pipeline/schema              -> strict, explicitly governed, deterministic
+```
+
+### 0A.8 Stage 08 create, resume, initial-load, and refresh
+
+All Stage 08 paths that consume an enriched Stage 06 contract must validate the three flat staging fields and project them into one exact `adr` map.
+
+Legacy un-enriched Atomic frozen contracts may remain readable for historical recovery, but they do not satisfy the new enriched v1.2.0 schema until separately upgraded.
+
+For an enriched resume contract, existing `adr` must compare exactly while valid operational `master.visibility` remains preserved.
+
+The current rich controlled refresh path must treat `adr` as one pipeline-owned root. A missing canonical `adr` may be added; a valid changed `adr` may be updated as one map. If existing `adr` is malformed, has extra/missing nested keys, or violates the resolved/unresolved invariant, refresh must fail closed.
+
+Refresh must preserve `master`, `tbRefs`, `geofenceRefs`, and every other non-pipeline-owned root exactly according to the existing preservation contract.
+
+The broader redesign that will make downstream refresh source-origin independent is a separate approved future workstream; Sales Enrich v1 must not implement it.
+
+### 0A.9 Non-fabrication boundary
+
+Sales Enrich v1 must not create, infer, derive, or modify:
+
+- GPS / latitude / longitude;
+- ward;
+- ERF ID, ERF number, or ERF relationship;
+- premise ID or premise relationship;
+- AST relationship;
+- cadastral relationship;
+- field-confirmed meter-to-ERF relationship.
+
+`suburbName` is not part of Sales Enrich v1.
+
+### 0A.10 Operational writer preservation
+
+Current active operational Sales All writers use targeted updates for fields such as `master.visibility`, `tbRefs`, and `geofenceRefs`. They must preserve `adr`. No Sales Enrich v1 runtime change is required in Web or Mobile merely to tolerate the new governed map. Consumption of `adr` by NGTB Web/Mobile functionality is a later sprint.
+
+### 0A.11 Implementation and test gate
+
+The implementation must prove at minimum:
+
+```text
+Input rows                       10,216
+Output rows                      10,216
+Enriched                         10,117
+Unresolved                           99
+No-GPS total                      2,633
+No-GPS enriched                   2,567
+No-GPS unresolved                    66
+Raw address mutations                 0
+Fabricated spatial relationships      0
+Root strNo/strName/strType             0
+```
+
+It must also prove Stage 08 nested `adr` construction, exact-map validation, create/resume/initial-load/refresh compatibility, operational-field preservation, and deterministic repeated parsing.
+
+### 0A.12 Governance files
+
+The authoritative Firestore shape is schema v1.2.0 at:
+
+```text
+C:\dev\ireps-schemas\sales-all-meters\sales_all_meters.schema.md
+```
+
+The schema and this amendment must move together with the Sales Enrich implementation. Neither document alone authorizes a Firestore write or migration.
 
 ---
 

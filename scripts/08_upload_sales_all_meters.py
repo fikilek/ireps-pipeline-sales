@@ -54,11 +54,19 @@ import json
 import re
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
+from time import monotonic
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Optional, Sequence
 
 import pandas as pd
 from tqdm import tqdm
+
+from sales_address_enrichment import (
+    ADDRESS_MAP_FIELDS,
+    ADDRESS_STAGING_COLUMNS,
+    address_map_from_row,
+    validate_address_values,
+)
 
 try:
     from google.cloud import firestore
@@ -70,7 +78,8 @@ except ImportError:  # Allows offline preflight/help tests without Firebase depe
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 COLLECTION_NAME = "sales-all-meters"
-BATCH_SIZE = 450
+BATCH_SIZE = 400
+INITIAL_LOAD_PROJECTS = {"ireps-test", "ireps-5c3e9"}
 GOVERNED_PROVIDER = "conlog"
 MONTH_COLUMN_RE = re.compile(r"^amount_(\d{4})_(\d{2})_C$")
 METER_ID_RE = re.compile(r"^[A-Z0-9]+$")
@@ -114,6 +123,7 @@ class UploadConfig:
     mode: str
     resume_report_path: Optional[Path]
     report_dir: Path
+    preflight_only: bool
 
 
 @dataclass(frozen=True)
@@ -125,6 +135,9 @@ class PreflightResult:
     months: list[str]
     providers: list[str]
     total_amount_c: int
+    address_enrichment_enabled: bool
+    address_enriched_rows: int
+    address_unresolved_rows: int
 
 
 @dataclass(frozen=True)
@@ -181,13 +194,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mode",
         required=True,
-        choices=("create-only", "resume"),
-        help="create-only is normal; resume is restricted recovery.",
+        choices=("create-only", "initial-load", "refresh", "resume"),
+        help=(
+            "create-only requires an empty whole collection; initial-load requires only the "
+            "input document IDs to be absent; refresh is recurring; resume is restricted recovery."
+        ),
     )
     parser.add_argument(
         "--resume-report",
         type=Path,
         help="Previous failed Stage 08 JSON report. Required only for resume.",
+    )
+    parser.add_argument(
+        "--preflight-only",
+        action="store_true",
+        help="Inspect the selected initial-load or refresh mode without writing Firestore.",
     )
     parser.add_argument(
         "--report-dir",
@@ -466,7 +487,17 @@ def load_and_validate_csv(
         raise ValueError(f"Input CSV is not valid CSV data: {path}") from exc
     actual_columns = list(df.columns)
     monthly_columns, months = parse_month_columns(actual_columns)
-    expected_columns = BASE_COLUMNS + monthly_columns
+    present_address = [column for column in ADDRESS_STAGING_COLUMNS if column in actual_columns]
+    if present_address and present_address != ADDRESS_STAGING_COLUMNS:
+        raise ValueError(
+            "Sales Enrich staging columns must be present together in canonical order"
+        )
+    address_enrichment_enabled = present_address == ADDRESS_STAGING_COLUMNS
+    expected_columns = (
+        BASE_COLUMNS
+        + (ADDRESS_STAGING_COLUMNS if address_enrichment_enabled else [])
+        + monthly_columns
+    )
     if actual_columns != expected_columns:
         missing = [column for column in expected_columns if column not in actual_columns]
         unexpected = [column for column in actual_columns if column not in expected_columns]
@@ -509,6 +540,21 @@ def load_and_validate_csv(
         )
     if df["meterNo"].eq("").any():
         raise ValueError("CSV contains blank meterNo values")
+
+    address_enriched_rows = 0
+    address_unresolved_rows = 0
+    if address_enrichment_enabled:
+        for index, row in df.iterrows():
+            try:
+                validate_address_values(row["strNo"], row["strName"], row["strType"])
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid Sales Enrich address at CSV row {int(index) + 2}: {exc}"
+                ) from exc
+            if safe_str(row["strNo"]) and safe_str(row["strName"]):
+                address_enriched_rows += 1
+            else:
+                address_unresolved_rows += 1
 
     invalid_provider = df["provider"].ne(GOVERNED_PROVIDER)
     if invalid_provider.any():
@@ -569,6 +615,9 @@ def load_and_validate_csv(
         months=months,
         providers=providers,
         total_amount_c=int(total_values.sum()),
+        address_enrichment_enabled=address_enrichment_enabled,
+        address_enriched_rows=address_enriched_rows,
+        address_unresolved_rows=address_unresolved_rows,
     )
     return df, monthly_columns, result
 
@@ -598,7 +647,7 @@ def build_document(
         ym = f"{match.group(1)}-{match.group(2)}"
         monthly_totals[ym] = int(str(row[column]))
 
-    return {
+    document = {
         "master": {
             "id": str(row["masterId"]),
             "visibility": DEFAULT_MASTER_VISIBILITY,
@@ -613,6 +662,12 @@ def build_document(
         "lastPurchaseAtISO": str(row["lastPurchaseAtISO"]) or None,
         "daysSinceLastPurchase": optional_int(row["daysSinceLastPurchase"]),
     }
+    present_address = [column for column in ADDRESS_STAGING_COLUMNS if column in row]
+    if present_address:
+        if present_address != ADDRESS_STAGING_COLUMNS:
+            raise ValueError("Sales Enrich staging fields must be present together")
+        document["adr"] = address_map_from_row(row)
+    return document
 
 
 def is_strict_int(value: Any) -> bool:
@@ -626,8 +681,11 @@ def compare_existing_document(
     """Validate canonical existing data while preserving valid operational visibility."""
     differences: list[str] = []
 
-    missing_top = sorted(PIPELINE_TOP_LEVEL_FIELDS - set(existing.keys()))
-    extra_top = sorted(set(existing.keys()) - PIPELINE_TOP_LEVEL_FIELDS)
+    expected_top_level_fields = set(PIPELINE_TOP_LEVEL_FIELDS)
+    if "adr" in expected:
+        expected_top_level_fields.add("adr")
+    missing_top = sorted(expected_top_level_fields - set(existing.keys()))
+    extra_top = sorted(set(existing.keys()) - expected_top_level_fields)
     if missing_top:
         differences.append(f"missing top-level fields: {missing_top}")
     if extra_top:
@@ -726,6 +784,30 @@ def compare_existing_document(
             f"daysSinceLastPurchase differs: Firestore={days!r}; CSV={expected_days!r}"
         )
 
+    if "adr" in expected:
+        actual_adr = existing.get("adr")
+        expected_adr = expected["adr"]
+        if not isinstance(actual_adr, Mapping):
+            differences.append("adr is missing or is not an object")
+        else:
+            actual_keys = set(actual_adr.keys())
+            if actual_keys != ADDRESS_MAP_FIELDS:
+                differences.append(
+                    f"adr keys differ: Firestore={sorted(actual_keys)}; "
+                    f"expected={sorted(ADDRESS_MAP_FIELDS)}"
+                )
+            for field in ADDRESS_STAGING_COLUMNS:
+                actual_value = actual_adr.get(field)
+                wanted = expected_adr[field]
+                if not isinstance(actual_value, str):
+                    differences.append(
+                        f"adr.{field} must be a string, found {type(actual_value).__name__}"
+                    )
+                elif actual_value != wanted:
+                    differences.append(
+                        f"adr.{field} differs: Firestore={actual_value!r}; CSV={wanted!r}"
+                    )
+
     return differences
 
 
@@ -738,18 +820,52 @@ def collection_has_documents(db: firestore.Client) -> bool:
     return next(db.collection(COLLECTION_NAME).limit(1).stream(), None) is not None
 
 
+def wall_ts() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def print_batch_progress(label: str, completed: int, total: int, started: float) -> None:
+    elapsed = max(monotonic() - started, 0.001)
+    rate = completed / elapsed
+    remaining = max(total - completed, 0)
+    eta_seconds = remaining / rate if rate > 0 else 0.0
+    print(
+        f"[{wall_ts()}] {label}: {completed:,}/{total:,}; "
+        f"elapsed={elapsed:.1f}s; rate={rate:.1f} docs/s; eta={eta_seconds:.1f}s"
+    )
+
+
+def find_existing_input_ids(
+    db: firestore.Client,
+    document_ids: Sequence[str],
+    *,
+    label: str,
+) -> list[str]:
+    ids = list(document_ids)
+    existing: list[str] = []
+    total = len(ids)
+    started = monotonic()
+    inspected = 0
+    for id_batch in chunks(ids, BATCH_SIZE):
+        refs = [db.collection(COLLECTION_NAME).document(doc_id) for doc_id in id_batch]
+        for snapshot in db.get_all(refs):
+            if snapshot.exists:
+                existing.append(snapshot.id)
+        inspected += len(id_batch)
+        print_batch_progress(label, inspected, total, started)
+    return sorted(existing)
+
+
 def create_documents(
     db: firestore.Client,
     rows: Sequence[Mapping[str, Any]],
     monthly_columns: Sequence[str],
     progress: UploadProgress,
 ) -> None:
-    row_batches = list(chunks(rows, BATCH_SIZE))
-    for row_batch in tqdm(
-        row_batches,
-        desc="Writing Sales All Meters batches",
-        unit="batch",
-    ):
+    total = len(rows)
+    started = monotonic()
+    completed = 0
+    for row_batch in chunks(rows, BATCH_SIZE):
         batch = db.batch()
         for row in row_batch:
             doc_id = str(row["masterId"])
@@ -758,6 +874,107 @@ def create_documents(
         batch.commit()
         progress.committed_batches += 1
         progress.documents_created += len(row_batch)
+        completed += len(row_batch)
+        print_batch_progress("Sales All create", completed, total, started)
+
+
+def create_prebuilt_documents(
+    db: firestore.Client,
+    rows: Sequence[Mapping[str, Any]],
+    progress: UploadProgress,
+) -> None:
+    """Create governed rich Stage 06 documents in the existing 400-document waves."""
+    for row_batch in tqdm(
+        list(chunks(rows, BATCH_SIZE)),
+        desc="Creating Sales All Meters documents",
+        unit="batch",
+    ):
+        batch = db.batch()
+        for item in row_batch:
+            doc_id = str(item["masterId"])
+            batch.create(
+                db.collection(COLLECTION_NAME).document(doc_id),
+                dict(item["expected"]),
+            )
+        batch.commit()
+        progress.documents_created += len(row_batch)
+        progress.committed_batches += 1
+
+
+def verify_prebuilt_input_scope(
+    db: firestore.Client,
+    rows: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Verify every rich initial-load document with batched get_all reads."""
+    expected_by_id = {str(item["masterId"]): item["expected"] for item in rows}
+    failures: list[dict[str, Any]] = []
+    verified = 0
+    for id_batch in tqdm(
+        list(chunks(list(expected_by_id), BATCH_SIZE)),
+        desc="Verifying Sales All Meters input scope",
+        unit="batch",
+    ):
+        refs = [db.collection(COLLECTION_NAME).document(doc_id) for doc_id in id_batch]
+        snapshots = {snapshot.id: snapshot for snapshot in db.get_all(refs)}
+        for doc_id in id_batch:
+            snapshot = snapshots.get(doc_id)
+            if snapshot is None or not snapshot.exists:
+                failures.append({"masterId": doc_id, "differences": ["document missing"]})
+                continue
+            if (snapshot.to_dict() or {}) != expected_by_id[doc_id]:
+                failures.append(
+                    {"masterId": doc_id, "differences": ["document does not match governed Stage 06 document"]}
+                )
+                continue
+            verified += 1
+    if failures:
+        raise RuntimeError(
+            f"Input-scope Sales All verification failed for {len(failures)} document(s); "
+            f"first={failures[:10]}"
+        )
+    return {"verifiedInputScopeCount": verified, "batchReadSize": BATCH_SIZE}
+
+
+def verify_input_scope_post_upload(
+    db: firestore.Client,
+    rows: Sequence[dict[str, str]],
+    monthly_columns: Sequence[str],
+) -> dict[str, Any]:
+    row_by_id = {row["masterId"]: row for row in rows}
+    ids = sorted(row_by_id)
+    total = len(ids)
+    verified = 0
+    started = monotonic()
+    failures: list[dict[str, Any]] = []
+
+    for id_batch in chunks(ids, BATCH_SIZE):
+        refs = [db.collection(COLLECTION_NAME).document(doc_id) for doc_id in id_batch]
+        snapshots_by_id = {snapshot.id: snapshot for snapshot in db.get_all(refs)}
+        for doc_id in id_batch:
+            snapshot = snapshots_by_id.get(doc_id)
+            if snapshot is None or not snapshot.exists:
+                failures.append({"masterId": doc_id, "differences": ["document missing"]})
+                continue
+            expected = build_document(row_by_id[doc_id], monthly_columns)
+            actual = snapshot.to_dict() or {}
+            differences = compare_existing_document(actual, expected)
+            if differences:
+                failures.append({"masterId": doc_id, "differences": differences})
+        verified += len(id_batch)
+        print_batch_progress("Sales All verify", verified, total, started)
+
+    if failures:
+        raise RuntimeError(
+            f"Input-scope Sales All verification failed for {len(failures)} document(s); "
+            f"first={failures[0]}"
+        )
+
+    return {
+        "expectedInputScopeCount": total,
+        "verifiedInputScopeCount": total,
+        "inputScopeVerification": "PASS",
+        "verificationMode": "BATCHED_GET_ALL_FULL_INPUT_SCOPE",
+    }
 
 
 def build_resume_plan(
@@ -882,7 +1099,7 @@ def stage06_fingerprint_contract(manifest: Mapping[str, Any]) -> dict[str, Any]:
     monthly = source.get("monthlyInputs")
     if not isinstance(stage05, Mapping) or not isinstance(master, Mapping) or not isinstance(monthly, list):
         raise ValueError("Stage 06 source contract is incomplete")
-    return {
+    contract: dict[str, Any] = {
         "lmPcode": source.get("lmPcode"),
         "fromMonth": source.get("fromMonth"),
         "toMonth": source.get("toMonth"),
@@ -922,9 +1139,20 @@ def stage06_fingerprint_contract(manifest: Mapping[str, Any]) -> dict[str, Any]:
             "provider": output.get("provider"),
             "totalAmountC": output.get("totalAmountC"),
             "visibilityColumn": output.get("visibilityColumn"),
+            **(
+                {"addressEnrichment": dict(output.get("addressEnrichment") or {})}
+                if "addressEnrichment" in output
+                else {}
+            ),
         },
         "stats": dict(stats),
     }
+    if "commercialAddressSource" in source:
+        commercial = source.get("commercialAddressSource")
+        if not isinstance(commercial, Mapping):
+            raise ValueError("Stage 06 commercialAddressSource must be an object")
+        contract["commercialAddressSource"] = dict(commercial)
+    return contract
 
 
 def validate_stage06_manifest(
@@ -960,6 +1188,41 @@ def validate_stage06_manifest(
         raise ValueError("Stage 06 manifest visibility ownership is invalid")
     as_of_date = parse_manifest_as_of_date(source.get("asOfDate"))
 
+    address_contract = output.get("addressEnrichment")
+    if preflight.address_enrichment_enabled:
+        if not isinstance(address_contract, Mapping) or address_contract.get("enabled") is not True:
+            raise ValueError("Stage 06 manifest is missing enabled addressEnrichment contract")
+        if address_contract.get("stagingColumns") != ADDRESS_STAGING_COLUMNS:
+            raise ValueError("Stage 06 addressEnrichment stagingColumns mismatch")
+        if address_contract.get("firestoreProjection") != "adr":
+            raise ValueError("Stage 06 addressEnrichment Firestore projection must be adr")
+        if address_contract.get("enrichedRows") != preflight.address_enriched_rows:
+            raise ValueError("Stage 06 addressEnrichment enrichedRows mismatch")
+        if address_contract.get("unresolvedRows") != preflight.address_unresolved_rows:
+            raise ValueError("Stage 06 addressEnrichment unresolvedRows mismatch")
+        if address_contract.get("rawAddressMutationCount") != 0:
+            raise ValueError("Stage 06 addressEnrichment reports raw address mutation")
+        if address_contract.get("fabricatedSpatialRelationshipCount") != 0:
+            raise ValueError("Stage 06 addressEnrichment reports fabricated spatial relationships")
+        report_filename = safe_str(address_contract.get("reportFilename"))
+        report_sha = safe_str(address_contract.get("reportSha256")).lower()
+        if not report_filename or not report_sha:
+            raise ValueError("Stage 06 addressEnrichment report fingerprint is incomplete")
+        report_path = config.input_path.with_name(report_filename)
+        require_file(report_path, "Stage 06 address enrichment report")
+        if sha256_file(report_path) != report_sha:
+            raise ValueError("Stage 06 address enrichment report SHA mismatch")
+        commercial_address_source = source.get("commercialAddressSource")
+        if not isinstance(commercial_address_source, Mapping):
+            raise ValueError("Atomic enriched Stage 06 manifest is missing commercialAddressSource")
+        if commercial_address_source.get("role") != "ADDRESS_EVIDENCE_ONLY":
+            raise ValueError("Atomic commercialAddressSource role must be ADDRESS_EVIDENCE_ONLY")
+        if commercial_address_source.get("salesTruthAuthority") != "ATOMIC":
+            raise ValueError("Atomic commercialAddressSource may not become Sales truth")
+    else:
+        if address_contract is not None:
+            raise ValueError("Stage 06 manifest advertises addressEnrichment but CSV lacks address columns")
+
     expected = {
         "filename": config.input_path.name,
         "rows": preflight.row_count,
@@ -970,6 +1233,11 @@ def validate_stage06_manifest(
         "provider": GOVERNED_PROVIDER,
         "totalAmountC": preflight.total_amount_c,
         "visibilityColumn": "ABSENT",
+        **(
+            {"addressEnrichment": dict(address_contract)}
+            if preflight.address_enrichment_enabled
+            else {}
+        ),
     }
     for field, wanted in expected.items():
         if output.get(field) != wanted:
@@ -987,6 +1255,7 @@ def validate_stage06_manifest(
         "lmPcode": source.get("lmPcode"),
         "fromMonth": source.get("fromMonth"),
         "toMonth": source.get("toMonth"),
+        "addressEnrichment": dict(address_contract) if isinstance(address_contract, Mapping) else None,
     }
 
 
@@ -1016,6 +1285,7 @@ def make_upload_contract(
         "visibilityResumePolicy": "PRESERVE_VALID_EXISTING_OR_BLOCK",
         "visibilityLifecycleOwner": "OPERATIONAL_BRIDGE",
         "visibilityOwnership": "OPERATIONAL_WRITERS_ONLY",
+        "addressEnrichment": stage06_evidence.get("addressEnrichment"),
     }
 
 
@@ -1086,9 +1356,12 @@ def build_config(args: argparse.Namespace) -> UploadConfig:
             f"Project confirmation failed: --project-id={project_id!r}, "
             f"--confirm-project={confirm_project!r}"
         )
+    if args.mode == "initial-load" and project_id not in INITIAL_LOAD_PROJECTS:
+        allowed = ", ".join(sorted(INITIAL_LOAD_PROJECTS))
+        raise ValueError(f"Stage 08 initial-load is hard-gated to projects: {allowed}")
     if args.mode == "resume" and args.resume_report is None:
         raise ValueError("--mode resume requires --resume-report")
-    if args.mode == "create-only" and args.resume_report is not None:
+    if args.mode != "resume" and args.resume_report is not None:
         raise ValueError("--resume-report may be used only with --mode resume")
 
     return UploadConfig(
@@ -1101,6 +1374,7 @@ def build_config(args: argparse.Namespace) -> UploadConfig:
             resolve_project_path(args.resume_report) if args.resume_report is not None else None
         ),
         report_dir=resolve_project_path(args.report_dir),
+        preflight_only=bool(args.preflight_only),
     )
 
 
@@ -1117,6 +1391,15 @@ def print_preflight(config: UploadConfig, result: PreflightResult) -> None:
     print(f"Provider:             {', '.join(result.providers)}")
     print(f"Total amount cents:   {result.total_amount_c:,}")
     print(f"CSV SHA-256:          {result.csv_sha256}")
+    print(
+        "Address enrichment:   "
+        + (
+            f"ENABLED ({result.address_enriched_rows:,} enriched / "
+            f"{result.address_unresolved_rows:,} unresolved)"
+            if result.address_enrichment_enabled
+            else "LEGACY / NOT PRESENT"
+        )
+    )
     print("Visibility column:    ABSENT (Stage 06)")
     print(f"Stage 08 default:     {DEFAULT_MASTER_VISIBILITY}")
     print("Resume visibility:    PRESERVE VALID / BLOCK INVALID")
@@ -1125,6 +1408,25 @@ def print_preflight(config: UploadConfig, result: PreflightResult) -> None:
 
 def main() -> None:
     args = parse_args()
+    if args.mode == "refresh":
+        from sales_pipeline_sales_all_refresh import run_refresh
+        report_path = run_refresh(
+            project_id=safe_str(args.project_id),
+            confirm_project=safe_str(args.confirm_project),
+            service_account_path=resolve_project_path(args.service_account),
+            input_path=resolve_project_path(args.input),
+            manifest_path=resolve_project_path(args.manifest),
+            report_dir=resolve_project_path(args.report_dir),
+            preflight_only=bool(args.preflight_only),
+        )
+        print("=== SALES ALL METERS REFRESH COMPLETE ===")
+        print(f"Mode: {'PREFLIGHT ONLY' if args.preflight_only else 'REFRESH + VERIFY'}")
+        print(f"Project: {safe_str(args.project_id)}")
+        print("Deletes: 0")
+        print(f"Report: {report_path}")
+        return
+    if args.preflight_only and args.mode not in ("initial-load", "refresh"):
+        raise ValueError("--preflight-only is supported with --mode initial-load or refresh")
     config = build_config(args)
     started_at = datetime.now(UTC)
     report_path = make_report_path(config.report_dir, config.project_id)
@@ -1137,6 +1439,7 @@ def main() -> None:
         "projectId": config.project_id,
         "collection": COLLECTION_NAME,
         "mode": config.mode,
+        "preflightOnly": config.preflight_only,
         "inputPath": str(config.input_path),
         "manifestPath": str(config.manifest_path),
         "serviceAccountPath": str(config.service_account_path),
@@ -1158,40 +1461,75 @@ def main() -> None:
                 f"Requested={config.project_id!r}; credential={credential_project!r}"
             )
 
-        df, monthly_columns, preflight = load_and_validate_csv(config.input_path)
-        manifest_snapshot = read_json_snapshot(config.manifest_path, "Stage 06 manifest")
-        stage06_evidence = validate_stage06_manifest(
-            config,
-            preflight,
-            list(df.columns),
-            manifest_snapshot,
-        )
-        validate_recency_contract(
-            df,
-            preflight.months,
-            parse_manifest_as_of_date(stage06_evidence["asOfDate"]),
-        )
-        rows = dataframe_rows(df)
-        upload_contract = make_upload_contract(config, preflight, stage06_evidence)
-        upload_fingerprint = canonical_json_sha256(upload_contract)
-        report.update(
-            {
-                "uploadContract": upload_contract,
-                "uploadFingerprint": upload_fingerprint,
-                "stage06Evidence": dict(stage06_evidence),
-                "csvSha256": preflight.csv_sha256,
-                "documentIdsSha256": preflight.document_ids_sha256,
-                "rowsRead": preflight.row_count,
-                "uniqueMasterIds": preflight.unique_master_ids,
-                "months": preflight.months,
-                "providers": preflight.providers,
-                "totalAmountC": preflight.total_amount_c,
-                "visibilityColumn": "ABSENT",
-                "visibilityCreationDefault": DEFAULT_MASTER_VISIBILITY,
-                "visibilityResumePolicy": "PRESERVE_VALID_EXISTING_OR_BLOCK",
-                "visibilityLifecycleOwner": "OPERATIONAL_BRIDGE",
-            }
-        )
+        rich_initial_load = config.mode == "initial-load"
+        if rich_initial_load:
+            from sales_pipeline_sales_all_refresh import load_and_validate as load_current_stage06
+
+            rows, stage06_evidence = load_current_stage06(
+                config.input_path,
+                config.manifest_path,
+            )
+            monthly_columns = []
+            report.update(
+                {
+                    "stage06Evidence": dict(stage06_evidence),
+                    "csvSha256": stage06_evidence["csvSha256"],
+                    "rowsRead": len(rows),
+                    "uniqueMasterIds": len({str(row["masterId"]) for row in rows}),
+                    "months": stage06_evidence["months"],
+                    "providers": [stage06_evidence["provider"]],
+                    "totalAmountC": stage06_evidence["totalAmountC"],
+                    "visibilityColumn": "ABSENT",
+                    "visibilityCreationDefault": DEFAULT_MASTER_VISIBILITY,
+                    "visibilityResumePolicy": "NOT_APPLICABLE_CREATE_ONLY",
+                    "visibilityLifecycleOwner": "OPERATIONAL_BRIDGE",
+                    "currentStage06RichContract": True,
+                }
+            )
+            print("\n=== SALES ALL METERS PREFLIGHT ===")
+            print(f"Mode:                 {config.mode}")
+            print(f"Target project:       {config.project_id}")
+            print(f"Rows:                 {len(rows):,}")
+            print(f"Provider:             {stage06_evidence['provider']}")
+            print("Stage 06 contract:    CURRENT RICH MONTHLY-SOURCE")
+            print("Visibility column:    ABSENT (Stage 06)")
+            print(f"Stage 08 default:     {DEFAULT_MASTER_VISIBILITY}")
+            print("===========================================\n")
+        else:
+            df, monthly_columns, preflight = load_and_validate_csv(config.input_path)
+            manifest_snapshot = read_json_snapshot(config.manifest_path, "Stage 06 manifest")
+            stage06_evidence = validate_stage06_manifest(
+                config,
+                preflight,
+                list(df.columns),
+                manifest_snapshot,
+            )
+            validate_recency_contract(
+                df,
+                preflight.months,
+                parse_manifest_as_of_date(stage06_evidence["asOfDate"]),
+            )
+            rows = dataframe_rows(df)
+            upload_contract = make_upload_contract(config, preflight, stage06_evidence)
+            upload_fingerprint = canonical_json_sha256(upload_contract)
+            report.update(
+                {
+                    "uploadContract": upload_contract,
+                    "uploadFingerprint": upload_fingerprint,
+                    "stage06Evidence": dict(stage06_evidence),
+                    "csvSha256": preflight.csv_sha256,
+                    "documentIdsSha256": preflight.document_ids_sha256,
+                    "rowsRead": preflight.row_count,
+                    "uniqueMasterIds": preflight.unique_master_ids,
+                    "months": preflight.months,
+                    "providers": preflight.providers,
+                    "totalAmountC": preflight.total_amount_c,
+                    "visibilityColumn": "ABSENT",
+                    "visibilityCreationDefault": DEFAULT_MASTER_VISIBILITY,
+                    "visibilityResumePolicy": "PRESERVE_VALID_EXISTING_OR_BLOCK",
+                    "visibilityLifecycleOwner": "OPERATIONAL_BRIDGE",
+                }
+            )
 
         if config.mode == "resume":
             assert config.resume_report_path is not None
@@ -1201,7 +1539,8 @@ def main() -> None:
                 upload_fingerprint,
             )
 
-        print_preflight(config, preflight)
+        if not rich_initial_load:
+            print_preflight(config, preflight)
 
         if firestore is None or service_account is None:
             raise RuntimeError(
@@ -1213,6 +1552,32 @@ def main() -> None:
         )
         db = firestore.Client(project=config.project_id, credentials=credentials)
 
+        if config.mode == "initial-load" and config.preflight_only:
+            existing_ids = find_existing_input_ids(
+                db,
+                [str(row["masterId"]) for row in rows],
+                label="Sales All initial-load preflight",
+            )
+            report.update(
+                {
+                    "inputScopeExistingCount": len(existing_ids),
+                    "inputScopeExistingIds": existing_ids[:100],
+                    "documentsCreated": 0,
+                    "committedBatches": 0,
+                }
+            )
+            if existing_ids:
+                raise RuntimeError(
+                    f"Stage 08 initial-load blocked: {len(existing_ids)} input document ID(s) "
+                    f"already exist; first={existing_ids[:10]}"
+                )
+            report.update({"status": "PASS", "result": "PREFLIGHT_PASS"})
+            print("=== SALES ALL INITIAL-LOAD PREFLIGHT PASS ===")
+            print(f"Input IDs checked: {len(rows):,}")
+            print("Existing input IDs: 0")
+            print("Firestore writes: 0")
+            return
+
         if config.mode == "create-only":
             if collection_has_documents(db):
                 raise RuntimeError(
@@ -1222,6 +1587,22 @@ def main() -> None:
             matching = 0
             missing_before = len(rows)
             create_documents(db, rows, monthly_columns, progress)
+        elif config.mode == "initial-load":
+            existing_ids = find_existing_input_ids(
+                db,
+                [str(row["masterId"]) for row in rows],
+                label="Sales All initial-load gate",
+            )
+            report["inputScopeExistingCount"] = len(existing_ids)
+            if existing_ids:
+                report["inputScopeExistingIds"] = existing_ids[:100]
+                raise RuntimeError(
+                    f"Initial-load blocked: {len(existing_ids)} input Sales All ID(s) already exist; "
+                    f"first={existing_ids[:10]}"
+                )
+            matching = 0
+            missing_before = len(rows)
+            create_prebuilt_documents(db, rows, progress)
         else:
             plan = build_resume_plan(db, rows, monthly_columns)
             report["matchingDocuments"] = plan.matching_count
@@ -1240,7 +1621,11 @@ def main() -> None:
             missing_before = len(plan.missing_rows)
             create_documents(db, plan.missing_rows, monthly_columns, progress)
 
-        verification = verify_post_upload(db, rows, monthly_columns)
+        verification = (
+            verify_prebuilt_input_scope(db, rows)
+            if config.mode == "initial-load"
+            else verify_post_upload(db, rows, monthly_columns)
+        )
         report.update(
             {
                 "documentsCreated": progress.documents_created,
@@ -1255,9 +1640,14 @@ def main() -> None:
 
         print("=== SALES ALL METERS UPLOAD COMPLETE ===")
         print(f"Project:            {config.project_id}")
+        print(f"Mode:               {config.mode}")
         print(f"Documents created:  {progress.documents_created:,}")
         print(f"Existing matching:  {matching:,}")
-        print(f"Final collection:   {verification['finalCount']:,}")
+        if config.mode == "initial-load":
+            print(f"Input scope verified:{verification['verifiedInputScopeCount']:,}")
+            print("Verification:        FULL INPUT SCOPE / BATCHED get_all")
+        else:
+            print(f"Final collection:   {verification['finalCount']:,}")
         print(f"Creation visibility: {DEFAULT_MASTER_VISIBILITY}")
         print("Existing visibility: PRESERVED WHEN VALID")
         print(f"Run report:         {report_path}")

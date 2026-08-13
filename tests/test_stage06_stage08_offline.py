@@ -13,6 +13,9 @@ import pandas as pd
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS_DIR = PROJECT_ROOT / "scripts"
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
 
 
 def load_script(module_name: str, filename: str):
@@ -28,6 +31,47 @@ def load_script(module_name: str, filename: str):
 
 stage06 = load_script("stage06_offline", "06_build_sales_all_meters.py")
 stage08 = load_script("stage08_offline", "08_upload_sales_all_meters.py")
+refresh = load_script("stage08_refresh_offline", "sales_pipeline_sales_all_refresh.py")
+import sales_pipeline_monthly_source_support as monthly_support  # noqa: E402
+
+
+def write_jsonl(path: Path, rows: list[dict]) -> str:
+    payload = b"".join(
+        (json.dumps(row, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
+        for row in rows
+    )
+    path.write_bytes(payload)
+    return hashlib.sha256(payload).hexdigest()
+
+
+def synthetic_commercial_row(*, meter: str = "ABC123") -> dict:
+    return {
+        "lmPcode": "ZA7423",
+        "meterNo": meter,
+        "meterNoNormalized": meter,
+        "customerNo": "C1",
+        "accountNo": "A1",
+        "accountNumber": "A1",
+        "customerName": "CUSTOMER",
+        "customerSurname": "SURNAME",
+        "addressLine1": "42 MCKENZIE",
+        "addressLine2": "STREET",
+        "town": "DUNDEE",
+        "postalAddress1": "PO BOX 1",
+        "postalAddress2": "",
+        "postalAddressTown": "DUNDEE",
+        "standNumber": "STAND-42",
+        "monthlySalesC": {"2026-06": 100},
+        "monthlyUnits": {"2026-06": "5"},
+        "totalSalesC": 100,
+        "totalUnits": "5",
+        "hasUsableGps": False,
+        "elmAccountMatched": False,
+        "erfCandidates": [],
+        "erfNumbers": [],
+        "missingErfNumbers": [],
+        "elmSourceRows": [],
+    }
 
 
 class Stage06ContractTests(unittest.TestCase):
@@ -129,24 +173,277 @@ class Stage06ContractTests(unittest.TestCase):
         self.assertEqual(snapshot.sha256, hashlib.sha256(original).hexdigest())
         self.assertEqual(snapshot.frame.at[0, "meterNo"], "ABC123")
 
+    def test_atomic_enrichment_integration_preserves_existing_fields_and_binds_report(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            commercial_path = root / "commercial.jsonl"
+            source_row = synthetic_commercial_row()
+            commercial_sha = write_jsonl(commercial_path, [source_row])
+            original_source_bytes = commercial_path.read_bytes()
 
-def sales_all_frame(*, provider: str = "conlog") -> pd.DataFrame:
-    return pd.DataFrame(
-        [
-            {
-                "masterId": "ABC123",
-                "meterNo": "ABC123",
-                "meterNoNormalized": "ABC123",
-                "provider": provider,
-                "customerNo": "C1",
-                "accountNo": "A1",
-                "totalAmountC": "100",
-                "lastPurchaseAtISO": "2026-06-30T10:00:00Z",
-                "daysSinceLastPurchase": "16",
-                "amount_2026_06_C": "100",
+            base = pd.DataFrame(
+                [
+                    {
+                        "masterId": "ABC123",
+                        "meterNo": "ABC123",
+                        "meterNoNormalized": "ABC123",
+                        "provider": "conlog",
+                        "customerNo": "C1",
+                        "accountNo": "A1",
+                        "totalAmountC": 100,
+                        "lastPurchaseAtISO": "2026-06-30T10:00:00+00:00",
+                        "daysSinceLastPurchase": 16,
+                        "amount_2026_06_C": 100,
+                    }
+                ],
+                columns=stage06.BASE_OUTPUT_COLUMNS + ["amount_2026_06_C"],
+            )
+            original = base.copy(deep=True)
+            output_path = root / "sales_all_meters__ZA7423__FULL__2026-06_to_2026-06.csv"
+
+            enriched, evidence, contract = stage06.enrich_atomic_output(
+                base,
+                lm_pcode="ZA7423",
+                commercial_source_path=commercial_path,
+                expected_commercial_sha256=commercial_sha,
+                output_path=output_path,
+            )
+
+            pd.testing.assert_frame_equal(
+                enriched[stage06.BASE_OUTPUT_COLUMNS + ["amount_2026_06_C"]],
+                original,
+                check_dtype=False,
+            )
+            self.assertEqual(
+                enriched.loc[0, ["strNo", "strName", "strType"]].tolist(),
+                ["42", "Mckenzie", "Street"],
+            )
+            self.assertEqual(evidence["role"], "ADDRESS_EVIDENCE_ONLY")
+            self.assertEqual(evidence["salesTruthAuthority"], "ATOMIC")
+            self.assertEqual(contract["rawAddressMutationCount"], 0)
+            report_path = root / "sales_all_meters__ZA7423__FULL__2026-06_to_2026-06.address_enrichment.json"
+            self.assertTrue(report_path.is_file())
+            self.assertEqual(contract["reportSha256"], hashlib.sha256(report_path.read_bytes()).hexdigest())
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(report["rawAddressMutationCount"], 0)
+            self.assertEqual(commercial_path.read_bytes(), original_source_bytes)
+
+    def test_atomic_enrichment_identity_join_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            commercial_path = root / "commercial.jsonl"
+            commercial_sha = write_jsonl(
+                commercial_path,
+                [synthetic_commercial_row(), synthetic_commercial_row(meter="EXTRA999")],
+            )
+            base = pd.DataFrame(
+                [
+                    {
+                        "masterId": "ABC123",
+                        "meterNo": "ABC123",
+                        "meterNoNormalized": "ABC123",
+                        "provider": "conlog",
+                        "customerNo": "C1",
+                        "accountNo": "A1",
+                        "totalAmountC": 100,
+                        "lastPurchaseAtISO": "2026-06-30T10:00:00+00:00",
+                        "daysSinceLastPurchase": 16,
+                        "amount_2026_06_C": 100,
+                    }
+                ],
+                columns=stage06.BASE_OUTPUT_COLUMNS + ["amount_2026_06_C"],
+            )
+            with self.assertRaisesRegex(ValueError, "population mismatch"):
+                stage06.enrich_atomic_output(
+                    base,
+                    lm_pcode="ZA7423",
+                    commercial_source_path=commercial_path,
+                    expected_commercial_sha256=commercial_sha,
+                    output_path=root / "out.csv",
+                )
+
+    def test_monthly_source_stage06_integration_preserves_raw_fields_and_binds_report(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            monthly_dir = root / "monthly"
+            monthly_dir.mkdir()
+            commercial_path = root / "commercial.jsonl"
+            source_row = synthetic_commercial_row()
+            commercial_sha = write_jsonl(commercial_path, [source_row])
+            original_source_bytes = commercial_path.read_bytes()
+
+            monthly_path = monthly_dir / "monthly__FULL__2026-06__from_monthly_source.csv"
+            pd.DataFrame(
+                [
+                    {
+                        "lmPcode": "ZA7423",
+                        "meterNo": "ABC123",
+                        "ym": "2026-06",
+                        "provider": "contour",
+                        "amountTotalC": "100",
+                        "unitsTotal": "5",
+                        "sourceOrigin": "monthly_source",
+                    }
+                ]
+            ).to_csv(monthly_path, index=False, encoding="utf-8")
+
+            master_path = root / "meter_master.csv"
+            master_manifest_path = root / "meter_master.manifest.json"
+            monthly_support.build_stage05_monthly_source(
+                lm_pcode="ZA7423",
+                provider="contour",
+                meter_type="electricity",
+                from_month="2026-06",
+                to_month="2026-06",
+                commercial_source=commercial_path,
+                expected_commercial_sha256=commercial_sha,
+                monthly_dir=monthly_dir,
+                output_path=master_path,
+                manifest_path=master_manifest_path,
+                source_run_id="SYNTHETIC_RUN",
+            )
+
+            sales_path = root / "sales_all_meters__ZA7423__FULL__2026-06_to_2026-06.csv"
+            sales_manifest_path = root / "sales_all_meters__ZA7423__FULL__2026-06_to_2026-06.manifest.json"
+            manifest = monthly_support.build_stage06_monthly_source(
+                lm_pcode="ZA7423",
+                provider="contour",
+                from_month="2026-06",
+                to_month="2026-06",
+                master_path=master_path,
+                master_manifest_path=master_manifest_path,
+                commercial_source=commercial_path,
+                expected_commercial_sha256=commercial_sha,
+                monthly_dir=monthly_dir,
+                output_path=sales_path,
+                manifest_path=sales_manifest_path,
+            )
+
+            output = pd.read_csv(sales_path, dtype=str, encoding="utf-8-sig").fillna("")
+            row = output.to_dict("records")[0]
+            for field in (
+                "addressLine1",
+                "addressLine2",
+                "town",
+                "postalAddress1",
+                "postalAddress2",
+                "postalAddressTown",
+                "standNumber",
+            ):
+                self.assertEqual(row[field], str(source_row.get(field) or ""))
+            self.assertEqual((row["strNo"], row["strName"], row["strType"]), ("42", "Mckenzie", "Street"))
+            self.assertEqual(row["totalAmountC"], "100")
+            self.assertEqual(row["provider"], "contour")
+            address_contract = manifest["outputContract"]["addressEnrichment"]
+            self.assertEqual(address_contract["rawAddressMutationCount"], 0)
+            report_path = sales_path.with_suffix(".address_enrichment.json")
+            self.assertEqual(address_contract["reportSha256"], hashlib.sha256(report_path.read_bytes()).hexdigest())
+            self.assertEqual(json.loads(report_path.read_text(encoding="utf-8"))["rawAddressMutationCount"], 0)
+            self.assertEqual(commercial_path.read_bytes(), original_source_bytes)
+
+    def test_monthly_source_stage06_identity_join_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            monthly_dir = root / "monthly"
+            monthly_dir.mkdir()
+            commercial_path = root / "commercial.jsonl"
+            commercial_sha = write_jsonl(commercial_path, [synthetic_commercial_row()])
+            monthly_path = monthly_dir / "monthly__FULL__2026-06__from_monthly_source.csv"
+            pd.DataFrame(
+                [
+                    {
+                        "lmPcode": "ZA7423",
+                        "meterNo": "ABC123",
+                        "ym": "2026-06",
+                        "provider": "contour",
+                        "amountTotalC": "100",
+                        "unitsTotal": "5",
+                        "sourceOrigin": "monthly_source",
+                    }
+                ]
+            ).to_csv(monthly_path, index=False, encoding="utf-8")
+
+            master_path = root / "meter_master.csv"
+            master_manifest_path = root / "meter_master.manifest.json"
+            monthly_support.build_stage05_monthly_source(
+                lm_pcode="ZA7423",
+                provider="contour",
+                meter_type="electricity",
+                from_month="2026-06",
+                to_month="2026-06",
+                commercial_source=commercial_path,
+                expected_commercial_sha256=commercial_sha,
+                monthly_dir=monthly_dir,
+                output_path=master_path,
+                manifest_path=master_manifest_path,
+                source_run_id="SYNTHETIC_RUN",
+            )
+
+            master = pd.read_csv(master_path, dtype=str, encoding="utf-8-sig").fillna("")
+            extra = master.iloc[0].copy()
+            extra["masterId"] = "EXTRA999"
+            extra["meterNoRaw"] = "EXTRA999"
+            extra["meterNoNormalized"] = "EXTRA999"
+            extra["salesId"] = "EXTRA999"
+            master = pd.concat([master, pd.DataFrame([extra])], ignore_index=True)
+            master.to_csv(master_path, index=False, lineterminator="\n", encoding="utf-8")
+
+            stage05_manifest = json.loads(master_manifest_path.read_text(encoding="utf-8"))
+            stage05_manifest["outputContract"]["rows"] = 2
+            stage05_manifest["outputContract"]["sha256"] = hashlib.sha256(master_path.read_bytes()).hexdigest()
+            stage05_manifest["stats"]["totalMasterRows"] = 2
+            fingerprint = {
+                "sourceContract": stage05_manifest["sourceContract"],
+                "outputContract": {
+                    "filename": stage05_manifest["outputContract"]["filename"],
+                    "rows": stage05_manifest["outputContract"]["rows"],
+                    "columns": stage05_manifest["outputContract"]["columns"],
+                    "sha256": stage05_manifest["outputContract"]["sha256"],
+                },
+                "stats": stage05_manifest["stats"],
             }
-        ]
-    )
+            stage05_manifest["buildFingerprint"] = monthly_support.canonical_sha256(fingerprint)
+            master_manifest_path.write_text(
+                json.dumps(stage05_manifest, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "Meter Master/commercial population mismatch"):
+                monthly_support.build_stage06_monthly_source(
+                    lm_pcode="ZA7423",
+                    provider="contour",
+                    from_month="2026-06",
+                    to_month="2026-06",
+                    master_path=master_path,
+                    master_manifest_path=master_manifest_path,
+                    commercial_source=commercial_path,
+                    expected_commercial_sha256=commercial_sha,
+                    monthly_dir=monthly_dir,
+                    output_path=root / "sales.csv",
+                    manifest_path=root / "sales.manifest.json",
+                )
+
+
+def sales_all_frame(*, provider: str = "conlog", enriched: bool = False) -> pd.DataFrame:
+    row = {
+        "masterId": "ABC123",
+        "meterNo": "ABC123",
+        "meterNoNormalized": "ABC123",
+        "provider": provider,
+        "customerNo": "C1",
+        "accountNo": "A1",
+        "totalAmountC": "100",
+        "lastPurchaseAtISO": "2026-06-30T10:00:00Z",
+        "daysSinceLastPurchase": "16",
+    }
+    columns = list(stage08.BASE_COLUMNS)
+    if enriched:
+        row.update({"strNo": "42", "strName": "Mckenzie", "strType": "Street"})
+        columns += list(stage08.ADDRESS_STAGING_COLUMNS)
+    row["amount_2026_06_C"] = "100"
+    columns.append("amount_2026_06_C")
+    return pd.DataFrame([row], columns=columns)
+
 
 
 class Stage08ContractTests(unittest.TestCase):
@@ -230,6 +527,7 @@ class Stage08ContractTests(unittest.TestCase):
                 mode="create-only",
                 resume_report_path=None,
                 report_dir=root,
+                preflight_only=False,
             )
             snapshot = stage08.read_json_snapshot(manifest_path, "Stage 06 manifest")
             evidence = stage08.validate_stage06_manifest(
@@ -240,6 +538,194 @@ class Stage08ContractTests(unittest.TestCase):
             )
 
         self.assertEqual(evidence["asOfDate"], "2026-07-16")
+
+    def test_enriched_legacy_csv_builds_nested_adr_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_csv(sales_all_frame(enriched=True), directory)
+            frame, monthly_columns, preflight = stage08.load_and_validate_csv(path)
+        self.assertTrue(preflight.address_enrichment_enabled)
+        document = stage08.build_document(frame.to_dict("records")[0], monthly_columns)
+        self.assertEqual(
+            document["adr"],
+            {"strNo": "42", "strName": "Mckenzie", "strType": "Street"},
+        )
+        self.assertNotIn("strNo", document)
+        self.assertNotIn("strName", document)
+        self.assertNotIn("strType", document)
+
+    def test_unresolved_enriched_legacy_csv_builds_canonical_adr(self) -> None:
+        frame = sales_all_frame(enriched=True)
+        frame.loc[0, ["strNo", "strName", "strType"]] = ["", "", "-"]
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_csv(frame, directory)
+            parsed, monthly_columns, preflight = stage08.load_and_validate_csv(path)
+        self.assertEqual(preflight.address_unresolved_rows, 1)
+        document = stage08.build_document(parsed.to_dict("records")[0], monthly_columns)
+        self.assertEqual(document["adr"], {"strNo": "", "strName": "", "strType": "-"})
+
+    def test_partial_address_staging_columns_are_rejected(self) -> None:
+        frame = sales_all_frame()
+        frame.insert(len(stage08.BASE_COLUMNS), "strNo", "42")
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_csv(frame, directory)
+            with self.assertRaisesRegex(ValueError, "present together"):
+                stage08.load_and_validate_csv(path)
+
+    def test_compare_existing_enriched_document_requires_exact_adr(self) -> None:
+        frame = sales_all_frame(enriched=True)
+        row = frame.to_dict("records")[0]
+        expected = stage08.build_document(row, ["amount_2026_06_C"] )
+        actual = dict(expected)
+        actual["master"] = {"id": "ABC123", "visibility": "VISIBLE"}
+        self.assertEqual(stage08.compare_existing_document(actual, expected), [])
+        bad = dict(actual)
+        bad["adr"] = {**actual["adr"], "extra": "x"}
+        self.assertTrue(any("adr keys differ" in item for item in stage08.compare_existing_document(bad, expected)))
+
+    def test_refresh_updates_adr_as_one_owned_map_and_preserves_other_roots(self) -> None:
+        expected = {
+            "master": {"id": "ABC123", "visibility": "INVISIBLE"},
+            "meterNoNormalized": "ABC123",
+            "provider": "contour",
+            "lmPcode": "ZA5241",
+            "adr": {"strNo": "42", "strName": "Mckenzie", "strType": "Street"},
+        }
+        existing = {
+            **expected,
+            "master": {"id": "ABC123", "visibility": "VISIBLE"},
+            "adr": {"strNo": "41", "strName": "Mckenzie", "strType": "Street"},
+            "tbRefs": [{"batchId": "TB1"}],
+        }
+        self.assertIsNone(refresh._conflict(existing, expected))
+        updates = refresh._updates(existing, expected)
+        self.assertEqual(updates, {"adr": expected["adr"]})
+        self.assertEqual(refresh._preserved_projection(existing)["tbRefs"], [{"batchId": "TB1"}])
+        self.assertEqual(refresh._preserved_projection(existing)["master"]["visibility"], "VISIBLE")
+
+    def test_refresh_rejects_malformed_existing_adr_and_root_flat_address(self) -> None:
+        expected = {
+            "master": {"id": "ABC123", "visibility": "INVISIBLE"},
+            "meterNoNormalized": "ABC123",
+            "provider": "contour",
+            "lmPcode": "ZA5241",
+            "adr": {"strNo": "42", "strName": "Mckenzie", "strType": "Street"},
+        }
+        malformed = {**expected, "adr": {"strNo": "42", "strName": "Mckenzie", "strType": "Street", "extra": "x"}}
+        self.assertIn("adr has unexpected/missing keys", refresh._conflict(malformed, expected))
+        flat = {**expected, "strNo": "42"}
+        self.assertIn("root strNo/strName/strType is prohibited", refresh._conflict(flat, expected))
+
+    def test_rich_stage06_contract_projects_adr_for_initial_load_and_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            row = {column: "" for column in refresh.BASE_COLUMNS + refresh.RICH_COLUMNS + refresh.ADDRESS_STAGING_COLUMNS}
+            row.update(
+                {
+                    "masterId": "ABC123",
+                    "meterNo": "ABC123",
+                    "meterNoNormalized": "ABC123",
+                    "provider": "contour",
+                    "customerNo": "C1",
+                    "accountNo": "A1",
+                    "totalAmountC": "100",
+                    "lmPcode": "ZA5241",
+                    "accountNumber": "A1",
+                    "totalSalesC": "100",
+                    "totalUnits": "5",
+                    "strNo": "42",
+                    "strName": "Mckenzie",
+                    "strType": "Street",
+                }
+            )
+            for field in refresh.COMMERCIAL_JSON_FIELDS:
+                row[field] = "[]"
+            row["hasUsableGps"] = "false"
+            row["elmAccountMatched"] = "false"
+            row["amount_2026_06_C"] = "100"
+            row["units_2026_06"] = "5"
+            columns = (
+                refresh.BASE_COLUMNS
+                + refresh.RICH_COLUMNS
+                + refresh.ADDRESS_STAGING_COLUMNS
+                + ["amount_2026_06_C", "units_2026_06"]
+            )
+            frame = pd.DataFrame([row], columns=columns)
+            csv_path = root / "sales_all_meters__ZA5241__FULL__2026-06_to_2026-06.csv"
+            frame.to_csv(csv_path, index=False, encoding="utf-8")
+            report_path = csv_path.with_suffix(".address_enrichment.json")
+            report_path.write_text("{}\n", encoding="utf-8")
+            report_sha = hashlib.sha256(report_path.read_bytes()).hexdigest()
+            address_contract = {
+                "enabled": True,
+                "stagingColumns": list(refresh.ADDRESS_STAGING_COLUMNS),
+                "firestoreProjection": "adr",
+                "enrichedRows": 1,
+                "unresolvedRows": 0,
+                "reasonCounts": {},
+                "rawAddressMutationCount": 0,
+                "fabricatedSpatialRelationshipCount": 0,
+                "reportFilename": report_path.name,
+                "reportSha256": report_sha,
+            }
+            source = {
+                "sourceOrigin": "monthly_source",
+                "sourceRunId": "RUN1",
+                "lmPcode": "ZA5241",
+                "fromMonth": "2026-06",
+                "toMonth": "2026-06",
+                "includedMonths": ["2026-06"],
+                "provider": "contour",
+                "recencyFactsAvailable": False,
+                "visibilityOwnership": "OPERATIONAL_WRITERS_ONLY",
+                "stage05Manifest": {},
+                "meterMaster": {},
+                "commercialSource": {},
+                "monthlyInputs": [],
+                "atomicFactsFabricated": 0,
+            }
+            output = {
+                "filename": csv_path.name,
+                "rows": 1,
+                "columns": columns,
+                "sha256": hashlib.sha256(csv_path.read_bytes()).hexdigest(),
+                "documentIdsSha256": refresh.canonical_sha256(["ABC123"]),
+                "months": ["2026-06"],
+                "monthlyColumns": ["amount_2026_06_C"],
+                "monthlyUnitColumns": ["units_2026_06"],
+                "provider": "contour",
+                "totalAmountC": 100,
+                "totalUnits": "5",
+                "visibilityColumn": "ABSENT",
+                "addressEnrichment": address_contract,
+            }
+            stats = {
+                "masterRows": 1,
+                "monthlyRowsMerged": 1,
+                "metersWithSales": 1,
+                "metersWithoutSales": 0,
+                "totalOutputRows": 1,
+                "totalUnits": "5",
+                "addressEnrichedRows": 1,
+                "addressUnresolvedRows": 0,
+            }
+            manifest = {
+                "schemaVersion": 2,
+                "stage": "06",
+                "script": "06_build_sales_all_meters.py",
+                "status": "PASS",
+                "result": "BUILD_WRITTEN",
+                "sourceContract": source,
+                "outputContract": output,
+                "stats": stats,
+            }
+            manifest["buildFingerprint"] = refresh._manifest_fingerprint(manifest)
+            manifest_path = csv_path.with_suffix(".manifest.json")
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            rows, evidence = refresh.load_and_validate(csv_path, manifest_path)
+
+        self.assertEqual(rows[0]["expected"]["adr"], {"strNo": "42", "strName": "Mckenzie", "strType": "Street"})
+        self.assertNotIn("strNo", rows[0]["expected"] )
+        self.assertEqual(evidence["addressEnrichment"]["enrichedRows"], 1)
 
     def test_blank_provider_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

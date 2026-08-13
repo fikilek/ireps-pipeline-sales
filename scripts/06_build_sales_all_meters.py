@@ -40,6 +40,22 @@ from typing import Any, Iterable, Mapping, Sequence
 
 import pandas as pd
 
+from sales_address_enrichment import (
+    ADDRESS_STAGING_COLUMNS,
+    build_enrichment_report,
+    enrichment_contract,
+    parse_physical_address,
+    raw_address_mutation_count,
+    raw_address_snapshot,
+    validate_address_values,
+    write_json_atomic as write_address_json_atomic,
+)
+from sales_pipeline_monthly_source_support import (
+    build_stage06_monthly_source,
+    load_commercial_source,
+    require_provider as require_monthly_source_provider,
+)
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 GOVERNED_OUTPUT_DIR = (PROJECT_ROOT / "output" / "sales_all_meters").resolve()
@@ -174,6 +190,29 @@ def parse_args() -> argparse.Namespace:
         help="Directory containing monthly__FULL__YYYY-MM__from_atomic.csv files.",
     )
     parser.add_argument(
+        "--provider",
+        default=GOVERNED_PROVIDER,
+        help="Sales provider code. Atomic path remains governed to conlog.",
+    )
+    parser.add_argument(
+        "--source-origin",
+        choices=("atomic", "monthly_source"),
+        default="atomic",
+        help="Upstream source contract. Default atomic preserves existing behavior.",
+    )
+    parser.add_argument(
+        "--commercial-source",
+        type=Path,
+        help=(
+            "Frozen cleaned commercial JSONL. Required for monthly_source; optional on "
+            "atomic to enable the shared Sales Enrich v1 address projection."
+        ),
+    )
+    parser.add_argument(
+        "--expected-commercial-source-sha256",
+        help="Frozen SHA256 for the cleaned commercial source.",
+    )
+    parser.add_argument(
         "--output",
         required=True,
         type=Path,
@@ -181,9 +220,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--as-of-date",
-        required=True,
         type=str,
-        help="Governed date used to calculate daysSinceLastPurchase, in YYYY-MM-DD format.",
+        help="Atomic path governed date used to calculate daysSinceLastPurchase (YYYY-MM-DD). Not used for monthly_source.",
     )
     return parser.parse_args()
 
@@ -524,6 +562,9 @@ def build_stage06_manifest(
     df: pd.DataFrame,
     stats: BuildStats,
     stage05_evidence: Mapping[str, Any],
+    *,
+    address_source_evidence: Mapping[str, Any] | None = None,
+    address_enrichment_contract: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     ids = df["masterId"].tolist()
     monthly_columns = [f"amount_{month.replace('-', '_')}_C" for month in months]
@@ -547,6 +588,9 @@ def build_stage06_manifest(
         },
         "monthlyInputs": list(stage05_evidence["monthlyInputs"]),
     }
+    if address_source_evidence is not None:
+        source_contract["commercialAddressSource"] = dict(address_source_evidence)
+
     output_contract = {
         "path": str(config.output_path),
         "filename": config.output_path.name,
@@ -560,6 +604,9 @@ def build_stage06_manifest(
         "totalAmountC": int(df["totalAmountC"].astype("int64").sum()),
         "visibilityColumn": "ABSENT",
     }
+    if address_enrichment_contract is not None:
+        output_contract["addressEnrichment"] = dict(address_enrichment_contract)
+
     stats_payload = {
         "masterRows": stats.master_rows,
         "monthlyRowsMerged": stats.monthly_rows,
@@ -567,6 +614,10 @@ def build_stage06_manifest(
         "metersWithoutSales": stats.meters_without_sales,
         "totalOutputRows": len(df),
     }
+    if address_enrichment_contract is not None:
+        stats_payload["addressEnrichedRows"] = int(address_enrichment_contract["enrichedRows"])
+        stats_payload["addressUnresolvedRows"] = int(address_enrichment_contract["unresolvedRows"])
+
     fingerprint_contract = {
         "lmPcode": config.lm_pcode,
         "fromMonth": config.from_month,
@@ -607,9 +658,16 @@ def build_stage06_manifest(
             "provider": output_contract["provider"],
             "totalAmountC": output_contract["totalAmountC"],
             "visibilityColumn": output_contract["visibilityColumn"],
+            **(
+                {"addressEnrichment": dict(address_enrichment_contract)}
+                if address_enrichment_contract is not None
+                else {}
+            ),
         },
         "stats": stats_payload,
     }
+    if address_source_evidence is not None:
+        fingerprint_contract["commercialAddressSource"] = dict(address_source_evidence)
     return {
         "schemaVersion": MANIFEST_SCHEMA_VERSION,
         "stage": "06",
@@ -913,6 +971,74 @@ def finalize_rows(
     ).reset_index(drop=True)
 
 
+def enrich_atomic_output(
+    df: pd.DataFrame,
+    *,
+    lm_pcode: str,
+    commercial_source_path: Path,
+    expected_commercial_sha256: str,
+    output_path: Path,
+) -> tuple[pd.DataFrame, dict[str, Any], dict[str, Any]]:
+    commercial, source_snapshot = load_commercial_source(
+        commercial_source_path,
+        expected_sha256=expected_commercial_sha256,
+        lm_pcode=lm_pcode,
+    )
+    ids = [safe_str(value) for value in df["masterId"].tolist()]
+    if set(ids) != set(commercial):
+        missing = sorted(set(ids) - set(commercial))
+        extra = sorted(set(commercial) - set(ids))
+        raise ValueError(
+            "Atomic Sales Enrich commercial-address population mismatch: "
+            f"missing={missing[:10]}; extra={extra[:10]}"
+        )
+
+    raw_before = raw_address_snapshot(commercial)
+    output = df.copy()
+    diagnostics: list[tuple[str, str, str, Any]] = []
+    for index, master_id in enumerate(ids):
+        source = commercial[master_id]
+        line1 = safe_str(source.get("addressLine1"))
+        line2 = safe_str(source.get("addressLine2"))
+        result = parse_physical_address(line1, line2)
+        output.at[index, "strNo"] = result.strNo
+        output.at[index, "strName"] = result.strName
+        output.at[index, "strType"] = result.strType
+        diagnostics.append((master_id, line1, line2, result))
+
+    raw_after = raw_address_snapshot(commercial)
+    raw_mutations = raw_address_mutation_count(raw_before, raw_after)
+    if raw_mutations != 0:
+        raise ValueError(
+            "Atomic Sales Enrich mutated governed raw address evidence: "
+            f"count={raw_mutations}"
+        )
+
+    monthly_columns = [column for column in output.columns if column.startswith("amount_")]
+    output = output[BASE_OUTPUT_COLUMNS + ADDRESS_STAGING_COLUMNS + monthly_columns]
+
+    report_path = output_path.with_suffix(".address_enrichment.json")
+    report = build_enrichment_report(
+        diagnostics,
+        source_label=str(source_snapshot.path),
+        source_sha256=source_snapshot.sha256,
+        raw_address_mutation_count=raw_mutations,
+    )
+    report_sha = write_address_json_atomic(report, report_path)
+    contract = enrichment_contract(
+        report, report_path=report_path, report_sha256=report_sha
+    )
+    source_evidence = {
+        "path": str(source_snapshot.path),
+        "filename": source_snapshot.path.name,
+        "rows": source_snapshot.rows,
+        "sha256": source_snapshot.sha256,
+        "role": "ADDRESS_EVIDENCE_ONLY",
+        "salesTruthAuthority": "ATOMIC",
+    }
+    return output, source_evidence, contract
+
+
 def validate_output(df: pd.DataFrame, months: list[str], expected_rows: int) -> None:
     if len(df) != expected_rows:
         raise ValueError(f"Output row count mismatch: expected {expected_rows}, found {len(df)}")
@@ -930,6 +1056,18 @@ def validate_output(df: pd.DataFrame, months: list[str], expected_rows: int) -> 
             "Sales All Meters staging must not contain visibility; "
             "operational registration/discovery/installation writers own master.visibility."
         )
+
+    present_address = [column for column in ADDRESS_STAGING_COLUMNS if column in df.columns]
+    if present_address and present_address != ADDRESS_STAGING_COLUMNS:
+        raise ValueError(
+            "Sales Enrich staging columns must be present together and in canonical order"
+        )
+    if present_address:
+        for row_number, row in enumerate(df.to_dict("records"), start=2):
+            try:
+                validate_address_values(row.get("strNo"), row.get("strName"), row.get("strType"))
+            except ValueError as exc:
+                raise ValueError(f"Invalid Sales Enrich address at row {row_number}: {exc}") from exc
 
     positive = df["totalAmountC"].astype("int64") > 0
     if df.loc[positive, "lastPurchaseAtISO"].astype(str).str.strip().eq("").any():
@@ -970,6 +1108,8 @@ def build_config(args: argparse.Namespace) -> BuildConfig:
     if not months:
         raise ValueError("The requested month range is empty.")
 
+    if not args.as_of_date:
+        raise ValueError("--as-of-date is required for --source-origin atomic")
     output_path = resolve_project_path(args.output).resolve()
     config = BuildConfig(
         lm_pcode=lm_pcode,
@@ -993,6 +1133,50 @@ def build_config(args: argparse.Namespace) -> BuildConfig:
 
 def main() -> None:
     args = parse_args()
+    if args.source_origin == "monthly_source":
+        provider = require_monthly_source_provider(args.provider)
+        lm_pcode = safe_str(args.lm_pcode).upper()
+        months = month_range(args.from_month, args.to_month)
+        if args.commercial_source is None:
+            raise ValueError("--commercial-source is required for --source-origin monthly_source")
+        output_path = resolve_project_path(args.output).resolve()
+        validate_output_identity(output_path, lm_pcode, months[0], months[-1])
+        master_path = resolve_project_path(args.master).resolve()
+        master_manifest_path = resolve_project_path(args.master_manifest).resolve()
+        commercial_source = resolve_project_path(args.commercial_source).resolve()
+        monthly_dir = resolve_project_path(args.monthly_dir).resolve()
+        manifest_path = output_path.with_suffix(".manifest.json")
+        manifest = build_stage06_monthly_source(
+            lm_pcode=lm_pcode,
+            provider=provider,
+            from_month=months[0],
+            to_month=months[-1],
+            master_path=master_path,
+            master_manifest_path=master_manifest_path,
+            commercial_source=commercial_source,
+            expected_commercial_sha256=safe_str(args.expected_commercial_source_sha256) or None,
+            monthly_dir=monthly_dir,
+            output_path=output_path,
+            manifest_path=manifest_path,
+        )
+        print("=== SALES ALL METERS BUILD — MONTHLY SOURCE ===")
+        print(f"LM/workbase:     {lm_pcode}")
+        print(f"Provider:        {provider}")
+        print(f"Meter Master:    {master_path}")
+        print(f"Commercial source: {commercial_source}")
+        print(f"Months:          {months[0]} to {months[-1]}")
+        print(f"Output rows:     {manifest['outputContract']['rows']:,}")
+        print(f"Total sales C:   {manifest['outputContract']['totalAmountC']:,}")
+        print(f"Total units:     {manifest['outputContract']['totalUnits']}")
+        print("Recency facts:   NOT AVAILABLE / NOT FABRICATED")
+        print("Validation:      PASS")
+        print(f"Output:          {output_path}")
+        print(f"Output SHA-256:  {manifest['outputContract']['sha256']}")
+        print(f"Manifest:        {manifest_path}")
+        return
+
+    if safe_str(args.provider).lower() != GOVERNED_PROVIDER:
+        raise ValueError(f"Stage 06 atomic path remains governed to provider={GOVERNED_PROVIDER!r}")
     config = build_config(args)
     months = month_range(config.from_month, config.to_month)
     stats = BuildStats()
@@ -1028,10 +1212,37 @@ def main() -> None:
     records = load_master(config, stats, master_snapshot)
     load_monthly_files(config, monthly_snapshots, records, stats)
     df = finalize_rows(config, months, records, stats)
+
+    address_source_evidence = None
+    address_contract = None
+    if args.commercial_source is not None:
+        expected_address_sha = safe_str(args.expected_commercial_source_sha256)
+        if not expected_address_sha:
+            raise ValueError(
+                "Atomic Sales Enrich requires --expected-commercial-source-sha256 "
+                "when --commercial-source is supplied"
+            )
+        commercial_source = resolve_project_path(args.commercial_source).resolve()
+        df, address_source_evidence, address_contract = enrich_atomic_output(
+            df,
+            lm_pcode=config.lm_pcode,
+            commercial_source_path=commercial_source,
+            expected_commercial_sha256=expected_address_sha.lower(),
+            output_path=config.output_path,
+        )
+
     validate_output(df, months, stats.master_rows)
 
     write_csv_atomic(df, config.output_path)
-    manifest = build_stage06_manifest(config, months, df, stats, stage05_evidence)
+    manifest = build_stage06_manifest(
+        config,
+        months,
+        df,
+        stats,
+        stage05_evidence,
+        address_source_evidence=address_source_evidence,
+        address_enrichment_contract=address_contract,
+    )
     write_json_atomic(manifest, config.manifest_path)
 
     print("=== BUILD SUMMARY ===")

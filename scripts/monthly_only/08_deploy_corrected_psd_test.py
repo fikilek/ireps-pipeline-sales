@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Preflight, deploy, and verify the corrected Endumeni Sales PSD in ireps2 DEV.
+Preflight, deploy, and verify the corrected Endumeni Sales PSD in ireps-test TEST.
 
 Target:
-- Firebase project: ireps2
+- Firebase project: ireps-test
 - Firestore collection: demo_sales_meters
 - Full PSD: 10,216 documents
 - Exact-GPS documents: 7,583
-- Existing verified pilot: 20 identical documents
-- Remaining documents expected before first full execution: 10,196
+- Expected initial TEST state: 0 identical documents
+- Expected initial TEST state: 10,216 missing documents
 - Firestore document ID: plain MeterNumber
 - Geometry fields: forbidden
 
@@ -31,9 +31,9 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-EXPECTED_PROJECT = "ireps2"
+EXPECTED_PROJECT = "ireps-test"
 COLLECTION = "demo_sales_meters"
-CONFIRM_TOKEN = "UPLOAD_REMAINING_CORRECTED_SALES_PSD_TO_IREPS2"
+CONFIRM_TOKEN = "UPLOAD_CORRECTED_SALES_PSD_TO_IREPS_TEST"
 FORBIDDEN_GEOMETRY_KEYS = {"geometry", "geometryjson"}
 DEFAULT_READ_BATCH_SIZE = 400
 DEFAULT_WRITE_BATCH_SIZE = 400
@@ -49,8 +49,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--report-file", required=True, type=Path)
     parser.add_argument("--expected-total-count", type=int, default=10_216)
     parser.add_argument("--expected-exact-gps-count", type=int, default=7_583)
-    parser.add_argument("--expected-existing-identical", type=int, default=20)
-    parser.add_argument("--expected-missing", type=int, default=10_196)
+    parser.add_argument("--expected-existing-identical", type=int, default=0)
+    parser.add_argument("--expected-missing", type=int, default=10_216)
     parser.add_argument(
         "--read-batch-size",
         type=int,
@@ -537,7 +537,7 @@ def main() -> int:
     args = parse_args()
 
     report: dict[str, Any] = {
-        "script": "08_deploy_corrected_psd_dev.py",
+        "script": "08_deploy_corrected_psd_test.py",
         "startedAt": utc_iso(),
         "targetProject": clean_text(args.project_id),
         "targetCollection": COLLECTION,
@@ -613,7 +613,7 @@ def main() -> int:
 
         print("")
         print("============================================================")
-        print("CORRECTED SALES PSD -> FIRESTORE DEV")
+        print("CORRECTED SALES PSD -> FIRESTORE TEST")
         print("============================================================")
         print(f"Operation:              {report['operation']}")
         print(f"Project:                {project_id}")

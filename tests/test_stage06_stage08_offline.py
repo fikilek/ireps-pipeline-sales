@@ -768,5 +768,24 @@ class Stage08ContractTests(unittest.TestCase):
         self.assertEqual(frame.at[0, "masterId"], "ABC123")
 
 
+class Stage08RefreshGovernanceIntegrationTests(unittest.TestCase):
+    def test_refresh_400_wave_partition_is_locked(self) -> None:
+        waves = list(refresh._chunks(list(range(10216))))
+        self.assertEqual([len(wave) for wave in waves], [400] * 25 + [216])
+
+    def test_refresh_source_has_no_per_document_transaction_fallback(self) -> None:
+        source = (PROJECT_ROOT / "scripts" / "sales_pipeline_sales_all_refresh.py").read_text(encoding="utf-8")
+        self.assertIn("FIRESTORE_BATCH_SIZE = 400", source)
+        self.assertNotIn("db.transaction(", source)
+        self.assertNotIn("firestore.transactional", source)
+        self.assertIn('"perDocumentFallback": False', source)
+
+    def test_refresh_batch_updates_use_last_update_preconditions(self) -> None:
+        source = (PROJECT_ROOT / "scripts" / "sales_pipeline_sales_all_refresh.py").read_text(encoding="utf-8")
+        self.assertIn("LastUpdateOption", source)
+        self.assertIn("batch.update(", source)
+        self.assertIn("batch.create(", source)
+
+
 if __name__ == "__main__":
     unittest.main()

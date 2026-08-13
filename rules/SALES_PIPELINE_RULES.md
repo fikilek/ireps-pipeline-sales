@@ -3,9 +3,9 @@
 **File:** `rules/SALES_PIPELINE_RULES.md`
 **Project:** `C:\dev\ireps-pipeline-sales`
 **Status:** Governing project rules
-**Version:** 1.9.0
+**Version:** 1.10.0
 **Effective date:** 2026-08-13
-**Current phase:** Sales Enrich v1 — canonical structured address projection
+**Current phase:** Sales Enrich v1 + governed Firestore 400-batch execution
 **Canonical Atomic provider:** Conlog; approved monthly-source providers remain bound by frozen source contracts
 **Current Sales Enrich regression LM / workbase:** Endumeni — `ZA5241`
 
@@ -211,6 +211,120 @@ C:\dev\ireps-schemas\sales-all-meters\sales_all_meters.schema.md
 The schema and this amendment must move together with the Sales Enrich implementation. Neither document alone authorizes a Firestore write or migration.
 
 ---
+
+
+## 0B. Version 1.10.0 — Governed Firestore 400-batch execution amendment
+
+This section is the controlling performance and concurrency amendment for every Firestore writer in this repository. It changes execution mechanics only. Existing document identities, schemas, exact-path ownership, create-only rules, conflict meanings, resume contracts, source contracts, and preservation requirements remain unchanged.
+
+### 0B.1 Fixed governed wave size
+
+The repository-wide governed Firestore batch size is:
+
+```text
+FIRESTORE_BATCH_SIZE = 400
+```
+
+For multi-document work, the limit counts actual Firestore operations or document references, not abstract rows. A logical record that consumes multiple reads or writes counts each Firestore operation separately against the applicable limit.
+
+Bulk reads must use `get_all` / `getAll` style APIs in waves containing no more than 400 document references. Multi-document writes must use Firestore batched-write APIs in commits containing no more than 400 write operations.
+
+A governed multi-document writer must never fall back to one-document-at-a-time network reads, direct writes, or one transaction per record. A runtime option must not permit a governed bulk writer to silently regress to batch size 1. Existing batch-size CLI arguments retained for compatibility must accept only the governed value 400.
+
+For 10,216 one-write records the normal maximum write-wave shape is:
+
+```text
+25 x 400
+ 1 x 216
+---------
+26 waves
+```
+
+This is derived from actual writes. Unchanged or conflicted records may reduce the number of write operations and committed waves.
+
+### 0B.2 Optimistic concurrency and create-only safety
+
+Batching must not weaken concurrency safety.
+
+An update classified from a preflighted existing document must carry that document's Firestore update-time precondition. Python writers use the supported public `LastUpdateOption(snapshot.update_time)` contract; Node writers use `{ lastUpdateTime: snapshot.updateTime }` or the equivalent supported public precondition accepted by `WriteBatch.update`.
+
+Missing documents that are approved for creation must use `batch.create()`. `set()` must not replace create-only semantics.
+
+A concurrency-specific atomic batch failure may use exactly one bounded recovery cycle:
+
+1. treat the failed atomic batch as zero committed writes;
+2. bulk reread every participating reference in governed waves;
+3. compare existence and update time with the preflight snapshot;
+4. classify changed participants as record-level conflicts;
+5. deterministically reclassify unchanged-state participants;
+6. retry the remaining safe subset once as a governed batch;
+7. if that rebuilt batch fails, stop the run.
+
+There is no per-document transaction/write/read fallback and no unbounded outer retry loop. Authentication, permission, transport, quota, deadline, and other systemic failures fail immediately rather than entering concurrency recovery.
+
+### 0B.3 Cross-collection transactional exception
+
+`scripts/sales_pipeline_visibility_reconciliation_dev.py` is the approved narrow exception to WriteBatch-only execution because its Sales All visibility decision depends atomically on both:
+
+```text
+meter_master/{meterId}
+sales-all-meters/{meterId}
+```
+
+A Sales All-only WriteBatch precondition cannot protect the Meter Master read state without writing to Meter Master, which is outside this operation's ownership contract.
+
+Therefore this reconciliation must use bounded multi-document transaction waves with:
+
+```text
+maximum logical meters per transaction = 200
+maximum transactional read refs        = 400
+  200 Meter Master + 200 Sales All
+maximum Sales All writes               = 200
+```
+
+The transaction must read the complete wave before queueing any write, update only the exact path `master.visibility`, commit once per wave, and retain bounded Firestore retry behaviour. The retrying callback must be deterministic and must not publish final counters, conflict lists, or reports until the transaction invocation succeeds.
+
+Preflight-only and post-write verification for this operation remain non-transactional governed bulk reads of no more than 400 references per request. No individual document reads are permitted for the multi-record scope.
+
+This exception does not reopen the general 400-WriteBatch rule for any other writer.
+
+### 0B.4 Exact-path ownership and preservation
+
+Batching is an I/O execution correction, not a schema or business-logic redesign. Writers must reuse their existing deterministic classification and exact-path mutation rules.
+
+In particular, Sales All refresh must continue preserving operational roots and unknown non-pipeline-owned fields, including:
+
+```text
+master.visibility
+tbRefs
+geofenceRefs
+```
+
+unless the specific approved operation owns that exact path. No whole-document replacement may be introduced merely to obtain batching.
+
+Meter Master AST, ERF, GPS, reference, identity, and metadata ownership rules remain unchanged. Create-only writers remain create-only. Existing record-level conflict continuation or blocking behaviour remains writer-specific and unchanged.
+
+### 0B.5 Verification and observability
+
+Multi-record preflight and verification must use governed bulk reads rather than one network read per record. Material writer reports should add, without renaming existing status/result meanings, enough evidence to prove actual batching, including where applicable:
+
+```text
+firestoreBatchSize
+readWaves
+writeWavesAttempted
+writeWavesCommitted
+writeOperationsAttempted
+writeOperationsSucceeded
+verificationReadWaves
+preconditionConflictCount
+maximumWriteOperationsInAnyBatch
+perDocumentFallback = false
+```
+
+The cross-collection transaction exception should report the corresponding transaction-wave counts and maximum reads/writes per transaction.
+
+Offline tests must prove the 400-operation partition, precondition propagation, create-only semantics, zero writes in preflight-only mode, bounded failed-wave recovery, no per-document fallback, exact-path preservation, and non-regression of already compliant Stage 02/04/07-create/08-initial-load paths before any Firestore execution.
+
 
 ## 1. Purpose
 

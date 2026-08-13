@@ -39,6 +39,7 @@ PROVIDER_RE = re.compile(r"^[a-z0-9_-]+$")
 VISIBILITY_VALUES = {"VISIBLE", "INVISIBLE"}
 DEFAULT_VISIBILITY = "INVISIBLE"
 COLLECTION = "sales-all-meters"
+FIRESTORE_BATCH_SIZE = 400
 
 BASE_COLUMNS = [
     "masterId", "meterNo", "meterNoNormalized", "provider", "customerNo", "accountNo",
@@ -72,6 +73,12 @@ class RefreshStats:
     writes_succeeded: int = 0
     conflict_records: list[dict[str, Any]] = field(default_factory=list)
     failure_records: list[dict[str, Any]] = field(default_factory=list)
+    read_waves: int = 0
+    write_waves_attempted: int = 0
+    write_waves_committed: int = 0
+    verification_read_waves: int = 0
+    precondition_conflicts: int = 0
+    maximum_write_operations_in_any_batch: int = 0
 
 
 def _sha(path: Path) -> str:
@@ -417,6 +424,235 @@ def _projection_hash(payload: Mapping[str, Any]) -> str:
     return canonical_sha256(_preserved_projection(payload))
 
 
+def _chunks(items: Sequence[Any], size: int = FIRESTORE_BATCH_SIZE):
+    if size <= 0 or size > FIRESTORE_BATCH_SIZE:
+        raise ValueError(f"Governed Firestore wave size must be 1..{FIRESTORE_BATCH_SIZE}")
+    for start in range(0, len(items), size):
+        yield items[start : start + size]
+
+
+def _bulk_snapshots(db: Any, refs: Sequence[Any]) -> dict[str, Any]:
+    if len(refs) > FIRESTORE_BATCH_SIZE:
+        raise ValueError("Bulk read exceeds governed 400-reference limit")
+    snapshots = list(db.get_all(list(refs)))
+    by_path: dict[str, Any] = {}
+    for snapshot in snapshots:
+        reference = getattr(snapshot, "reference", None)
+        path = getattr(reference, "path", None)
+        if not path:
+            path = f"{COLLECTION}/{snapshot.id}"
+        by_path[str(path)] = snapshot
+    return by_path
+
+
+def _snapshot_for(by_path: Mapping[str, Any], ref: Any) -> Any | None:
+    path = getattr(ref, "path", None) or f"{COLLECTION}/{getattr(ref, 'id', '')}"
+    return by_path.get(str(path))
+
+
+def _snapshot_token(snapshot: Any | None) -> tuple[bool, Any]:
+    if snapshot is None or not snapshot.exists:
+        return (False, None)
+    return (True, getattr(snapshot, "update_time", None))
+
+
+def _classify_snapshot(item: Mapping[str, Any], snapshot: Any | None) -> dict[str, Any]:
+    doc_id = str(item["masterId"])
+    expected = item["expected"]
+    if snapshot is None or not snapshot.exists:
+        return {
+            "masterId": doc_id,
+            "classification": "CREATED",
+            "reason": None,
+            "updates": {},
+            "snapshot": snapshot,
+            "preservedHash": None,
+        }
+    payload = snapshot.to_dict() or {}
+    conflict = _conflict(payload, expected)
+    if conflict:
+        return {
+            "masterId": doc_id,
+            "classification": "CONFLICT",
+            "reason": conflict,
+            "updates": {},
+            "snapshot": snapshot,
+            "preservedHash": None,
+        }
+    changes = _updates(payload, expected)
+    return {
+        "masterId": doc_id,
+        "classification": "UPDATED" if changes else "UNCHANGED",
+        "reason": None,
+        "updates": changes,
+        "snapshot": snapshot,
+        "preservedHash": _projection_hash(payload),
+    }
+
+
+def _add_classification(stats: RefreshStats, classified: Mapping[str, Any]) -> None:
+    stats.inspected += 1
+    classification = str(classified["classification"])
+    if classification == "CONFLICT":
+        stats.conflicts += 1
+        stats.conflict_records.append(
+            {"masterId": classified["masterId"], "reason": classified.get("reason")}
+        )
+    else:
+        counter_name = classification.lower()
+        setattr(stats, counter_name, getattr(stats, counter_name) + 1)
+
+
+def _build_write_batch(
+    *,
+    db: Any,
+    collection: Any,
+    operations: Sequence[Mapping[str, Any]],
+    last_update_option_cls: Any,
+) -> Any:
+    if len(operations) > FIRESTORE_BATCH_SIZE:
+        raise ValueError("Write batch exceeds governed 400-operation limit")
+    batch = db.batch()
+    for operation in operations:
+        ref = collection.document(str(operation["masterId"]))
+        if operation["classification"] == "CREATED":
+            batch.create(ref, operation["expected"])
+        elif operation["classification"] == "UPDATED":
+            snapshot = operation["snapshot"]
+            update_time = getattr(snapshot, "update_time", None)
+            if update_time is None:
+                raise RuntimeError(f"Missing update_time for {operation['masterId']}")
+            batch.update(
+                ref,
+                dict(operation["updates"]),
+                option=last_update_option_cls(update_time),
+            )
+        else:
+            raise ValueError(f"Non-write classification in batch: {operation['classification']}")
+    return batch
+
+
+def _write_operations_for_wave(
+    *,
+    db: Any,
+    collection: Any,
+    wave_items: Sequence[Mapping[str, Any]],
+    classified: Sequence[Mapping[str, Any]],
+    stats: RefreshStats,
+    preserved_before: dict[str, str],
+    last_update_option_cls: Any,
+    concurrency_exceptions: tuple[type[BaseException], ...],
+) -> list[Mapping[str, Any]]:
+    """Commit one governed wave, with one bounded concurrency recovery."""
+    item_by_id = {str(item["masterId"]): item for item in wave_items}
+    operations: list[dict[str, Any]] = []
+
+    for decision in classified:
+        classification = str(decision["classification"])
+        if classification in {"UNCHANGED", "CONFLICT"}:
+            _add_classification(stats, decision)
+            if classification == "UNCHANGED" and decision.get("preservedHash") is not None:
+                preserved_before[str(decision["masterId"])] = str(decision["preservedHash"])
+            continue
+        operations.append(
+            {
+                **dict(decision),
+                "expected": item_by_id[str(decision["masterId"])]["expected"],
+                "originalToken": _snapshot_token(decision.get("snapshot")),
+            }
+        )
+
+    if not operations:
+        return []
+
+    stats.maximum_write_operations_in_any_batch = max(
+        stats.maximum_write_operations_in_any_batch, len(operations)
+    )
+    stats.write_waves_attempted += 1
+    stats.writes_attempted += len(operations)
+    batch = _build_write_batch(
+        db=db,
+        collection=collection,
+        operations=operations,
+        last_update_option_cls=last_update_option_cls,
+    )
+    try:
+        batch.commit()
+        committed = operations
+    except concurrency_exceptions as first_exc:
+        # Atomic batch failed: zero writes committed. Re-read the complete failed
+        # wave once, convert changed participants to conflicts, and retry only the
+        # unchanged safe subset as one batch. Never fall back to per-record I/O.
+        refs = [collection.document(str(item["masterId"])) for item in wave_items]
+        refreshed = _bulk_snapshots(db, refs)
+        stats.read_waves += 1
+        retry_operations: list[dict[str, Any]] = []
+        committed = []
+        for operation in operations:
+            ref = collection.document(str(operation["masterId"]))
+            fresh_snapshot = _snapshot_for(refreshed, ref)
+            fresh_token = _snapshot_token(fresh_snapshot)
+            if fresh_token != operation["originalToken"]:
+                stats.precondition_conflicts += 1
+                _add_classification(
+                    stats,
+                    {
+                        "masterId": operation["masterId"],
+                        "classification": "CONFLICT",
+                        "reason": "batch precondition changed after preflight",
+                    },
+                )
+                continue
+            fresh_decision = _classify_snapshot(item_by_id[str(operation["masterId"])], fresh_snapshot)
+            fresh_classification = str(fresh_decision["classification"])
+            if fresh_classification in {"CONFLICT", "UNCHANGED"}:
+                _add_classification(stats, fresh_decision)
+                if fresh_classification == "UNCHANGED" and fresh_decision.get("preservedHash") is not None:
+                    preserved_before[str(fresh_decision["masterId"])] = str(fresh_decision["preservedHash"])
+                continue
+            retry_operations.append(
+                {
+                    **dict(fresh_decision),
+                    "expected": item_by_id[str(operation["masterId"])]["expected"],
+                    "originalToken": fresh_token,
+                }
+            )
+
+        if retry_operations:
+            stats.maximum_write_operations_in_any_batch = max(
+                stats.maximum_write_operations_in_any_batch, len(retry_operations)
+            )
+            stats.write_waves_attempted += 1
+            stats.writes_attempted += len(retry_operations)
+            retry_batch = _build_write_batch(
+                db=db,
+                collection=collection,
+                operations=retry_operations,
+                last_update_option_cls=last_update_option_cls,
+            )
+            try:
+                retry_batch.commit()
+            except concurrency_exceptions as second_exc:
+                raise RuntimeError(
+                    "Stage 08 refresh concurrency recovery batch failed; "
+                    "no per-document fallback is permitted"
+                ) from second_exc
+            committed = retry_operations
+        else:
+            committed = []
+
+    if committed:
+        stats.write_waves_committed += 1
+        stats.writes_succeeded += len(committed)
+        for operation in committed:
+            classification = str(operation["classification"])
+            stats.inspected += 1
+            setattr(stats, classification.lower(), getattr(stats, classification.lower()) + 1)
+            if classification == "UPDATED" and operation.get("preservedHash") is not None:
+                preserved_before[str(operation["masterId"])] = str(operation["preservedHash"])
+    return committed
+
+
 def run_refresh(
     *,
     project_id: str,
@@ -441,6 +677,7 @@ def run_refresh(
 
     try:
         from google.cloud import firestore
+        from google.cloud.firestore_v1 import LastUpdateOption
         from google.api_core import exceptions as google_exceptions
         from google.oauth2 import service_account
     except ImportError as exc:
@@ -448,6 +685,7 @@ def run_refresh(
 
     credentials = service_account.Credentials.from_service_account_file(str(service_account_path))
     db = firestore.Client(project=project_id, credentials=credentials)
+    collection = db.collection(COLLECTION)
     stats = RefreshStats(rows=len(rows))
     preserved_before: dict[str, str] = {}
     run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -459,7 +697,22 @@ def run_refresh(
         "preflightOnly": preflight_only, "projectId": project_id,
         "collection": COLLECTION, "startedAt": datetime.now(UTC).isoformat(),
         "sourceEvidence": evidence, "status": "STARTED", "result": "STARTED",
+        "firestoreBatchSize": FIRESTORE_BATCH_SIZE,
     }
+
+    concurrency_exceptions = tuple(
+        exc for exc in (
+            google_exceptions.AlreadyExists,
+            google_exceptions.Aborted,
+            getattr(google_exceptions, "FailedPrecondition", None),
+        ) if exc is not None
+    )
+    systemic_exceptions = (
+        google_exceptions.Unauthenticated,
+        google_exceptions.PermissionDenied,
+        google_exceptions.ServiceUnavailable,
+        google_exceptions.DeadlineExceeded,
+    )
 
     def write_report() -> None:
         report["finishedAt"] = datetime.now(UTC).isoformat()
@@ -470,124 +723,83 @@ def run_refresh(
         temp.replace(report_path)
 
     try:
-        for idx, item in enumerate(rows, start=1):
-            doc_id = item["masterId"]
-            expected = item["expected"]
-            ref = db.collection(COLLECTION).document(doc_id)
+        processed = 0
+        for wave_items in _chunks(rows):
+            refs = [collection.document(str(item["masterId"])) for item in wave_items]
+            snapshots = _bulk_snapshots(db, refs)
+            stats.read_waves += 1
+            classified = [
+                _classify_snapshot(item, _snapshot_for(snapshots, ref))
+                for item, ref in zip(wave_items, refs)
+            ]
+
             if preflight_only:
-                snap = ref.get()
-                if not snap.exists:
-                    classification = "CREATED"
-                else:
-                    payload = snap.to_dict()
-                    conflict = _conflict(payload, expected)
-                    if conflict:
-                        classification = "CONFLICT"
-                        stats.conflict_records.append({"masterId": doc_id, "reason": conflict})
-                    else:
-                        classification = "UPDATED" if _updates(payload, expected) else "UNCHANGED"
-                stats.inspected += 1
-                counter_name = {
-                    "CREATED": "created",
-                    "UPDATED": "updated",
-                    "UNCHANGED": "unchanged",
-                    "CONFLICT": "conflicts",
-                    "FAILED": "failed",
-                }[classification]
-                setattr(stats, counter_name, getattr(stats, counter_name) + 1)
+                for decision in classified:
+                    _add_classification(stats, decision)
             else:
-                transaction = db.transaction()
-                write_state = {"attempted": False, "preservedHash": None}
-
-                @firestore.transactional
-                def apply(transaction):
-                    snap = ref.get(transaction=transaction)
-                    if not snap.exists:
-                        write_state["attempted"] = True
-                        transaction.create(ref, expected)
-                        return "CREATED"
-                    payload = snap.to_dict()
-                    write_state["preservedHash"] = _projection_hash(payload)
-                    conflict = _conflict(payload, expected)
-                    if conflict:
-                        return ("CONFLICT", conflict)
-                    changes = _updates(payload, expected)
-                    if not changes:
-                        return "UNCHANGED"
-                    write_state["attempted"] = True
-                    transaction.update(ref, changes)
-                    return "UPDATED"
-
                 try:
-                    result = apply(transaction)
-                    stats.inspected += 1
-                    if isinstance(result, tuple):
-                        stats.conflicts += 1
-                        stats.conflict_records.append({"masterId": doc_id, "reason": result[1]})
-                    else:
-                        setattr(stats, result.lower(), getattr(stats, result.lower()) + 1)
-                        if write_state["attempted"]:
-                            stats.writes_attempted += 1
-                            stats.writes_succeeded += 1
-                        if result != "CREATED" and write_state["preservedHash"] is not None:
-                            preserved_before[doc_id] = str(write_state["preservedHash"])
-                except (google_exceptions.Aborted, google_exceptions.AlreadyExists) as exc:
-                    stats.inspected += 1
-                    stats.conflicts += 1
-                    stats.conflict_records.append({"masterId": doc_id, "reason": "transaction precondition changed", "error": str(exc)})
-                except (
-                    google_exceptions.Unauthenticated,
-                    google_exceptions.PermissionDenied,
-                    google_exceptions.ServiceUnavailable,
-                    google_exceptions.DeadlineExceeded,
-                ):
-                    # Systemic Firestore failures must stop the run immediately.
+                    _write_operations_for_wave(
+                        db=db,
+                        collection=collection,
+                        wave_items=wave_items,
+                        classified=classified,
+                        stats=stats,
+                        preserved_before=preserved_before,
+                        last_update_option_cls=LastUpdateOption,
+                        concurrency_exceptions=concurrency_exceptions,
+                    )
+                except systemic_exceptions:
                     raise
-                except Exception as exc:
-                    stats.inspected += 1
-                    stats.failed += 1
-                    stats.failure_records.append({"masterId": doc_id, "errorType": type(exc).__name__, "error": str(exc)})
-            if idx == 1 or idx % 100 == 0 or idx == len(rows):
-                print(
-                    f"Stage 08 refresh progress {idx:,}/{len(rows):,}: "
-                    f"create={stats.created:,} update={stats.updated:,} unchanged={stats.unchanged:,} "
-                    f"conflict={stats.conflicts:,} failed={stats.failed:,}"
-                )
 
-        classified = stats.created + stats.updated + stats.unchanged + stats.conflicts + stats.failed
-        if classified != stats.rows or stats.inspected != stats.rows:
-            raise RuntimeError("Stage 08 refresh accounting imbalance")
+            processed += len(wave_items)
+            print(
+                f"Stage 08 refresh progress {processed:,}/{len(rows):,}: "
+                f"create={stats.created:,} update={stats.updated:,} unchanged={stats.unchanged:,} "
+                f"conflict={stats.conflicts:,} failed={stats.failed:,}; "
+                f"readWaves={stats.read_waves:,} writeWaves={stats.write_waves_committed:,}"
+            )
+
+        classified_count = stats.created + stats.updated + stats.unchanged + stats.conflicts + stats.failed
+        if classified_count != stats.rows or stats.inspected != stats.rows:
+            raise RuntimeError(
+                f"Stage 08 refresh accounting imbalance: rows={stats.rows}; "
+                f"classified={classified_count}; inspected={stats.inspected}"
+            )
         if stats.conflicts or stats.failed:
-            raise RuntimeError(f"Stage 08 refresh blocked/incomplete: conflicts={stats.conflicts}; failed={stats.failed}")
+            raise RuntimeError(
+                f"Stage 08 refresh blocked/incomplete: conflicts={stats.conflicts}; failed={stats.failed}"
+            )
 
         verification: dict[str, Any] = {"status": "NOT_RUN" if preflight_only else "PASS"}
         if not preflight_only:
-            # Full input-scope read-back verification. No global collection count is used,
-            # so unrelated LMs/providers are neither treated as extras nor touched.
             checked = 0
             preserved_checked = 0
             preservation_pairs_before: list[tuple[str, str]] = []
             preservation_pairs_after: list[tuple[str, str]] = []
-            for item in rows:
-                doc_id = item["masterId"]
-                snap = db.collection(COLLECTION).document(doc_id).get()
-                if not snap.exists:
-                    raise RuntimeError(f"Post-write verification missing {doc_id}")
-                payload = snap.to_dict()
-                _verify_doc(payload, item["expected"])
-                if doc_id in preserved_before:
-                    before_hash = preserved_before[doc_id]
-                    after_hash = _projection_hash(payload)
-                    if before_hash != after_hash:
-                        raise RuntimeError(
-                            f"Stage 08 changed non-pipeline-owned fields for {doc_id}"
-                        )
-                    preservation_pairs_before.append((doc_id, before_hash))
-                    preservation_pairs_after.append((doc_id, after_hash))
-                    preserved_checked += 1
-                checked += 1
-                if checked == 1 or checked % 500 == 0 or checked == len(rows):
-                    print(f"Stage 08 verification {checked:,}/{len(rows):,}")
+            item_by_id = {str(item["masterId"]): item for item in rows}
+            ordered_ids = list(item_by_id)
+            for id_wave in _chunks(ordered_ids):
+                refs = [collection.document(doc_id) for doc_id in id_wave]
+                snapshots = _bulk_snapshots(db, refs)
+                stats.verification_read_waves += 1
+                for doc_id, ref in zip(id_wave, refs):
+                    snap = _snapshot_for(snapshots, ref)
+                    if snap is None or not snap.exists:
+                        raise RuntimeError(f"Post-write verification missing {doc_id}")
+                    payload = snap.to_dict() or {}
+                    _verify_doc(payload, item_by_id[doc_id]["expected"])
+                    if doc_id in preserved_before:
+                        before_hash = preserved_before[doc_id]
+                        after_hash = _projection_hash(payload)
+                        if before_hash != after_hash:
+                            raise RuntimeError(
+                                f"Stage 08 changed non-pipeline-owned fields for {doc_id}"
+                            )
+                        preservation_pairs_before.append((doc_id, before_hash))
+                        preservation_pairs_after.append((doc_id, after_hash))
+                        preserved_checked += 1
+                    checked += 1
+                print(f"Stage 08 verification {checked:,}/{len(rows):,}")
             verification = {
                 "status": "PASS",
                 "documentsVerified": checked,
@@ -595,8 +807,22 @@ def run_refresh(
                 "preservationVerifiedExistingDocuments": preserved_checked,
                 "preservedProjectionBeforeSha256": canonical_sha256(preservation_pairs_before),
                 "preservedProjectionAfterSha256": canonical_sha256(preservation_pairs_after),
+                "readWaves": stats.verification_read_waves,
+                "maximumReferencesPerWave": FIRESTORE_BATCH_SIZE,
             }
 
+        batch_evidence = {
+            "firestoreBatchSize": FIRESTORE_BATCH_SIZE,
+            "readWaves": stats.read_waves,
+            "writeWavesAttempted": stats.write_waves_attempted,
+            "writeWavesCommitted": stats.write_waves_committed,
+            "writeOperationsAttempted": stats.writes_attempted,
+            "writeOperationsSucceeded": stats.writes_succeeded,
+            "verificationReadWaves": stats.verification_read_waves,
+            "preconditionConflictCount": stats.precondition_conflicts,
+            "maximumWriteOperationsInAnyBatch": stats.maximum_write_operations_in_any_batch,
+            "perDocumentFallback": False,
+        }
         report.update({
             "rowsRead": stats.rows,
             "recordsInspected": stats.inspected,
@@ -610,21 +836,54 @@ def run_refresh(
             "conflicts": stats.conflict_records,
             "failedRecords": stats.failure_records,
             "verification": verification,
+            "batchEvidence": batch_evidence,
+            "stats": {
+                "rows": stats.rows,
+                "inspected": stats.inspected,
+                "created": stats.created,
+                "updated": stats.updated,
+                "unchanged": stats.unchanged,
+                "conflicts": stats.conflicts,
+                "failed": stats.failed,
+                "writes_attempted": stats.writes_attempted,
+                "writes_succeeded": stats.writes_succeeded,
+            },
             "firestoreWrites": 0 if preflight_only else stats.writes_succeeded,
             "updatesOrCreatesOnly": True,
             "deletes": 0,
-            "preservedOperationalFields": ["master.visibility", "tbRefs", "geofenceRefs", "all non-pipeline-owned fields"],
+            "preservedOperationalFields": [
+                "master.visibility", "tbRefs", "geofenceRefs", "all non-pipeline-owned fields"
+            ],
             "status": "PASS",
             "result": "PREFLIGHT_PASS" if preflight_only else "REFRESH_VERIFIED",
         })
         return report_path
     except Exception as exc:
         report.update({
-            "rowsRead": stats.rows, "recordsInspected": stats.inspected,
-            "createdCount": stats.created, "updatedCount": stats.updated,
-            "unchangedCount": stats.unchanged, "conflictCount": stats.conflicts,
-            "failedCount": stats.failed, "conflicts": stats.conflict_records,
-            "failedRecords": stats.failure_records, "status": "FAIL", "result": "FAILED",
+            "rowsRead": stats.rows,
+            "recordsInspected": stats.inspected,
+            "createdCount": stats.created,
+            "updatedCount": stats.updated,
+            "unchangedCount": stats.unchanged,
+            "conflictCount": stats.conflicts,
+            "failedCount": stats.failed,
+            "writeAttemptCount": stats.writes_attempted,
+            "writeSuccessCount": stats.writes_succeeded,
+            "conflicts": stats.conflict_records,
+            "failedRecords": stats.failure_records,
+            "batchEvidence": {
+                "firestoreBatchSize": FIRESTORE_BATCH_SIZE,
+                "readWaves": stats.read_waves,
+                "writeWavesAttempted": stats.write_waves_attempted,
+                "writeWavesCommitted": stats.write_waves_committed,
+                "writeOperationsAttempted": stats.writes_attempted,
+                "writeOperationsSucceeded": stats.writes_succeeded,
+                "verificationReadWaves": stats.verification_read_waves,
+                "preconditionConflictCount": stats.precondition_conflicts,
+                "maximumWriteOperationsInAnyBatch": stats.maximum_write_operations_in_any_batch,
+                "perDocumentFallback": False,
+            },
+            "status": "FAIL", "result": "FAILED",
             "errorType": type(exc).__name__, "error": str(exc),
             "deletes": 0,
         })
@@ -637,3 +896,4 @@ def run_refresh(
                 db.close()
             except Exception:
                 pass
+

@@ -258,6 +258,7 @@ def comparable_firestore_data(value: dict[str, Any]) -> dict[str, Any]:
 
 
 def inspect_existing(
+    db: Any,
     collection: Any,
     records: list[dict[str, Any]],
 ) -> dict[str, Any]:
@@ -266,8 +267,12 @@ def inspect_existing(
     missing = 0
     examples: list[dict[str, Any]] = []
 
+    refs = [collection.document(record["docId"]) for record in records]
+    snapshots = {snapshot.id: snapshot for snapshot in db.get_all(refs)}
     for index, record in enumerate(records, start=1):
-        snapshot = collection.document(record["docId"]).get()
+        snapshot = snapshots.get(record["docId"])
+        if snapshot is None:
+            raise RuntimeError(f"Missing bulk-read snapshot for {record['docId']}")
         if not snapshot.exists:
             missing += 1
             state = "MISSING"
@@ -302,14 +307,20 @@ def inspect_existing(
 
 
 def verify_after_write(
+    db: Any,
     collection: Any,
     records: list[dict[str, Any]],
 ) -> dict[str, Any]:
     verified = 0
     failures: list[dict[str, Any]] = []
 
+    refs = [collection.document(record["docId"]) for record in records]
+    snapshots = {snapshot.id: snapshot for snapshot in db.get_all(refs)}
     for index, record in enumerate(records, start=1):
-        snapshot = collection.document(record["docId"]).get()
+        snapshot = snapshots.get(record["docId"])
+        if snapshot is None:
+            failures.append({"docId": record["docId"], "reason": "MISSING_BULK_READ_SNAPSHOT"})
+            continue
         if not snapshot.exists:
             failures.append(
                 {
@@ -500,7 +511,7 @@ def main() -> int:
         collection = db.collection(COLLECTION)
 
         report["firestoreReadsPerformed"] = True
-        existing = inspect_existing(collection, records)
+        existing = inspect_existing(db, collection, records)
         report["existingState"] = existing
 
         print("")
@@ -540,6 +551,7 @@ def main() -> int:
         print("[UPLOAD] Batch committed: 20/20")
 
         verification = verify_after_write(
+            db,
             collection,
             records,
         )

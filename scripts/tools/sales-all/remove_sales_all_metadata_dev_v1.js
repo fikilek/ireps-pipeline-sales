@@ -41,6 +41,7 @@ const SOURCE_ASSESSMENT_RUN_ID =
 const TARGET_PROJECT_ID = "ireps2";
 const TARGET_COLLECTION = "sales-all-meters";
 const TARGET_DOCUMENT_COUNT = 72;
+const FIRESTORE_BATCH_SIZE = 400;
 const CONFIRM_ACTION = "REMOVE_ROOT_METADATA";
 
 const TARGET_DOCUMENT_IDS = Object.freeze([
@@ -502,6 +503,35 @@ function createCounters() {
   };
 }
 
+function timestampKey(value) {
+  if (!value) return "";
+  return `${value.seconds ?? ""}:${value.nanoseconds ?? ""}`;
+}
+
+async function bulkReadDocuments(db, documentIds) {
+  if (documentIds.length > FIRESTORE_BATCH_SIZE) {
+    throw new Error(`Bulk read exceeds governed ${FIRESTORE_BATCH_SIZE}-reference limit.`);
+  }
+  const refs = documentIds.map((id) => db.collection(TARGET_COLLECTION).doc(id));
+  const snapshots = await db.getAll(...refs);
+  return new Map(snapshots.map((snapshot) => [snapshot.id, snapshot]));
+}
+
+function buildMetadataDeleteBatch(db, records) {
+  if (records.length > FIRESTORE_BATCH_SIZE) {
+    throw new Error(`Write batch exceeds governed ${FIRESTORE_BATCH_SIZE}-operation limit.`);
+  }
+  const batch = db.batch();
+  for (const record of records) {
+    batch.update(
+      record.documentRef,
+      { metadata: FieldValue.delete() },
+      { lastUpdateTime: record.snapshot.updateTime },
+    );
+  }
+  return batch;
+}
+
 async function main() {
   const startedAt = nowIso();
   const args = parseArgs(process.argv.slice(2));
@@ -599,14 +629,14 @@ async function main() {
 
     console.log("[STEP 3/5] Preflighting all 72 hard-locked documents...");
 
+    const preflightSnapshots = await bulkReadDocuments(db, TARGET_DOCUMENT_IDS);
+    counters.preflightRead += TARGET_DOCUMENT_IDS.length;
     for (let index = 0; index < TARGET_DOCUMENT_IDS.length; index += 1) {
       const documentId = TARGET_DOCUMENT_IDS[index];
       const documentRef = db.collection(TARGET_COLLECTION).doc(documentId);
-
       try {
-        const snapshot = await documentRef.get();
-        counters.preflightRead += 1;
-
+        const snapshot = preflightSnapshots.get(documentId);
+        if (!snapshot) throw new Error("BULK_READ_SNAPSHOT_MISSING");
         const assessment = validateTargetDocument(snapshot, documentId);
         const record = {
           index: index + 1,
@@ -616,34 +646,19 @@ async function main() {
           issues: assessment.issues,
           metadataPresent: assessment.metadataPresent,
           metadataKeys: assessment.metadataKeys,
-          updateTime:
-            snapshot.updateTime?.toDate().toISOString() || null,
+          updateTime: snapshot.updateTime?.toDate().toISOString() || null,
         };
-
-        preflightRecords.push({
-          documentId,
-          documentRef,
-          snapshot,
-          assessment,
-        });
-
-        if (assessment.result === "WOULD_UPDATE") {
-          counters.wouldUpdate += 1;
-        } else if (assessment.result === "UNCHANGED") {
-          counters.unchanged += 1;
-        } else {
+        preflightRecords.push({ documentId, documentRef, snapshot, assessment });
+        if (assessment.result === "WOULD_UPDATE") counters.wouldUpdate += 1;
+        else if (assessment.result === "UNCHANGED") counters.unchanged += 1;
+        else {
           counters.conflicts += 1;
           conflicts.push(record);
         }
-
         await appendJsonLine(resultsStream, record);
-
-        console.log(
-          `[PREFLIGHT] ${index + 1}/${TARGET_DOCUMENT_COUNT} id=${documentId} result=${assessment.result}`,
-        );
+        console.log(`[PREFLIGHT] ${index + 1}/${TARGET_DOCUMENT_COUNT} id=${documentId} result=${assessment.result}`);
       } catch (error) {
         counters.failed += 1;
-
         const record = {
           index: index + 1,
           documentId,
@@ -652,13 +667,9 @@ async function main() {
           issues: [error.message || String(error)],
           code: error.code || null,
         };
-
         conflicts.push(record);
         await appendJsonLine(resultsStream, record);
-
-        console.log(
-          `[PREFLIGHT] ${index + 1}/${TARGET_DOCUMENT_COUNT} id=${documentId} result=FAILED`,
-        );
+        console.log(`[PREFLIGHT] ${index + 1}/${TARGET_DOCUMENT_COUNT} id=${documentId} result=FAILED`);
       }
     }
 
@@ -685,125 +696,98 @@ async function main() {
         `[STEP 4/5] Applying root metadata deletion to ${counters.wouldUpdate} documents...`,
       );
 
-      let applyIndex = 0;
+      const updateRecords = preflightRecords.filter(
+        (record) => record.assessment.result === "WOULD_UPDATE",
+      );
+      counters.writesAttempted += updateRecords.length;
+      let committedRecords = updateRecords;
 
-      for (const record of preflightRecords) {
-        if (record.assessment.result === "UNCHANGED") {
-          continue;
-        }
-
-        applyIndex += 1;
-        counters.writesAttempted += 1;
-
+      if (updateRecords.length > 0) {
         try {
-          const beforeWithoutMetadata = withoutMetadata(record.assessment.data);
+          await buildMetadataDeleteBatch(db, updateRecords).commit();
+        } catch (error) {
+          const isConcurrencyFailure =
+            error.code === 6 || error.code === 9 || error.code === 10 ||
+            error.code === "already-exists" ||
+            error.code === "failed-precondition" ||
+            error.code === "aborted" ||
+            error.code === "ALREADY_EXISTS" ||
+            error.code === "FAILED_PRECONDITION" ||
+            error.code === "ABORTED";
+          if (!isConcurrencyFailure) throw error;
 
-          await record.documentRef.update(
-            {
-              metadata: FieldValue.delete(),
-            },
-            {
-              lastUpdateTime: record.snapshot.updateTime,
-            },
+          const refreshed = await bulkReadDocuments(
+            db,
+            updateRecords.map((record) => record.documentId),
           );
-
-          const afterSnapshot = await record.documentRef.get();
-          const afterData = afterSnapshot.data() || {};
-
-          if (Object.prototype.hasOwnProperty.call(afterData, "metadata")) {
-            throw new Error("POST_WRITE_METADATA_STILL_PRESENT");
+          const retryRecords = [];
+          committedRecords = [];
+          for (const record of updateRecords) {
+            const current = refreshed.get(record.documentId);
+            if (
+              !current || !current.exists ||
+              timestampKey(current.updateTime) !== timestampKey(record.snapshot.updateTime)
+            ) {
+              counters.conflicts += 1;
+              conflicts.push({
+                documentId: record.documentId,
+                phase: "APPLY",
+                result: "CONFLICT",
+                code: error.code || null,
+                issues: ["PRECONDITION_CHANGED_AFTER_PREFLIGHT"],
+              });
+              continue;
+            }
+            retryRecords.push({ ...record, snapshot: current });
           }
-
-          if (!isDeepStrictEqual(beforeWithoutMetadata, afterData)) {
-            throw new Error("POST_WRITE_NON_METADATA_FIELDS_CHANGED");
+          if (retryRecords.length > 0) {
+            counters.writesAttempted += retryRecords.length;
+            try {
+              await buildMetadataDeleteBatch(db, retryRecords).commit();
+            } catch (retryError) {
+              throw new Error(
+                `BOUNDED_BATCH_RECOVERY_FAILED:${retryError.message || String(retryError)}`,
+              );
+            }
+            committedRecords = retryRecords;
           }
+        }
+      }
 
-          const afterAssessment = validateTargetDocument(
-            afterSnapshot,
-            record.documentId,
-          );
+      counters.updated += committedRecords.length;
+      counters.writesCompleted += committedRecords.length;
 
-          if (afterAssessment.result !== "UNCHANGED") {
-            throw new Error(
-              `POST_WRITE_CANONICAL_VALIDATION_FAILED:${afterAssessment.issues.join(
-                "|",
-              )}`,
-            );
+      console.log("[STEP 5/5] Verifying all 72 target documents...");
+      const finalSnapshots = await bulkReadDocuments(db, TARGET_DOCUMENT_IDS);
+      let finalMetadataPresent = 0;
+      let finalValidationFailures = 0;
+      const committedIds = new Set(committedRecords.map((record) => record.documentId));
+
+      for (let index = 0; index < TARGET_DOCUMENT_IDS.length; index += 1) {
+        const documentId = TARGET_DOCUMENT_IDS[index];
+        const snapshot = finalSnapshots.get(documentId);
+        if (!snapshot) throw new Error(`FINAL_BULK_READ_SNAPSHOT_MISSING:${documentId}`);
+        const assessment = validateTargetDocument(snapshot, documentId);
+        if (assessment.metadataPresent) finalMetadataPresent += 1;
+        if (assessment.result !== "UNCHANGED") finalValidationFailures += 1;
+
+        if (committedIds.has(documentId)) {
+          const before = preflightRecords.find((record) => record.documentId === documentId);
+          const afterData = snapshot.data() || {};
+          if (!before || !isDeepStrictEqual(withoutMetadata(before.assessment.data), afterData)) {
+            throw new Error(`POST_WRITE_NON_METADATA_FIELDS_CHANGED:${documentId}`);
           }
-
-          counters.updated += 1;
-          counters.writesCompleted += 1;
           counters.verificationPassed += 1;
-
-          const outputRecord = {
-            documentId: record.documentId,
+          await appendJsonLine(resultsStream, {
+            documentId,
             phase: "APPLY",
             result: "UPDATED",
             changedField: "metadata",
             operation: "DELETE_ROOT_FIELD",
             postWriteVerified: true,
-            updateTime:
-              afterSnapshot.updateTime?.toDate().toISOString() || null,
-          };
-
-          await appendJsonLine(resultsStream, outputRecord);
-
-          console.log(
-            `[APPLY] ${applyIndex}/${counters.wouldUpdate} id=${record.documentId} result=UPDATED`,
-          );
-        } catch (error) {
-          const isPreconditionConflict =
-            error.code === 9 ||
-            error.code === "failed-precondition" ||
-            error.code === "FAILED_PRECONDITION";
-
-          if (isPreconditionConflict) {
-            counters.conflicts += 1;
-          } else {
-            counters.failed += 1;
-          }
-
-          counters.verificationFailed += 1;
-
-          const outputRecord = {
-            documentId: record.documentId,
-            phase: "APPLY",
-            result: isPreconditionConflict ? "CONFLICT" : "FAILED",
-            code: error.code || null,
-            issues: [error.message || String(error)],
-          };
-
-          conflicts.push(outputRecord);
-          await appendJsonLine(resultsStream, outputRecord);
-
-          console.log(
-            `[APPLY] ${applyIndex}/${counters.wouldUpdate} id=${record.documentId} result=${outputRecord.result}`,
-          );
+            updateTime: snapshot.updateTime?.toDate().toISOString() || null,
+          });
         }
-      }
-
-      console.log("[STEP 5/5] Verifying all 72 target documents...");
-
-      let finalMetadataPresent = 0;
-      let finalValidationFailures = 0;
-
-      for (let index = 0; index < TARGET_DOCUMENT_IDS.length; index += 1) {
-        const documentId = TARGET_DOCUMENT_IDS[index];
-        const snapshot = await db
-          .collection(TARGET_COLLECTION)
-          .doc(documentId)
-          .get();
-
-        const assessment = validateTargetDocument(snapshot, documentId);
-
-        if (assessment.metadataPresent) {
-          finalMetadataPresent += 1;
-        }
-
-        if (assessment.result !== "UNCHANGED") {
-          finalValidationFailures += 1;
-        }
-
         if ((index + 1) % 10 === 0 || index + 1 === TARGET_DOCUMENT_COUNT) {
           console.log(
             `[VERIFY] checked=${index + 1}/${TARGET_DOCUMENT_COUNT} metadataPresent=${finalMetadataPresent} validationFailures=${finalValidationFailures}`,
@@ -822,10 +806,7 @@ async function main() {
         result = "COMPLETED_WITH_CONFLICTS";
       } else {
         status = "COMPLETED";
-        result =
-          counters.updated > 0
-            ? "UPDATED"
-            : "UNCHANGED";
+        result = counters.updated > 0 ? "UPDATED" : "UNCHANGED";
       }
 
       console.log(
@@ -895,6 +876,11 @@ async function main() {
         writerCodeAssessed: false,
         writerCodeChanged: false,
         newFirestoreCollectionCreated: false,
+        firestoreBatchSize: FIRESTORE_BATCH_SIZE,
+        bulkPreflightReads: true,
+        batchedWrites: true,
+        bulkVerificationReads: true,
+        perDocumentFallback: false,
       },
       failure,
     };

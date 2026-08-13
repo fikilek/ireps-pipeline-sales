@@ -987,10 +987,13 @@ def verify_post_upload(
         )
 
     frame_by_id = atomic.frame.set_index("atomicId", drop=False)
+    sample_ids = deterministic_sample_ids(atomic.frame)
+    refs = [db.collection(COLLECTION).document(document_id) for document_id in sample_ids]
+    snapshots = {snapshot.id: snapshot for snapshot in db.get_all(refs)}
     sample_results: list[dict[str, Any]] = []
-    for document_id in deterministic_sample_ids(atomic.frame):
-        snapshot = db.collection(COLLECTION).document(document_id).get()
-        if not snapshot.exists:
+    for document_id in sample_ids:
+        snapshot = snapshots.get(document_id)
+        if snapshot is None or not snapshot.exists:
             raise ValueError(
                 f"Post-upload sample document is missing: {COLLECTION}/{document_id}"
             )

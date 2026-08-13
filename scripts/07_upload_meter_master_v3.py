@@ -53,20 +53,29 @@ import json
 import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from time import monotonic
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Optional, Sequence
 from uuid import uuid4
 
-from google.api_core import exceptions as google_exceptions
-from google.cloud import firestore
-from google.oauth2 import service_account
+try:
+    from google.api_core import exceptions as google_exceptions
+    from google.cloud import firestore
+    from google.cloud.firestore_v1 import LastUpdateOption
+    from google.oauth2 import service_account
+except ImportError:  # Allows --help/static validation without Firestore dependencies.
+    google_exceptions = None
+    firestore = None
+    LastUpdateOption = None
+    service_account = None
 import pandas as pd
 from tqdm import tqdm
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 COLLECTION_NAME = "meter_master"
-BATCH_SIZE = 450
+BATCH_SIZE = 400
+FIRESTORE_BATCH_SIZE = BATCH_SIZE
 SYSTEM_UID = "SYSTEM"
 SYSTEM_USER = "METER MASTER PIPELINE"
 GOVERNED_PROVIDER = "conlog"
@@ -117,6 +126,7 @@ class UploadConfig:
     mode: str
     resume_report_path: Optional[Path]
     report_dir: Path
+    preflight_only: bool
 
 
 @dataclass(frozen=True)
@@ -174,6 +184,12 @@ class RefreshRunState:
     conflicts: list[dict[str, Any]] = field(default_factory=list)
     failures: list[dict[str, Any]] = field(default_factory=list)
     successful_rows: list[dict[str, str]] = field(default_factory=list)
+    read_waves: int = 0
+    write_waves_attempted: int = 0
+    write_waves_committed: int = 0
+    verification_read_waves: int = 0
+    precondition_conflict_count: int = 0
+    maximum_write_operations_in_any_batch: int = 0
 
     def counts(self) -> dict[str, int]:
         return {
@@ -196,10 +212,14 @@ REFRESH_UPDATE_PATHS = (
 )
 
 SYSTEMIC_FIRESTORE_EXCEPTIONS = (
-    google_exceptions.Unauthenticated,
-    google_exceptions.PermissionDenied,
-    google_exceptions.ServiceUnavailable,
-    google_exceptions.DeadlineExceeded,
+    (
+        google_exceptions.Unauthenticated,
+        google_exceptions.PermissionDenied,
+        google_exceptions.ServiceUnavailable,
+        google_exceptions.DeadlineExceeded,
+    )
+    if google_exceptions is not None
+    else ()
 )
 
 
@@ -234,13 +254,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mode",
         required=True,
-        choices=("create-only", "refresh", "resume"),
-        help="create-only is the first load; refresh is recurring; resume is restricted recovery.",
+        choices=("create-only", "initial-load", "refresh", "resume"),
+        help=(
+            "create-only requires an empty whole collection; initial-load requires only the "
+            "input document IDs to be absent; refresh is recurring; resume is restricted recovery."
+        ),
     )
     parser.add_argument(
         "--resume-report",
         type=Path,
         help="Previous failed Stage 07 JSON report. Required only for resume.",
+    )
+    parser.add_argument(
+        "--preflight-only",
+        action="store_true",
+        help="Validate source and inspect the selected mode without writing Firestore.",
     )
     parser.add_argument(
         "--report-dir",
@@ -335,6 +363,18 @@ def stage05_fingerprint_contract(manifest: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("Stage 05 manifest outputContract is missing or invalid")
     if not isinstance(stats, Mapping):
         raise ValueError("Stage 05 manifest stats is missing or invalid")
+
+    if manifest.get("schemaVersion") == 2 and safe_str(source.get("sourceOrigin")) == "monthly_source":
+        return {
+            "sourceContract": dict(source),
+            "outputContract": {
+                "filename": output.get("filename"),
+                "rows": output.get("rows"),
+                "columns": output.get("columns"),
+                "sha256": output.get("sha256"),
+            },
+            "stats": dict(stats),
+        }
 
     monthly_inputs = source.get("monthlyInputs")
     if not isinstance(monthly_inputs, list) or not monthly_inputs:
@@ -445,12 +485,9 @@ def load_and_validate_csv(path: Path) -> tuple[pd.DataFrame, dict[str, Any]]:
     if lm_value != lm_value.upper() or not LM_PCODE_RE.fullmatch(lm_value):
         raise ValueError(f"Invalid canonical lmPcode: {lm_value!r}")
 
-    if not df["salesProvider"].eq(GOVERNED_PROVIDER).all():
-        examples = sorted(df.loc[~df["salesProvider"].eq(GOVERNED_PROVIDER), "salesProvider"].unique())[:10]
-        raise ValueError(
-            f"Stage 07 is governed only for salesProvider={GOVERNED_PROVIDER!r}. "
-            f"Found: {examples}"
-        )
+    providers = sorted(df["salesProvider"].unique().tolist())
+    if len(providers) != 1 or not providers[0] or providers[0] != providers[0].lower() or not re.fullmatch(r"[a-z0-9_-]+", providers[0]):
+        raise ValueError(f"Stage 07 requires exactly one canonical provider code. Found: {providers}")
     if not df["meterType"].eq(GOVERNED_METER_TYPE).all():
         examples = sorted(df.loc[~df["meterType"].eq(GOVERNED_METER_TYPE), "meterType"].unique())[:10]
         raise ValueError(
@@ -473,7 +510,7 @@ def load_and_validate_csv(path: Path) -> tuple[pd.DataFrame, dict[str, Any]]:
         "csvSha256": sha256_file(path),
         "documentIdsSha256": document_ids_sha256(df["masterId"].tolist()),
         "lmPcodes": lm_values,
-        "providers": sorted(df["salesProvider"].unique().tolist()),
+        "providers": providers,
         "meterTypes": sorted(df["meterType"].unique().tolist()),
     }
     return df, evidence
@@ -485,7 +522,7 @@ def validate_stage05_manifest(
     csv_evidence: Mapping[str, Any],
 ) -> dict[str, Any]:
     manifest = read_json(manifest_path, "Stage 05 manifest")
-    if manifest.get("schemaVersion") != STAGE05_MANIFEST_SCHEMA_VERSION:
+    if manifest.get("schemaVersion") not in (STAGE05_MANIFEST_SCHEMA_VERSION, 2):
         raise ValueError("Unsupported Stage 05 manifest schemaVersion")
     if safe_str(manifest.get("stage")) != "05":
         raise ValueError("Manifest is not a Stage 05 manifest")
@@ -516,8 +553,11 @@ def validate_stage05_manifest(
             f"found={included_months}, expected={expected_months}"
         )
 
-    if safe_str(source.get("provider")) != GOVERNED_PROVIDER:
-        raise ValueError("Stage 05 manifest provider is not governed conlog")
+    manifest_provider = safe_str(source.get("provider"))
+    if manifest_provider not in csv_evidence["providers"]:
+        raise ValueError("Stage 05 manifest provider does not match the CSV provider")
+    if manifest.get("schemaVersion") == 1 and manifest_provider != GOVERNED_PROVIDER:
+        raise ValueError("Legacy Stage 05 schemaVersion 1 remains governed to conlog")
     if safe_str(source.get("meterType")) != GOVERNED_METER_TYPE:
         raise ValueError("Stage 05 manifest meterType is not governed electricity")
     if safe_str(source.get("lmPcode")) not in csv_evidence["lmPcodes"]:
@@ -872,18 +912,91 @@ def collection_has_documents(db: firestore.Client) -> bool:
     return next(db.collection(COLLECTION_NAME).limit(1).stream(), None) is not None
 
 
+def wall_ts() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def print_batch_progress(label: str, completed: int, total: int, started: float) -> None:
+    elapsed = max(monotonic() - started, 0.001)
+    rate = completed / elapsed
+    remaining = max(total - completed, 0)
+    eta_seconds = remaining / rate if rate > 0 else 0.0
+    print(
+        f"[{wall_ts()}] {label}: {completed:,}/{total:,}; "
+        f"elapsed={elapsed:.1f}s; rate={rate:.1f} docs/s; eta={eta_seconds:.1f}s"
+    )
+
+
+def find_existing_input_ids(
+    db: firestore.Client,
+    document_ids: Sequence[str],
+    *,
+    label: str,
+) -> list[str]:
+    ids = list(document_ids)
+    existing: list[str] = []
+    total = len(ids)
+    started = monotonic()
+    inspected = 0
+    for id_batch in chunks(ids, BATCH_SIZE):
+        refs = [db.collection(COLLECTION_NAME).document(doc_id) for doc_id in id_batch]
+        for snapshot in db.get_all(refs):
+            if snapshot.exists:
+                existing.append(snapshot.id)
+        inspected += len(id_batch)
+        print_batch_progress(label, inspected, total, started)
+    return sorted(existing)
+
+
+def verify_input_scope_post_upload(
+    db: firestore.Client,
+    rows: Sequence[dict[str, str]],
+) -> dict[str, Any]:
+    row_by_id = {row["masterId"]: row for row in rows}
+    ids = sorted(row_by_id)
+    total = len(ids)
+    verified = 0
+    started = monotonic()
+    failures: list[dict[str, Any]] = []
+
+    for id_batch in chunks(ids, BATCH_SIZE):
+        refs = [db.collection(COLLECTION_NAME).document(doc_id) for doc_id in id_batch]
+        snapshots_by_id = {snapshot.id: snapshot for snapshot in db.get_all(refs)}
+        for doc_id in id_batch:
+            snapshot = snapshots_by_id.get(doc_id)
+            if snapshot is None or not snapshot.exists:
+                failures.append({"masterId": doc_id, "differences": ["document missing"]})
+                continue
+            differences = compare_existing_document(snapshot.to_dict() or {}, row_by_id[doc_id])
+            if differences:
+                failures.append({"masterId": doc_id, "differences": differences})
+        verified += len(id_batch)
+        print_batch_progress("Meter Master verify", verified, total, started)
+
+    if failures:
+        raise RuntimeError(
+            f"Input-scope Meter Master verification failed for {len(failures)} document(s); "
+            f"first={failures[0]}"
+        )
+
+    return {
+        "expectedInputScopeCount": total,
+        "verifiedInputScopeCount": total,
+        "inputScopeVerification": "PASS",
+        "verificationMode": "BATCHED_GET_ALL_FULL_INPUT_SCOPE",
+    }
+
+
 def create_documents(
     db: firestore.Client,
     rows: Sequence[Mapping[str, Any]],
     timestamp: datetime,
     progress: UploadProgress,
 ) -> None:
-    row_batches = list(chunks(rows, BATCH_SIZE))
-    for row_batch in tqdm(
-        row_batches,
-        desc="Writing Meter Master batches",
-        unit="batch",
-    ):
+    total = len(rows)
+    started = monotonic()
+    completed = 0
+    for row_batch in chunks(rows, BATCH_SIZE):
         batch = db.batch()
         for row in row_batch:
             doc_id = str(row["masterId"])
@@ -892,61 +1005,107 @@ def create_documents(
         batch.commit()
         progress.committed_batches += 1
         progress.documents_created += len(row_batch)
+        completed += len(row_batch)
+        print_batch_progress("Meter Master create", completed, total, started)
 
 
-def refresh_one_document(
+def _bulk_refresh_snapshots(
     db: firestore.Client,
+    rows: Sequence[Mapping[str, Any]],
+) -> list[tuple[Mapping[str, Any], Any, Any]]:
+    if len(rows) > FIRESTORE_BATCH_SIZE:
+        raise ValueError("Meter Master refresh read wave exceeds governed 400-reference limit")
+    refs = [db.collection(COLLECTION_NAME).document(str(row["masterId"])) for row in rows]
+    snapshots = list(db.get_all(refs))
+    by_id = {snapshot.id: snapshot for snapshot in snapshots}
+    return [(row, ref, by_id.get(str(row["masterId"]))) for row, ref in zip(rows, refs)]
+
+
+def _refresh_snapshot_token(snapshot: Any | None) -> tuple[bool, Any]:
+    if snapshot is None or not snapshot.exists:
+        return (False, None)
+    return (True, getattr(snapshot, "update_time", None))
+
+
+def _refresh_decision_for_snapshot(
     row: Mapping[str, Any],
+    snapshot: Any | None,
     timestamp: datetime,
 ) -> RefreshDecision:
-    """Atomically re-read, reclassify and conditionally write one refresh row."""
     doc_id = str(row["masterId"])
-    doc_ref = db.collection(COLLECTION_NAME).document(doc_id)
-    transaction = db.transaction()
-    write_state = {"attempted": False}
+    if snapshot is None or not snapshot.exists:
+        return RefreshDecision(
+            "CREATED", "MM_DOCUMENT_CREATED", {},
+            {"masterId": doc_id, "expectedAstId": ""}, False, False,
+        )
+    return classify_refresh_document(doc_id, snapshot.to_dict() or {}, row, timestamp)
 
-    @firestore.transactional
-    def apply(transaction: Any) -> RefreshDecision:
-        snapshot = doc_ref.get(transaction=transaction)
-        if not snapshot.exists:
-            write_state["attempted"] = True
-            transaction.create(doc_ref, build_create_doc(row, timestamp))
-            return RefreshDecision(
-                "CREATED", "MM_DOCUMENT_CREATED", {},
-                {"masterId": doc_id, "expectedAstId": ""}, True, True,
-            )
-        decision = classify_refresh_document(doc_id, snapshot.to_dict(), row, timestamp)
-        if decision.classification == "UPDATED":
-            write_state["attempted"] = True
-            transaction.update(doc_ref, decision.updates)
-            return RefreshDecision(
-                decision.classification, decision.code, decision.updates,
-                decision.evidence, True, True,
-            )
-        return decision
 
-    try:
-        return apply(transaction)
-    except google_exceptions.AlreadyExists as exc:
-        return RefreshDecision(
-            "CONFLICT", "MM_TRANSACTION_PRECONDITION_CHANGED", {},
-            {"masterId": doc_id, "errorType": type(exc).__name__, "error": str(exc)},
-            write_state["attempted"], False,
-        )
-    except google_exceptions.Aborted as exc:
-        return RefreshDecision(
-            "CONFLICT", "MM_TRANSACTION_PRECONDITION_CHANGED", {},
-            {"masterId": doc_id, "errorType": type(exc).__name__, "error": str(exc)},
-            write_state["attempted"], False,
-        )
-    except SYSTEMIC_FIRESTORE_EXCEPTIONS:
-        raise
-    except Exception as exc:
-        return RefreshDecision(
-            "FAILED", "MM_RECORD_WRITE_FAILED", {},
-            {"masterId": doc_id, "errorType": type(exc).__name__, "error": str(exc)},
-            write_state["attempted"], False,
-        )
+def _record_refresh_decision(
+    state: RefreshRunState,
+    row: Mapping[str, Any],
+    decision: RefreshDecision,
+    *,
+    write_attempted: bool = False,
+    write_succeeded: bool = False,
+) -> None:
+    state.records_inspected += 1
+    counter_name = f"{decision.classification.lower()}_count"
+    setattr(state, counter_name, getattr(state, counter_name) + 1)
+    source_row = {key: safe_str(row.get(key)) for key in REQUIRED_COLUMNS}
+    detail = {
+        "runId": state.run_id,
+        "masterId": safe_str(row.get("masterId")),
+        "lmPcode": safe_str(row.get("lmPcode")),
+        "sourceRow": source_row,
+        "code": decision.code,
+        "conflictingPaths": decision.evidence.get("conflictingPaths", []),
+        "existingValues": decision.evidence.get("existing"),
+        "incomingValues": decision.evidence.get("incoming", source_row),
+        "message": decision.evidence.get("detail", decision.evidence.get("error", decision.code)),
+        "detectedAt": datetime.now(UTC).isoformat(),
+        "writeAttempted": write_attempted,
+        "investigationRecommendation": (
+            "Review the existing Meter Master document and approved Stage 05 source; "
+            "do not overwrite operational fields manually."
+        ),
+        **decision.evidence,
+    }
+    if decision.classification == "CONFLICT":
+        state.conflicts.append(detail)
+    elif decision.classification == "FAILED":
+        state.failures.append(detail)
+    else:
+        successful_row = dict(source_row)
+        successful_row["_expectedAstId"] = safe_str(decision.evidence.get("expectedAstId"))
+        state.successful_rows.append(successful_row)
+
+
+def _build_refresh_batch(
+    db: firestore.Client,
+    operations: Sequence[Mapping[str, Any]],
+    timestamp: datetime,
+) -> Any:
+    if len(operations) > FIRESTORE_BATCH_SIZE:
+        raise ValueError("Meter Master write batch exceeds governed 400-operation limit")
+    if LastUpdateOption is None:
+        raise RuntimeError("Firestore LastUpdateOption is unavailable")
+    batch = db.batch()
+    for operation in operations:
+        row = operation["row"]
+        decision = operation["decision"]
+        ref = operation["ref"]
+        if decision.classification == "CREATED":
+            batch.create(ref, build_create_doc(row, timestamp))
+        elif decision.classification == "UPDATED":
+            snapshot = operation["snapshot"]
+            update_time = getattr(snapshot, "update_time", None)
+            if update_time is None:
+                raise RuntimeError(f"Missing update_time for {row['masterId']}")
+            batch.update(ref, decision.updates, option=LastUpdateOption(update_time))
+        else:
+            raise ValueError(f"Non-write decision queued: {decision.classification}")
+    return batch
 
 
 def refresh_documents(
@@ -955,49 +1114,143 @@ def refresh_documents(
     timestamp: datetime,
     state: RefreshRunState,
 ) -> RefreshRunState:
+    concurrency_errors = tuple(
+        exc for exc in (
+            google_exceptions.AlreadyExists,
+            google_exceptions.Aborted,
+            getattr(google_exceptions, "FailedPrecondition", None),
+        ) if exc is not None
+    )
     total = len(rows)
-    for processed, row in enumerate(rows, start=1):
-        decision = refresh_one_document(db, row, timestamp)
-        state.records_inspected += 1
-        counter_name = f"{decision.classification.lower()}_count"
-        setattr(state, counter_name, getattr(state, counter_name) + 1)
-        state.write_attempt_count += int(decision.write_attempted)
-        state.write_success_count += int(decision.write_succeeded)
-        source_row = {key: safe_str(row.get(key)) for key in REQUIRED_COLUMNS}
-        detail = {
-            "runId": state.run_id,
-            "masterId": safe_str(row.get("masterId")),
-            "lmPcode": safe_str(row.get("lmPcode")),
-            "sourceRow": source_row,
-            "code": decision.code,
-            "conflictingPaths": decision.evidence.get("conflictingPaths", []),
-            "existingValues": decision.evidence.get("existing"),
-            "incomingValues": decision.evidence.get("incoming", source_row),
-            "message": decision.evidence.get("detail", decision.evidence.get("error", decision.code)),
-            "detectedAt": datetime.now(UTC).isoformat(),
-            "writeAttempted": decision.write_attempted,
-            "investigationRecommendation": (
-                "Review the existing Meter Master document and approved Stage 05 source; "
-                "do not overwrite operational fields manually."
-            ),
-            **decision.evidence,
-        }
-        if decision.classification == "CONFLICT":
-            state.conflicts.append(detail)
-        elif decision.classification == "FAILED":
-            state.failures.append(detail)
-        else:
-            successful_row = dict(source_row)
-            successful_row["_expectedAstId"] = safe_str(decision.evidence.get("expectedAstId"))
-            state.successful_rows.append(successful_row)
-        counts = state.counts()
-        if processed == 1 or processed % 100 == 0 or processed == total:
-            print(
-                f"Refresh progress: {processed:,}/{total:,} inspected; "
-                f"created={counts['CREATED']:,}, updated={counts['UPDATED']:,}, "
-                f"unchanged={counts['UNCHANGED']:,}, conflicts={counts['CONFLICT']:,}, "
-                f"failed={counts['FAILED']:,}"
+    processed = 0
+    for row_wave in chunks(rows, FIRESTORE_BATCH_SIZE):
+        snapshots = _bulk_refresh_snapshots(db, row_wave)
+        state.read_waves += 1
+        operations: list[dict[str, Any]] = []
+        for row, ref, snapshot in snapshots:
+            decision = _refresh_decision_for_snapshot(row, snapshot, timestamp)
+            if decision.classification in {"CREATED", "UPDATED"}:
+                operations.append({
+                    "row": row, "ref": ref, "snapshot": snapshot, "decision": decision,
+                    "token": _refresh_snapshot_token(snapshot),
+                })
+            else:
+                _record_refresh_decision(state, row, decision)
+
+        committed: list[Mapping[str, Any]] = []
+        if operations:
+            state.maximum_write_operations_in_any_batch = max(
+                state.maximum_write_operations_in_any_batch, len(operations)
             )
+            state.write_waves_attempted += 1
+            state.write_attempt_count += len(operations)
+            try:
+                _build_refresh_batch(db, operations, timestamp).commit()
+                committed = operations
+            except concurrency_errors:
+                # One bounded wave recovery. Re-read the complete wave in bulk,
+                # mark changed participants as conflicts, retry unchanged safe
+                # participants once, never fall back to per-document transactions.
+                refreshed = _bulk_refresh_snapshots(db, row_wave)
+                state.read_waves += 1
+                fresh_by_id = {str(row["masterId"]): (row, ref, snap) for row, ref, snap in refreshed}
+                retry: list[dict[str, Any]] = []
+                for operation in operations:
+                    doc_id = str(operation["row"]["masterId"])
+                    row, ref, fresh_snapshot = fresh_by_id[doc_id]
+                    if _refresh_snapshot_token(fresh_snapshot) != operation["token"]:
+                        state.precondition_conflict_count += 1
+                        _record_refresh_decision(
+                            state,
+                            row,
+                            RefreshDecision(
+                                "CONFLICT", "MM_TRANSACTION_PRECONDITION_CHANGED", {},
+                                {"masterId": doc_id, "detail": "document changed after refresh preflight"},
+                            ),
+                            write_attempted=True,
+                            write_succeeded=False,
+                        )
+                        continue
+                    fresh_decision = _refresh_decision_for_snapshot(row, fresh_snapshot, timestamp)
+                    if fresh_decision.classification in {"CREATED", "UPDATED"}:
+                        retry.append({
+                            "row": row, "ref": ref, "snapshot": fresh_snapshot,
+                            "decision": fresh_decision,
+                            "token": _refresh_snapshot_token(fresh_snapshot),
+                        })
+                    else:
+                        _record_refresh_decision(
+                            state, row, fresh_decision,
+                            write_attempted=True, write_succeeded=False,
+                        )
+                if retry:
+                    state.maximum_write_operations_in_any_batch = max(
+                        state.maximum_write_operations_in_any_batch, len(retry)
+                    )
+                    state.write_waves_attempted += 1
+                    state.write_attempt_count += len(retry)
+                    try:
+                        _build_refresh_batch(db, retry, timestamp).commit()
+                    except concurrency_errors as exc:
+                        raise RuntimeError(
+                            "Meter Master refresh concurrency recovery batch failed; "
+                            "no per-document fallback is permitted"
+                        ) from exc
+                    committed = retry
+            except SYSTEMIC_FIRESTORE_EXCEPTIONS:
+                raise
+
+        if committed:
+            state.write_waves_committed += 1
+            for operation in committed:
+                _record_refresh_decision(
+                    state,
+                    operation["row"],
+                    operation["decision"],
+                    write_attempted=True,
+                    write_succeeded=True,
+                )
+            state.write_success_count += len(committed)
+
+        processed += len(row_wave)
+        counts = state.counts()
+        print(
+            f"Refresh progress: {processed:,}/{total:,} inspected; "
+            f"created={counts['CREATED']:,}, updated={counts['UPDATED']:,}, "
+            f"unchanged={counts['UNCHANGED']:,}, conflicts={counts['CONFLICT']:,}, "
+            f"failed={counts['FAILED']:,}; readWaves={state.read_waves:,}; "
+            f"writeWaves={state.write_waves_committed:,}"
+        )
+    return state
+
+
+def preflight_refresh_documents(
+    db: firestore.Client,
+    rows: Sequence[Mapping[str, Any]],
+    timestamp: datetime,
+    state: RefreshRunState,
+) -> RefreshRunState:
+    total = len(rows)
+    processed = 0
+    for row_wave in chunks(rows, FIRESTORE_BATCH_SIZE):
+        snapshots = _bulk_refresh_snapshots(db, row_wave)
+        state.read_waves += 1
+        for row, _ref, snapshot in snapshots:
+            decision = _refresh_decision_for_snapshot(row, snapshot, timestamp)
+            if decision.classification == "CREATED":
+                decision = RefreshDecision(
+                    "CREATED", "MM_DOCUMENT_WOULD_CREATE", {},
+                    decision.evidence, False, False,
+                )
+            _record_refresh_decision(state, row, decision)
+        processed += len(row_wave)
+        counts = state.counts()
+        print(
+            f"Preflight progress: {processed:,}/{total:,}; "
+            f"created={counts['CREATED']:,}, updated={counts['UPDATED']:,}, "
+            f"unchanged={counts['UNCHANGED']:,}, conflicts={counts['CONFLICT']:,}, "
+            f"failed={counts['FAILED']:,}; readWaves={state.read_waves:,}"
+        )
     return state
 
 
@@ -1078,10 +1331,13 @@ def verify_post_upload(
         )
 
     row_by_id = {row["masterId"]: row for row in rows}
+    sample_ids = deterministic_sample_ids(list(row_by_id.keys()))
+    refs = [db.collection(COLLECTION_NAME).document(doc_id) for doc_id in sample_ids]
+    snapshots = {snapshot.id: snapshot for snapshot in db.get_all(refs)}
     samples: list[dict[str, Any]] = []
-    for doc_id in deterministic_sample_ids(list(row_by_id.keys())):
-        snapshot = db.collection(COLLECTION_NAME).document(doc_id).get()
-        if not snapshot.exists:
+    for doc_id in sample_ids:
+        snapshot = snapshots.get(doc_id)
+        if snapshot is None or not snapshot.exists:
             raise RuntimeError(f"Post-upload sample is missing: {COLLECTION_NAME}/{doc_id}")
         differences = compare_existing_document(snapshot.to_dict() or {}, row_by_id[doc_id])
         samples.append({"masterId": doc_id, "matches": not differences})
@@ -1115,6 +1371,18 @@ def refresh_state_report_fields(state: RefreshRunState) -> dict[str, Any]:
         "classificationCounts": state.counts(),
         "conflicts": state.conflicts,
         "failedRecords": state.failures,
+        "batchEvidence": {
+            "firestoreBatchSize": FIRESTORE_BATCH_SIZE,
+            "readWaves": state.read_waves,
+            "writeWavesAttempted": state.write_waves_attempted,
+            "writeWavesCommitted": state.write_waves_committed,
+            "writeOperationsAttempted": state.write_attempt_count,
+            "writeOperationsSucceeded": state.write_success_count,
+            "verificationReadWaves": state.verification_read_waves,
+            "preconditionConflictCount": state.precondition_conflict_count,
+            "maximumWriteOperationsInAnyBatch": state.maximum_write_operations_in_any_batch,
+            "perDocumentFallback": False,
+        },
     }
 
 
@@ -1143,6 +1411,7 @@ def verify_refresh_post_write(
     collection_count_before: int,
     collection_count_after: int,
     created_count: int,
+    state: RefreshRunState | None = None,
 ) -> dict[str, Any]:
     expected_count = collection_count_before + created_count
     if collection_count_after < collection_count_before:
@@ -1154,10 +1423,14 @@ def verify_refresh_post_write(
 
     row_by_id = {safe_str(item.get("masterId")): item for item in successful_rows}
     sample_ids = deterministic_sample_ids(list(row_by_id))
+    refs = [db.collection(COLLECTION_NAME).document(doc_id) for doc_id in sample_ids]
+    snapshots = {snapshot.id: snapshot for snapshot in db.get_all(refs)}
+    if state is not None and refs:
+        state.verification_read_waves += 1
     samples: list[dict[str, Any]] = []
     for doc_id in sample_ids:
-        snapshot = db.collection(COLLECTION_NAME).document(doc_id).get()
-        if not snapshot.exists:
+        snapshot = snapshots.get(doc_id)
+        if snapshot is None or not snapshot.exists:
             raise RuntimeError(f"Refresh verification failed: missing sample {doc_id}")
         payload = snapshot.to_dict()
         decision = classify_refresh_document(doc_id, payload, row_by_id[doc_id], datetime.now(UTC))
@@ -1358,6 +1631,7 @@ def build_config(args: argparse.Namespace) -> UploadConfig:
             resolve_project_path(args.resume_report) if args.resume_report is not None else None
         ),
         report_dir=resolve_project_path(args.report_dir),
+        preflight_only=bool(args.preflight_only),
     )
 
 
@@ -1387,6 +1661,7 @@ def main() -> None:
     report_path = make_report_path(config.report_dir, config.project_id)
     progress = UploadProgress()
     firestore_started = False
+    db: Any = None
     run_id = uuid4().hex
     refresh_state = RefreshRunState(run_id=run_id, rows_read=0)
     conflict_report_path: Optional[Path] = None
@@ -1398,6 +1673,7 @@ def main() -> None:
         "projectId": config.project_id,
         "collection": COLLECTION_NAME,
         "mode": config.mode,
+        "preflightOnly": config.preflight_only,
         "runId": run_id,
         "inputPath": str(config.input_path),
         "manifestPath": str(config.manifest_path),
@@ -1471,6 +1747,10 @@ def main() -> None:
 
         print_preflight(config, preflight)
 
+        if firestore is None or service_account is None or google_exceptions is None:
+            raise RuntimeError(
+                "google-cloud-firestore/google-auth are required for Stage 07 Firestore access"
+            )
         credentials = service_account.Credentials.from_service_account_file(
             str(config.service_account_path)
         )
@@ -1478,11 +1758,68 @@ def main() -> None:
         firestore_started = True
         operation_timestamp = datetime.now(UTC)
 
+        if config.preflight_only:
+            if config.mode == "initial-load":
+                existing_ids = find_existing_input_ids(
+                    db,
+                    [str(row["masterId"]) for row in rows],
+                    label="Meter Master initial-load preflight",
+                )
+                report.update(
+                    {
+                        "inputScopeExistingCount": len(existing_ids),
+                        "inputScopeExistingIds": existing_ids[:100],
+                        "documentsCreated": 0,
+                        "committedBatches": 0,
+                    }
+                )
+                if existing_ids:
+                    raise RuntimeError(
+                        f"Stage 07 initial-load blocked: {len(existing_ids)} input document ID(s) "
+                        f"already exist; first={existing_ids[:10]}"
+                    )
+                report.update({"status": "PASS", "result": "PREFLIGHT_PASS"})
+                print("=== METER MASTER INITIAL-LOAD PREFLIGHT PASS ===")
+                print(f"Input IDs checked: {len(rows):,}")
+                print("Existing input IDs: 0")
+                print("Firestore writes: 0")
+                return
+            if config.mode != "refresh":
+                raise ValueError("--preflight-only is supported with --mode initial-load or refresh")
+            preflight_refresh_documents(db, rows, operation_timestamp, refresh_state)
+            counts = refresh_state.counts()
+            report.update(refresh_state_report_fields(refresh_state))
+            if counts["CONFLICT"] or counts["FAILED"]:
+                raise RuntimeError(f"Stage 07 refresh preflight blocked: conflicts={counts['CONFLICT']}; failed={counts['FAILED']}")
+            report.update({"status": "PASS", "result": "PREFLIGHT_PASS", "documentsCreated": 0, "committedBatches": 0})
+            print("=== METER MASTER REFRESH PREFLIGHT PASS ===")
+            print(f"Would create:    {counts['CREATED']:,}")
+            print(f"Would update:    {counts['UPDATED']:,}")
+            print(f"Unchanged:       {counts['UNCHANGED']:,}")
+            print("Firestore writes: 0")
+            return
+
         if config.mode == "create-only":
             if collection_has_documents(db):
                 raise RuntimeError(
                     f"Upload blocked: {COLLECTION_NAME} is not empty in {config.project_id}. "
                     "An established collection requires a separate reviewed migration plan."
+                )
+            matching = 0
+            missing_before = len(rows)
+            create_documents(db, rows, operation_timestamp, progress)
+        elif config.mode == "initial-load":
+            existing_ids = find_existing_input_ids(
+                db,
+                [str(row["masterId"]) for row in rows],
+                label="Meter Master initial-load gate",
+            )
+            report["inputScopeExistingCount"] = len(existing_ids)
+            if existing_ids:
+                report["inputScopeExistingIds"] = existing_ids[:100]
+                raise RuntimeError(
+                    f"Initial-load blocked: {len(existing_ids)} input Meter Master ID(s) already exist; "
+                    f"first={existing_ids[:10]}"
                 )
             matching = 0
             missing_before = len(rows)
@@ -1504,8 +1841,12 @@ def main() -> None:
             missing_before = len(plan.missing_rows)
             create_documents(db, plan.missing_rows, operation_timestamp, progress)
 
-        if config.mode in ("create-only", "resume"):
-            verification = verify_post_upload(db, rows)
+        if config.mode in ("create-only", "initial-load", "resume"):
+            verification = (
+                verify_input_scope_post_upload(db, rows)
+                if config.mode == "initial-load"
+                else verify_post_upload(db, rows)
+            )
             report.update(
                 {
                     "documentsCreated": progress.documents_created,
@@ -1513,17 +1854,23 @@ def main() -> None:
                     "matchingDocuments": matching,
                     "missingDocumentsBeforeWrite": missing_before,
                     "verification": verification,
-                    "finalCollectionCount": verification["finalCount"],
                     "status": "PASS",
                     "result": "UPLOAD_VERIFIED",
                 }
             )
+            if "finalCount" in verification:
+                report["finalCollectionCount"] = verification["finalCount"]
             print("=== METER MASTER UPLOAD COMPLETE ===")
             print(f"Project:            {config.project_id}")
+            print(f"Mode:               {config.mode}")
             print(f"Documents created:  {progress.documents_created:,}")
             print(f"Existing matching:  {matching:,}")
-            print(f"Final collection:   {verification['finalCount']:,}")
-            print("Sample verification: PASS")
+            if config.mode == "initial-load":
+                print(f"Input scope verified:{verification['verifiedInputScopeCount']:,}")
+                print("Verification:        FULL INPUT SCOPE / BATCHED get_all")
+            else:
+                print(f"Final collection:   {verification['finalCount']:,}")
+                print("Sample verification: PASS")
         else:
             established_before = sum(1 for _ in db.collection(COLLECTION_NAME).stream())
             refresh_documents(db, rows, operation_timestamp, refresh_state)
@@ -1543,6 +1890,7 @@ def main() -> None:
                 established_before,
                 established_after,
                 refresh_state.created_count,
+                refresh_state,
             )
             complete_refresh_report(report, refresh_state, accounting, verification)
             report.update(
@@ -1602,6 +1950,12 @@ def main() -> None:
         raise
 
     finally:
+        if db is not None:
+            try:
+                db.close()
+                print("[CLEANUP] Firestore client closed.")
+            except Exception as cleanup_exc:
+                report["firestoreClientCleanupWarning"] = str(cleanup_exc)
         report["finishedAt"] = datetime.now(UTC).isoformat()
         write_report(report_path, report)
         print(f"\n[REPORT] {report_path}")

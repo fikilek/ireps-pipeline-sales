@@ -29,6 +29,7 @@ const DEFAULT_REPORT_DIR = path.join(SCRIPT_DIR, "reports");
 const CONFIRM_TEXT = "MIGRATE_IREPS2_METER_MASTER_CANONICAL_V1";
 const MIGRATION_UID = "SYSTEM";
 const MIGRATION_USER = "METER MASTER CANONICAL MIGRATION";
+const FIRESTORE_BATCH_SIZE = 400;
 
 const CANONICAL_ROOT_FIELDS = Object.freeze([
   "lmPcode",
@@ -743,14 +744,6 @@ function buildUpdateRequest(existingData, canonical, sourceUpdateTime) {
   };
 }
 
-async function flushBulkWriter(writer, writePromises) {
-  // BulkWriter dispatches and drains queued writes when close() is called.
-  // Do not await unresolved individual write promises before closing the writer:
-  // Node can otherwise exit with an unresolved top-level promise and no active handles.
-  await writer.close();
-  return Promise.all(writePromises);
-}
-
 function validateProjectArgs(args) {
   if (args.projectId !== TARGET_PROJECT_ID) {
     throw new Error(`This migration is hard locked to ${TARGET_PROJECT_ID}; received ${args.projectId}.`);
@@ -810,8 +803,8 @@ async function readSelectedDocuments(db, onlyIds) {
     const uniqueIds = [...new Set(onlyIds)];
     const refs = uniqueIds.map((id) => db.collection(COLLECTION_NAME).doc(id));
     const snapshots = [];
-    for (let i = 0; i < refs.length; i += 250) {
-      snapshots.push(...await db.getAll(...refs.slice(i, i + 250)));
+    for (let i = 0; i < refs.length; i += FIRESTORE_BATCH_SIZE) {
+      snapshots.push(...await db.getAll(...refs.slice(i, i + FIRESTORE_BATCH_SIZE)));
     }
     return snapshots.filter((snapshot) => snapshot.exists).sort((a, b) => a.id.localeCompare(b.id));
   }
@@ -939,6 +932,93 @@ async function createDryRun(db, args) {
   return report;
 }
 
+function chunked(values, size = FIRESTORE_BATCH_SIZE) {
+  const output = [];
+  for (let i = 0; i < values.length; i += size) output.push(values.slice(i, i + size));
+  return output;
+}
+
+async function bulkReadById(db, ids) {
+  const result = new Map();
+  for (const idChunk of chunked(ids)) {
+    if (idChunk.length > FIRESTORE_BATCH_SIZE) throw new Error("Governed read wave exceeds 400 refs.");
+    const refs = idChunk.map((id) => db.collection(COLLECTION_NAME).doc(id));
+    const snapshots = await db.getAll(...refs);
+    for (const snapshot of snapshots) result.set(snapshot.id, snapshot);
+  }
+  return result;
+}
+
+function isConcurrencyBatchError(error) {
+  return [6, 9, 10, "already-exists", "failed-precondition", "aborted", "ALREADY_EXISTS", "FAILED_PRECONDITION", "ABORTED"].includes(error?.code);
+}
+
+function preconditionConflict(record, message, existingValues = undefined) {
+  return {
+    ...record,
+    classification: "CONFLICT",
+    conflicts: [{
+      code: CONFLICT_CODES.TRANSACTION_PRECONDITION_CHANGED,
+      message,
+      paths: ["__updateTime__"],
+      ...(existingValues ? { existingValues } : {}),
+    }],
+  };
+}
+
+function prepareMigrationOperation(record, currentSnapshot, executionTimestamp) {
+  const sourceUpdateTime = deserializeFirestore(record.sourceUpdateTime);
+  if (!currentSnapshot || !currentSnapshot.exists) {
+    return { conflict: preconditionConflict(record, "Document no longer exists at execution time.") };
+  }
+  const currentHash = hashFirestore(currentSnapshot.data());
+  if (currentHash !== record.sourceHash || !timestampsEqual(currentSnapshot.updateTime, sourceUpdateTime)) {
+    return {
+      conflict: preconditionConflict(
+        record,
+        "Document changed after the dry-run plan was created.",
+        {
+          plannedHash: record.sourceHash,
+          currentHash,
+          plannedUpdateTime: serializeFirestore(sourceUpdateTime),
+          currentUpdateTime: serializeFirestore(currentSnapshot.updateTime),
+        },
+      ),
+    };
+  }
+  const canonical = buildExecutionCanonical(record, executionTimestamp);
+  const validationErrors = validateCanonicalDocument(record.id, canonical);
+  if (validationErrors.length) {
+    return { conflict: { ...record, classification: "CONFLICT", conflicts: validationErrors } };
+  }
+  const { updateData, precondition } = buildUpdateRequest(
+    currentSnapshot.data(), canonical, sourceUpdateTime,
+  );
+  return {
+    operation: {
+      id: record.id,
+      record,
+      ref: currentSnapshot.ref || currentSnapshot.reference || null,
+      updateData,
+      precondition,
+      expectedHash: hashFirestore(canonical),
+      preflightUpdateTime: currentSnapshot.updateTime,
+    },
+  };
+}
+
+function buildMigrationBatch(db, operations) {
+  if (operations.length > FIRESTORE_BATCH_SIZE) {
+    throw new Error("Governed migration batch exceeds 400 write operations.");
+  }
+  const batch = db.batch();
+  for (const operation of operations) {
+    const ref = operation.ref || db.collection(COLLECTION_NAME).doc(operation.id);
+    batch.update(ref, operation.updateData, operation.precondition);
+  }
+  return batch;
+}
+
 async function executePlan(db, args) {
   const absolutePlanPath = path.resolve(args.planPath);
   if (!fs.existsSync(absolutePlanPath)) throw new Error(`Plan not found: ${absolutePlanPath}`);
@@ -958,97 +1038,95 @@ async function executePlan(db, args) {
   const conflictRecords = plan.records.filter((record) => record.classification === "CONFLICT");
   const unchangedRecords = plan.records.filter((record) => record.classification === "UNCHANGED");
   const updateRecords = plan.records.filter((record) => record.classification === "UPDATE");
+  const writeResults = [];
+  const failedResults = [];
+  let readWaves = 0;
+  let writeWavesAttempted = 0;
+  let writeWavesCommitted = 0;
+  let preconditionConflictCount = 0;
+  let maximumWriteOperationsInAnyBatch = 0;
 
-  const writer = db.bulkWriter();
-  writer.onWriteError((error) => {
-    const retryableCodes = new Set([4, 8, 10, 13, 14]);
-    return retryableCodes.has(error.code) && error.failedAttempts < 3;
-  });
-
-  const writePromises = [];
+  const initialSnapshots = await bulkReadById(db, updateRecords.map((record) => record.id));
+  readWaves += Math.ceil(updateRecords.length / FIRESTORE_BATCH_SIZE);
+  const operations = [];
   for (const record of updateRecords) {
-    const ref = db.collection(COLLECTION_NAME).doc(record.id);
-    const sourceUpdateTime = deserializeFirestore(record.sourceUpdateTime);
-    const currentSnapshot = await ref.get();
-    if (!currentSnapshot.exists) {
-      conflictRecords.push({
-        ...record,
-        classification: "CONFLICT",
-        conflicts: [{
-          code: CONFLICT_CODES.TRANSACTION_PRECONDITION_CHANGED,
-          message: "Document no longer exists at execution time.",
-          paths: ["__name__"],
-        }],
-      });
-      continue;
-    }
-    const currentHash = hashFirestore(currentSnapshot.data());
-    if (currentHash !== record.sourceHash || !timestampsEqual(currentSnapshot.updateTime, sourceUpdateTime)) {
-      conflictRecords.push({
-        ...record,
-        classification: "CONFLICT",
-        conflicts: [{
-          code: CONFLICT_CODES.TRANSACTION_PRECONDITION_CHANGED,
-          message: "Document changed after the dry-run plan was created.",
-          paths: ["__updateTime__"],
-          existingValues: {
-            plannedHash: record.sourceHash,
-            currentHash,
-            plannedUpdateTime: serializeFirestore(sourceUpdateTime),
-            currentUpdateTime: serializeFirestore(currentSnapshot.updateTime),
-          },
-        }],
-      });
-      continue;
-    }
-
-    const canonical = buildExecutionCanonical(record, executionTimestamp);
-    const validationErrors = validateCanonicalDocument(record.id, canonical);
-    if (validationErrors.length) {
-      conflictRecords.push({
-        ...record,
-        classification: "CONFLICT",
-        conflicts: validationErrors,
-      });
-      continue;
-    }
-
-    const { updateData, precondition } = buildUpdateRequest(
-      currentSnapshot.data(),
-      canonical,
-      sourceUpdateTime,
-    );
-    const promise = writer.update(ref, updateData, precondition)
-      .then((writeResult) => ({
-        id: record.id,
-        status: "UPDATED",
-        writeTime: serializeFirestore(writeResult.writeTime),
-        expectedHash: hashFirestore(canonical),
-      }))
-      .catch((error) => ({
-        id: record.id,
-        status: "FAILED",
-        conflictCode: error.code === 9
-          ? CONFLICT_CODES.TRANSACTION_PRECONDITION_CHANGED
-          : CONFLICT_CODES.RECORD_WRITE_FAILED,
-        error: String(error?.message || error),
-      }));
-    writePromises.push(promise);
+    const prepared = prepareMigrationOperation(record, initialSnapshots.get(record.id), executionTimestamp);
+    if (prepared.conflict) conflictRecords.push(prepared.conflict);
+    else operations.push(prepared.operation);
   }
 
-  console.log(`Queued writes: ${writePromises.length}`);
-  const writeResults = await flushBulkWriter(writer, writePromises);
-  console.log(`BulkWriter completed: ${writeResults.length}`);
+  for (const operationWave of chunked(operations)) {
+    maximumWriteOperationsInAnyBatch = Math.max(maximumWriteOperationsInAnyBatch, operationWave.length);
+    writeWavesAttempted += 1;
+    let committed = operationWave;
+    let commitResults;
+    try {
+      commitResults = await buildMigrationBatch(db, operationWave).commit();
+    } catch (error) {
+      if (!isConcurrencyBatchError(error)) throw error;
+      const refreshed = await bulkReadById(db, operationWave.map((operation) => operation.id));
+      readWaves += Math.ceil(operationWave.length / FIRESTORE_BATCH_SIZE);
+      const retry = [];
+      committed = [];
+      for (const operation of operationWave) {
+        const current = refreshed.get(operation.id);
+        if (
+          !current || !current.exists ||
+          !timestampsEqual(current.updateTime, operation.preflightUpdateTime)
+        ) {
+          preconditionConflictCount += 1;
+          conflictRecords.push(preconditionConflict(
+            operation.record,
+            "Document changed after execution preflight; excluded from bounded batch retry.",
+            {
+              preflightUpdateTime: serializeFirestore(operation.preflightUpdateTime),
+              currentUpdateTime: current?.updateTime ? serializeFirestore(current.updateTime) : null,
+            },
+          ));
+          continue;
+        }
+        retry.push({ ...operation, ref: current.ref || current.reference || operation.ref });
+      }
+      if (retry.length > 0) {
+        maximumWriteOperationsInAnyBatch = Math.max(maximumWriteOperationsInAnyBatch, retry.length);
+        writeWavesAttempted += 1;
+        try {
+          commitResults = await buildMigrationBatch(db, retry).commit();
+        } catch (retryError) {
+          throw new Error(`BOUNDED_BATCH_RECOVERY_FAILED:${retryError.message || String(retryError)}`);
+        }
+        committed = retry;
+      } else {
+        commitResults = [];
+      }
+    }
 
+    if (committed.length > 0) {
+      writeWavesCommitted += 1;
+      committed.forEach((operation, index) => {
+        writeResults.push({
+          id: operation.id,
+          status: "UPDATED",
+          writeTime: serializeFirestore(commitResults?.[index]?.writeTime || executionTimestamp),
+          expectedHash: operation.expectedHash,
+        });
+      });
+    }
+  }
+
+  console.log(`Governed write batches completed: ${writeWavesCommitted}`);
   const updatedResults = writeResults.filter((result) => result.status === "UPDATED");
-  const failedResults = writeResults.filter((result) => result.status === "FAILED");
 
   const verification = [];
-  for (let i = 0; i < updatedResults.length; i += 250) {
-    const chunk = updatedResults.slice(i, i + 250);
-    const snapshots = await db.getAll(...chunk.map((result) => db.collection(COLLECTION_NAME).doc(result.id)));
+  let verificationReadWaves = 0;
+  const resultById = new Map(updatedResults.map((item) => [item.id, item]));
+  for (const resultWave of chunked(updatedResults)) {
+    const snapshots = await db.getAll(
+      ...resultWave.map((result) => db.collection(COLLECTION_NAME).doc(result.id)),
+    );
+    verificationReadWaves += 1;
     for (const snapshot of snapshots) {
-      const result = updatedResults.find((item) => item.id === snapshot.id);
+      const result = resultById.get(snapshot.id);
       const errors = snapshot.exists ? validateCanonicalDocument(snapshot.id, snapshot.data()) : [{
         code: CONFLICT_CODES.RECORD_WRITE_FAILED,
         message: "Document missing during verification.",
@@ -1084,11 +1162,7 @@ async function executePlan(db, args) {
     })),
     ...failedResults.map((record) => ({
       id: record.id,
-      conflicts: [{
-        code: record.conflictCode,
-        message: record.error,
-        paths: [],
-      }],
+      conflicts: [{ code: record.conflictCode, message: record.error, paths: [] }],
       writeAttempted: true,
     })),
   ];
@@ -1118,11 +1192,20 @@ async function executePlan(db, args) {
       failed: failedResults.length,
       verificationFailed: verificationFailures.length,
     },
+    batchEvidence: {
+      firestoreBatchSize: FIRESTORE_BATCH_SIZE,
+      readWaves,
+      writeWavesAttempted,
+      writeWavesCommitted,
+      writeOperationsSucceeded: updatedResults.length,
+      verificationReadWaves,
+      preconditionConflictCount,
+      maximumWriteOperationsInAnyBatch,
+      perDocumentFallback: false,
+      bulkWriterUsed: false,
+    },
     accountingValid:
-      updatedResults.length
-      + unchangedRecords.length
-      + conflictOutput.length
-      === plan.records.length,
+      updatedResults.length + unchangedRecords.length + conflictOutput.length === plan.records.length,
     conflictReportPath: path.join(runDir, "conflicts.json"),
     writeResultsPath: path.join(runDir, "write_results.json"),
     verificationPath: path.join(runDir, "verification.json"),
@@ -1167,7 +1250,6 @@ module.exports = {
   buildExecutionCanonical,
   buildUpdateRequest,
   deserializeFirestore,
-  flushBulkWriter,
   hashFirestore,
   normalizeMeterNo,
   serializeFirestore,

@@ -383,7 +383,9 @@ async function main() {
       console.log("[STEP 4/5] Applying the single allowed field update...");
       writesAttempted = 1;
 
-      await targetRef.update(
+      const batch = db.batch();
+      batch.update(
+        targetRef,
         {
           "master.visibility": TARGET_VISIBILITY,
         },
@@ -391,6 +393,7 @@ async function main() {
           lastUpdateTime: beforeSnap.updateTime,
         },
       );
+      await batch.commit();
 
       writesCompleted = 1;
       console.log(

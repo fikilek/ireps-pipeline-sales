@@ -246,5 +246,13 @@ class Stage02OfflineTests(unittest.TestCase):
             )
 
 
+class Stage02BatchGovernanceTests(unittest.TestCase):
+    def test_sample_verification_uses_bulk_get_all(self):
+        source = (Path(__file__).resolve().parents[1] / "scripts" / "02_upload_conlog_atomic_v2.py").read_text(encoding="utf-8")
+        self.assertIn("db.get_all(refs)", source)
+        self.assertIn("BATCH_SIZE = 400", source)
+
+
+
 if __name__ == "__main__":
     unittest.main()

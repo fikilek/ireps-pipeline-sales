@@ -264,26 +264,34 @@ class Stage04OfflineTests(unittest.TestCase):
             expected_lm_pcode="ZA7423",
             expected_month="2026-06",
         )
+        source_origin, provider = STAGE04.manifest_source_contract(manifest)
         datasets = {
             dataset: STAGE04.validate_dataset(
                 dataset,
                 selected[dataset],
                 expected_lm_pcode="ZA7423",
                 expected_month="2026-06",
+                source_origin=source_origin,
+                expected_provider=provider,
             )
             for dataset in STAGE04.COLLECTIONS
         }
-        reconciliation = STAGE04.reconcile_datasets(datasets)
+        reconciliation = STAGE04.reconcile_datasets(
+            datasets,
+            source_origin=source_origin,
+        )
         return manifest, selected, manifest_sha, datasets, reconciliation
 
     def test_valid_stage03_manifest_and_evidence_pass(self) -> None:
         manifest, _, manifest_sha, datasets, reconciliation = self._load_validated()
+        source_origin, _provider = STAGE04.manifest_source_contract(manifest)
         evidence = STAGE04.validate_manifest_evidence(
             manifest,
             datasets,
             reconciliation,
             expected_lm_pcode="ZA7423",
             expected_month="2026-06",
+            source_origin=source_origin,
         )
         self.assertEqual("PASS", evidence["verification"])
         self.assertEqual(2, evidence["atomic"]["purchasesCount"])
@@ -320,6 +328,7 @@ class Stage04OfflineTests(unittest.TestCase):
     def test_manifest_rejects_reconciliation_not_proven_by_csvs(self) -> None:
         manifest, _, _, datasets, reconciliation = self._load_validated()
         manifest["reconciliation"][0]["amountTotalC"] = 301
+        source_origin, _provider = STAGE04.manifest_source_contract(manifest)
         with self.assertRaisesRegex(ValueError, "reconciliation amountTotalC mismatch"):
             STAGE04.validate_manifest_evidence(
                 manifest,
@@ -327,6 +336,7 @@ class Stage04OfflineTests(unittest.TestCase):
                 reconciliation,
                 expected_lm_pcode="ZA7423",
                 expected_month="2026-06",
+                source_origin=source_origin,
             )
 
     def test_csv_sha_and_parser_use_one_byte_snapshot(self) -> None:
@@ -343,11 +353,14 @@ class Stage04OfflineTests(unittest.TestCase):
             "read_csv_robust_bytes",
             side_effect=mutate_after_snapshot,
         ):
+            source_origin, provider = STAGE04.manifest_source_contract(self.manifest)
             dataset = STAGE04.validate_dataset(
                 "monthly",
                 entry,
                 expected_lm_pcode="ZA7423",
                 expected_month="2026-06",
+                source_origin=source_origin,
+                expected_provider=provider,
             )
 
         self.assertEqual(entry["sha256"], dataset.file_sha256)
@@ -375,6 +388,14 @@ class Stage04OfflineTests(unittest.TestCase):
                 {**expected, "unexpected": "value"}, expected
             ),
         )
+
+
+class Stage04BatchGovernanceTests(unittest.TestCase):
+    def test_sample_verification_uses_bulk_get_all(self):
+        source = (Path(__file__).resolve().parents[1] / "scripts" / "04_upload_conlog_monthly_v3.py").read_text(encoding="utf-8")
+        self.assertIn("db.get_all(refs)", source)
+        self.assertIn("BATCH_SIZE = 400", source)
+
 
 
 if __name__ == "__main__":

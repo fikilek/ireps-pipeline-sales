@@ -1054,10 +1054,13 @@ def verify_post_upload(
         )
 
     row_by_id = {row["masterId"]: row for row in rows}
+    sample_ids = deterministic_sample_ids(list(row_by_id.keys()))
+    refs = [db.collection(COLLECTION_NAME).document(doc_id) for doc_id in sample_ids]
+    snapshots = {snapshot.id: snapshot for snapshot in db.get_all(refs)}
     samples: list[dict[str, Any]] = []
-    for doc_id in deterministic_sample_ids(list(row_by_id.keys())):
-        snapshot = db.collection(COLLECTION_NAME).document(doc_id).get()
-        if not snapshot.exists:
+    for doc_id in sample_ids:
+        snapshot = snapshots.get(doc_id)
+        if snapshot is None or not snapshot.exists:
             raise RuntimeError(f"Post-upload sample is missing: {COLLECTION_NAME}/{doc_id}")
         expected = build_document(row_by_id[doc_id], monthly_columns)
         actual = snapshot.to_dict() or {}

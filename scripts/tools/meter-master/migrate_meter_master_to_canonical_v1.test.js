@@ -5,7 +5,6 @@ const {
   CANONICAL_ROOT_FIELDS,
   buildCanonicalCandidate,
   deserializeFirestore,
-  flushBulkWriter,
   normalizeMeterNo,
   serializeFirestore,
   timestampsEqual,
@@ -129,27 +128,25 @@ test("timestamp comparison rejects a one-nanosecond change", () => {
 });
 
 
-test("BulkWriter is closed before waiting for queued write promises", async () => {
-  let closeCalled = false;
-  let resolveWrite;
 
-  const writePromise = new Promise((resolve) => {
-    resolveWrite = resolve;
-  });
 
-  const fakeWriter = {
-    async close() {
-      closeCalled = true;
-      resolveWrite({ status: "UPDATED" });
-    },
-  };
 
-  const results = await flushBulkWriter(fakeWriter, [writePromise]);
-
-  assert.equal(closeCalled, true);
-  assert.deepEqual(results, [{ status: "UPDATED" }]);
+test("migration source uses governed explicit 400-operation WriteBatch waves", () => {
+  const fs = require("node:fs");
+  const source = fs.readFileSync(require.resolve("./migrate_meter_master_to_canonical_v1.js"), "utf8");
+  assert.match(source, /FIRESTORE_BATCH_SIZE = 400/);
+  assert.match(source, /db\.batch\(\)/);
+  assert.match(source, /batch\.update\(/);
+  assert.match(source, /lastUpdateTime/);
+  assert.doesNotMatch(source, /bulkWriter\(/);
 });
 
+test("migration source has bounded batch recovery and no per-document fallback", () => {
+  const fs = require("node:fs");
+  const source = fs.readFileSync(require.resolve("./migrate_meter_master_to_canonical_v1.js"), "utf8");
+  assert.match(source, /BOUNDED_BATCH_RECOVERY_FAILED/);
+  assert.match(source, /perDocumentFallback: false/);
+});
 
 test("toTimestampOrNull preserves Firestore timestamp nanoseconds exactly", () => {
   const original = new Timestamp(1773912421, 362345000);

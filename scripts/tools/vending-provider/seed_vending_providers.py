@@ -1,9 +1,10 @@
 """
 Create the governed Firestore vending_providers reference collection.
 
-Creates:
+Creates governed provider documents such as:
 
-    vending_providers/vpr_7f4d3c91a2b84e6f
+    vending_providers/vpr_7f4d3c91a2b84e6f   (CONLOG)
+    vending_providers/vpr_7c5e133b3475f3e2   (CONTOUR)
 
 The provider ID is a permanent opaque internal identifier.
 The business code and display name are stored separately.
@@ -36,7 +37,14 @@ PROVIDERS: list[dict[str, Any]] = [
         "providerCode": "CONLOG",
         "providerName": "Conlog",
         "status": "active",
-    }
+    },
+    {
+        "documentId": "vpr_7c5e133b3475f3e2",
+        "providerId": "vpr_7c5e133b3475f3e2",
+        "providerCode": "CONTOUR",
+        "providerName": "Contour",
+        "status": "active",
+    },
 ]
 
 
@@ -59,6 +67,15 @@ def parse_args() -> argparse.Namespace:
         required=True,
         type=Path,
         help="Path to the target project's service-account JSON.",
+    )
+    parser.add_argument(
+        "--provider-code",
+        type=lambda value: value.strip().upper(),
+        choices=sorted(provider["providerCode"] for provider in PROVIDERS),
+        help=(
+            "Optional provider code to seed. When omitted, all governed providers "
+            "are processed using the existing create-only behavior."
+        ),
     )
     parser.add_argument(
         "--created-by-uid",
@@ -197,14 +214,33 @@ def build_provider_document(
     }
 
 
-def print_plan(args: argparse.Namespace) -> None:
+def select_providers(args: argparse.Namespace) -> list[dict[str, Any]]:
+    if not args.provider_code:
+        return PROVIDERS
+
+    selected = [
+        provider
+        for provider in PROVIDERS
+        if provider["providerCode"] == args.provider_code
+    ]
+    if len(selected) != 1:
+        raise SystemExit(
+            f"Governed provider code was not resolved uniquely: {args.provider_code!r}"
+        )
+    return selected
+
+
+def print_plan(
+    args: argparse.Namespace,
+    providers: list[dict[str, Any]],
+) -> None:
     print("[TARGET]")
     print(f"  project:    {args.project_id}")
     print(f"  collection: {COLLECTION}")
-    print(f"  providers:  {len(PROVIDERS)}")
+    print(f"  providers:  {len(providers)}")
     print("  mode:       create-only")
 
-    for provider in PROVIDERS:
+    for provider in providers:
         print(
             "  planned:    "
             f"{COLLECTION}/{provider['documentId']} "
@@ -216,7 +252,8 @@ def main() -> None:
     args = parse_args()
     validate_args(args)
     validate_seed_data()
-    print_plan(args)
+    providers = select_providers(args)
+    print_plan(args, providers)
 
     if args.preflight_only:
         print("[PREFLIGHT OK] No Firestore connection or write was performed.")
@@ -226,38 +263,33 @@ def main() -> None:
 
     created = 0
     conflicts = 0
-
-    for provider in PROVIDERS:
+    batch = db.batch()
+    for provider in providers:
         document_id = provider["documentId"]
         document = build_provider_document(
             provider=provider,
             created_by_uid=args.created_by_uid,
             created_by_user=args.created_by_user,
         )
-
         ref = db.collection(COLLECTION).document(document_id)
+        batch.create(ref, document)
 
-        try:
-            ref.create(document)
-            created += 1
-            print(f"[CREATED] {COLLECTION}/{document_id}")
-        except AlreadyExists:
-            conflicts += 1
-            print(
-                f"[CONFLICT] {COLLECTION}/{document_id} already exists. "
-                "No overwrite was performed."
-            )
+    try:
+        batch.commit()
+        created = len(providers)
+        for provider in providers:
+            print(f"[CREATED] {COLLECTION}/{provider['documentId']}")
+    except AlreadyExists:
+        # Firestore batch commits are atomic: if any create collides, none are created.
+        conflicts = len(providers)
+        raise SystemExit(
+            "[BLOCKED] One or more provider documents already existed. "
+            "The atomic create batch committed zero documents; review the existing target(s)."
+        )
 
     print("\n[RESULT]")
     print(f"  created:   {created}")
     print(f"  conflicts: {conflicts}")
-
-    if conflicts:
-        raise SystemExit(
-            "[BLOCKED] One or more provider documents already existed. "
-            "Review the existing document before making any controlled update."
-        )
-
     print("[OK] Vending-provider seed completed.")
 
 

@@ -125,7 +125,7 @@ function printHelp() {
 ${TASK_ID} — governed read-only Sales All Meters reassessment against schema 1.1.0
 
 Usage:
-  node scripts/tools/sales-all/read_sales_all_meters_dev_v1.js \\
+  node scripts/tools/sales-all/read_sales_all_meters_dev_v2.js \\
     --service-account "C:\\dev\\secrets\\ireps2-b33892e25c20.json"
 
 Options:

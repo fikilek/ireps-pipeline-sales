@@ -135,4 +135,3 @@ print(
     + hashlib.sha256(upload_output.read_bytes()).hexdigest()
 )
 print("Firestore operations:    NONE")
-

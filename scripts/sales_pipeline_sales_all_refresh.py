@@ -896,4 +896,3 @@ def run_refresh(
                 db.close()
             except Exception:
                 pass
-

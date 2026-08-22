@@ -48,6 +48,11 @@ from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
 
 import pandas as pd
 
+from sales_pipeline_monthly_source_support import (
+    build_stage05_monthly_source,
+    require_provider as require_monthly_source_provider,
+)
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 GOVERNED_PROVIDER = "conlog"
@@ -211,8 +216,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--provider",
         default=GOVERNED_PROVIDER,
-        choices=(GOVERNED_PROVIDER,),
-        help="Governed sales provider. Current approved value: conlog.",
+        help="Sales provider code. Atomic path remains governed to conlog; monthly_source accepts a validated provider code.",
+    )
+    parser.add_argument(
+        "--source-origin",
+        choices=("atomic", "monthly_source"),
+        default="atomic",
+        help="Upstream source contract. Default atomic preserves the existing Conlog path.",
+    )
+    parser.add_argument(
+        "--commercial-source",
+        type=Path,
+        help="Cleaned commercial JSONL. Required only for --source-origin monthly_source.",
+    )
+    parser.add_argument(
+        "--expected-commercial-source-sha256",
+        help="Optional/strongly recommended frozen SHA256 for --commercial-source.",
+    )
+    parser.add_argument(
+        "--source-run-id",
+        default="",
+        help="Governed upstream monthly-source run identifier recorded in the Stage 05 manifest.",
     )
     parser.add_argument(
         "--meter-type",
@@ -1583,10 +1607,12 @@ def main() -> None:
         raise ValueError("--lm-pcode may not be blank.")
     if not re.fullmatch(r"[A-Z0-9_-]+", config.lm_pcode):
         raise ValueError("--lm-pcode may contain only A-Z, 0-9, underscore, and hyphen.")
-    if config.provider != GOVERNED_PROVIDER:
+    if args.source_origin == "atomic" and config.provider != GOVERNED_PROVIDER:
         raise ValueError(
-            f"Stage 05 is currently governed only for provider={GOVERNED_PROVIDER!r}."
+            f"Stage 05 atomic path remains governed only for provider={GOVERNED_PROVIDER!r}."
         )
+    if args.source_origin == "monthly_source":
+        require_monthly_source_provider(config.provider)
     if config.meter_type != GOVERNED_METER_TYPE:
         raise ValueError(
             f"Stage 05 is currently governed only for meterType={GOVERNED_METER_TYPE!r}."
@@ -1600,6 +1626,46 @@ def main() -> None:
     explicit_output = (
         resolve_project_path(args.output) if args.output is not None else None
     )
+
+    if args.source_origin == "monthly_source":
+        if args.commercial_source is None:
+            raise ValueError("--commercial-source is required for --source-origin monthly_source")
+        commercial_source = resolve_project_path(args.commercial_source)
+        output_path = resolve_output_path(
+            explicit_output,
+            output_dir,
+            config.lm_pcode,
+            args.scope,
+            args.from_month,
+            args.to_month,
+        )
+        manifest_path = resolve_manifest_path(output_path)
+        manifest = build_stage05_monthly_source(
+            lm_pcode=config.lm_pcode,
+            provider=config.provider,
+            meter_type=config.meter_type,
+            from_month=args.from_month,
+            to_month=args.to_month,
+            commercial_source=commercial_source,
+            expected_commercial_sha256=safe_str(args.expected_commercial_source_sha256) or None,
+            monthly_dir=monthly_dir,
+            output_path=output_path,
+            manifest_path=manifest_path,
+            source_run_id=safe_str(args.source_run_id),
+        )
+        print("=== METER MASTER BUILD — MONTHLY SOURCE ===")
+        print(f"LM/workbase: {config.lm_pcode}")
+        print(f"Provider: {config.provider}")
+        print(f"Commercial source: {commercial_source}")
+        print(f"Months: {args.from_month} to {args.to_month}")
+        print(f"Total meter master rows: {manifest['stats']['totalMasterRows']:,}")
+        print("Atomic facts fabricated: 0")
+        print("Validation: PASS")
+        print(f"Output: {output_path}")
+        print(f"Output SHA-256: {manifest['outputContract']['sha256']}")
+        print(f"Build fingerprint: {manifest['buildFingerprint']}")
+        print(f"Manifest: {manifest_path}")
+        return
 
     require_file(customer_details_path)
     require_file(npr_path)

@@ -37,6 +37,8 @@ input/**
 !input/conlog_sales/
 !input/raw-sales/
 !input/reference/
+!input/received/
+!input/prepared/
 !input/**/.gitkeep
 
 # =========================================================
@@ -53,6 +55,7 @@ output/**
 !output/monthly_lm/
 !output/monthly_lm_groups/
 !output/sales_all_meters/
+!output/sales_enrich/
 !output/**/.gitkeep
 
 # =========================================================
@@ -87,3 +90,23 @@ archive/*.csv
 
 # Generated Sales All Meters assessment and remediation outputs
 scripts/tools/sales-all/reports/
+
+# =========================================================
+# Governed local archive
+# Historical packages, reports, inspections, outputs and
+# extracted artifacts are preserved locally but not committed.
+# =========================================================
+
+archive/**
+!archive/
+!archive/.gitkeep
+
+# =========================================================
+# Controlled ZIP exchange
+# All repository exchange ZIPs live directly under /zips.
+# ZIP payloads remain local and are not committed.
+# =========================================================
+
+zips/**
+!zips/
+!zips/.gitkeep

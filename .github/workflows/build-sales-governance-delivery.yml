@@ -1,0 +1,50 @@
+name: Build Sales Governance Delivery
+
+on:
+  push:
+    branches:
+      - governance-sales-schema-20260714
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Parse PowerShell installer
+        shell: pwsh
+        run: |
+          $path = 'delivery/iREPS_Sales_Pipeline_Rules_and_Schemas_2026-07-14/Apply-iREPSSalesGovernanceUpdate.ps1'
+          [scriptblock]::Create((Get-Content $path -Raw)) | Out-Null
+
+      - name: Test installer in temporary repositories
+        shell: pwsh
+        run: |
+          $pipeline = Join-Path $env:RUNNER_TEMP 'ireps-pipeline-sales'
+          $schemas = Join-Path $env:RUNNER_TEMP 'ireps-schemas'
+          New-Item -ItemType Directory -Path (Join-Path $pipeline 'rules') -Force | Out-Null
+          New-Item -ItemType Directory -Path $schemas -Force | Out-Null
+          Copy-Item 'rules/SALES_PIPELINE_RULES.md' (Join-Path $pipeline 'rules/SALES_PIPELINE_RULES.md')
+          & 'delivery/iREPS_Sales_Pipeline_Rules_and_Schemas_2026-07-14/Apply-iREPSSalesGovernanceUpdate.ps1' -PipelineRoot $pipeline -SchemasRoot $schemas
+          if (-not (Test-Path (Join-Path $schemas 'sales-all-meters/sales_all_meters.schema.md'))) { throw 'Sales All Meters schema missing after installer test.' }
+          $updated = Get-Content (Join-Path $pipeline 'rules/SALES_PIPELINE_RULES.md') -Raw
+          if (-not $updated.Contains('DATA AND FIRESTORE BASELINE COMPLETE')) { throw 'Rules completion marker missing after installer test.' }
+
+      - name: Build ZIP
+        run: |
+          cd delivery
+          zip -r iREPS_Sales_Pipeline_Rules_and_Schemas_2026-07-14.zip iREPS_Sales_Pipeline_Rules_and_Schemas_2026-07-14
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: iREPS_Sales_Pipeline_Rules_and_Schemas_2026-07-14
+          path: delivery/iREPS_Sales_Pipeline_Rules_and_Schemas_2026-07-14.zip
+          if-no-files-found: error

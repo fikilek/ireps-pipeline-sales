@@ -682,6 +682,9 @@ def build_stage06_monthly_source(
         *COMMERCIAL_SCALAR_FIELDS,
         *COMMERCIAL_JSON_FIELDS,
     ]
+    include_category_history = any("monthlyCategories" in record for record in commercial.values())
+    if include_category_history:
+        rich_columns.append("monthlyCategories")
     base_columns = [
         "masterId",
         "meterNo",
@@ -780,6 +783,12 @@ def build_stage06_monthly_source(
             if not isinstance(value, (list, dict)):
                 raise ValueError(f"Commercial field {field} must be list/object for meter {meter}")
             row[field] = _compact_json(value)
+
+        if include_category_history:
+            from sales_monthly_categories import validate_history
+            history = source.get("monthlyCategories", {})
+            validate_history(history)
+            row["monthlyCategories"] = _compact_json(history)
 
         address_result = parse_physical_address(
             source.get("addressLine1"),

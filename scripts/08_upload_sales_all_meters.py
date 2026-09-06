@@ -216,7 +216,19 @@ def parse_args() -> argparse.Namespace:
         default=Path("output/logs/sales_all_meters"),
         help="Directory for Stage 08 JSON reports.",
     )
-    return parser.parse_args()
+    parser.add_argument("--category-package", type=Path,
+        help="Frozen exact-month category package; refresh only, no Sales identity creation.")
+    parser.add_argument("--category-package-sha256",
+        help="Approved SHA256 of the exact-month category package.")
+    parser.add_argument("--metadata-contract", type=Path,
+        help="Hash-bound creation/update actor provenance for a full commercial refresh.")
+    parser.add_argument("--metadata-contract-sha256")
+    args = parser.parse_args()
+    if (args.category_package or args.category_package_sha256) and args.mode != "refresh":
+        parser.error("Category packages require --mode refresh")
+    if (args.metadata_contract or args.metadata_contract_sha256) and args.mode != "refresh":
+        parser.error("Metadata contracts require --mode refresh")
+    return args
 
 
 def resolve_project_path(path: Path) -> Path:
@@ -1411,6 +1423,8 @@ def print_preflight(config: UploadConfig, result: PreflightResult) -> None:
 
 def main() -> None:
     args = parse_args()
+    if args.mode != "refresh" and not args.preflight_only:
+        raise ValueError("Final-state Sales writes require --mode refresh and an approved metadata/category contract")
     if args.mode == "refresh":
         from sales_pipeline_sales_all_refresh import run_refresh
         report_path = run_refresh(
@@ -1421,6 +1435,11 @@ def main() -> None:
             manifest_path=resolve_project_path(args.manifest),
             report_dir=resolve_project_path(args.report_dir),
             preflight_only=bool(args.preflight_only),
+            category_package_path=(resolve_project_path(args.category_package)
+                if args.category_package else None),
+            category_package_sha256=args.category_package_sha256,
+            metadata_contract_path=(resolve_project_path(args.metadata_contract) if args.metadata_contract else None),
+            metadata_contract_sha256=args.metadata_contract_sha256,
         )
         print("=== SALES ALL METERS REFRESH COMPLETE ===")
         print(f"Mode: {'PREFLIGHT ONLY' if args.preflight_only else 'REFRESH + VERIFY'}")

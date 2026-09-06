@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -59,6 +60,9 @@ PIPELINE_ROOT_FIELDS = {
     "adr",
     *COMMERCIAL_SCALAR_FIELDS, *COMMERCIAL_JSON_FIELDS,
 }
+# Frozen legacy categories are never authoritative refresh targets.
+PIPELINE_ROOT_FIELDS -= {"leakageCategory", "riskTier", "riskScore"}
+PIPELINE_ROOT_FIELDS.add("monthlyCategories")
 
 @dataclass
 class RefreshStats:
@@ -79,6 +83,10 @@ class RefreshStats:
     verification_read_waves: int = 0
     precondition_conflicts: int = 0
     maximum_write_operations_in_any_batch: int = 0
+    global_preflight_complete: bool = False
+    global_preflight_gate_passed: bool = False
+    committed_write_waves: list[dict[str, Any]] = field(default_factory=list)
+    failed_write_wave: dict[str, Any] | None = None
 
 
 def _sha(path: Path) -> str:
@@ -168,7 +176,8 @@ def _manifest_fingerprint(manifest: Mapping[str, Any]) -> str:
 def load_and_validate(path: Path, manifest_path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     if not path.is_file() or not manifest_path.is_file():
         raise FileNotFoundError("Stage 08 input/manifest file is missing")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest_bytes = manifest_path.read_bytes()
+    manifest = json.loads(manifest_bytes.decode("utf-8-sig"))
     if manifest.get("schemaVersion") != 2 or manifest.get("stage") != "06":
         raise ValueError("Stage 08 refresh requires Stage 06 schemaVersion 2")
     if manifest.get("script") != "06_build_sales_all_meters.py" or manifest.get("status") != "PASS":
@@ -193,7 +202,8 @@ def load_and_validate(path: Path, manifest_path: Path) -> tuple[list[dict[str, A
 
     amount_columns = [c for c in df.columns if AMOUNT_RE.fullmatch(c)]
     unit_columns = [c for c in df.columns if UNITS_RE.fullmatch(c)]
-    expected = BASE_COLUMNS + RICH_COLUMNS + ADDRESS_STAGING_COLUMNS + amount_columns + unit_columns
+    category_columns = ["monthlyCategories"] if "monthlyCategories" in df.columns else []
+    expected = BASE_COLUMNS + RICH_COLUMNS + category_columns + ADDRESS_STAGING_COLUMNS + amount_columns + unit_columns
     if list(df.columns) != expected:
         raise ValueError("Stage 08 refresh CSV columns/order do not match the rich monthly-source contract")
     months = [f"{AMOUNT_RE.fullmatch(c).group(1)}-{AMOUNT_RE.fullmatch(c).group(2)}" for c in amount_columns]
@@ -311,6 +321,9 @@ def load_and_validate(path: Path, manifest_path: Path) -> tuple[list[dict[str, A
                 doc[field] = safe_str(raw_value)
         for field in COMMERCIAL_JSON_FIELDS:
             doc[field] = _json_value(raw_row.get(field), field)
+        if category_columns:
+            from sales_monthly_categories import validate_history
+            doc["monthlyCategories"] = validate_history(json.loads(raw_row["monthlyCategories"]))
         rows.append({"masterId": meter, "expected": doc})
 
     if output.get("totalAmountC") != total_sales:
@@ -328,8 +341,8 @@ def load_and_validate(path: Path, manifest_path: Path) -> tuple[list[dict[str, A
         "lmPcode": source.get("lmPcode"),
         "months": months,
         "sourceRunId": source.get("sourceRunId"),
-        "csvSha256": _sha(path),
-        "manifestSha256": _sha(manifest_path),
+        "csvSha256": hashlib.sha256(raw).hexdigest(),
+        "manifestSha256": hashlib.sha256(manifest_bytes).hexdigest(),
         "stage06BuildFingerprint": manifest.get("buildFingerprint"),
         "rows": len(rows),
         "totalAmountC": total_sales,
@@ -339,6 +352,24 @@ def load_and_validate(path: Path, manifest_path: Path) -> tuple[list[dict[str, A
 
 
 def _conflict(existing: Mapping[str, Any], expected: Mapping[str, Any]) -> str | None:
+    if "monthlyCategories" in expected:
+        from sales_monthly_categories import validate_history
+        try:
+            old_categories = validate_history(existing.get("monthlyCategories", {}))
+            new_categories = validate_history(expected["monthlyCategories"])
+        except ValueError as exc:
+            return str(exc)
+        for month, value in old_categories.items():
+            if month not in new_categories or value != new_categories[month]:
+                return f"Historical category conflict at monthlyCategories.{month}"
+    for monthly_field in ("monthlyTotalsC", "monthlySalesC", "monthlyUnits"):
+        history = existing.get(monthly_field, {})
+        wanted = expected.get(monthly_field, {})
+        if not isinstance(history, Mapping) or not isinstance(wanted, Mapping):
+            return f"{monthly_field} must be an object"
+        for month, value in history.items():
+            if month not in wanted or not _strict_equal(value, wanted[month]):
+                return f"Historical Sales conflict at {monthly_field}.{month}"
     master = existing.get("master")
     if not isinstance(master, Mapping):
         return "master missing/not object"
@@ -396,7 +427,15 @@ def _strict_equal(left: Any, right: Any) -> bool:
 def _updates(existing: Mapping[str, Any], expected: Mapping[str, Any]) -> dict[str, Any]:
     updates: dict[str, Any] = {}
     for field in sorted(PIPELINE_ROOT_FIELDS):
+        if field == "monthlyCategories" and field not in expected:
+            continue
         wanted = expected.get(field)
+        if field in {"monthlyTotalsC", "monthlySalesC", "monthlyUnits", "monthlyCategories"} and isinstance(wanted, Mapping):
+            existing_months = existing.get(field, {})
+            for month, value in wanted.items():
+                if month not in existing_months:
+                    updates[f"{field}.{month}"] = value
+            continue
         if not _strict_equal(existing.get(field), wanted):
             updates[field] = wanted
     return updates
@@ -457,9 +496,25 @@ def _snapshot_token(snapshot: Any | None) -> tuple[bool, Any]:
 
 
 def _classify_snapshot(item: Mapping[str, Any], snapshot: Any | None) -> dict[str, Any]:
+    if item.get("createOnly") and snapshot is not None and snapshot.exists:
+        return {"masterId": str(item["masterId"]), "classification": "CONFLICT",
+            "reason": "Approved create target already exists; review required", "updates": {}, "preservedHash": None}
+    if "categoryRefresh" in item:
+        from sales_monthly_categories import classify
+        return classify(item, snapshot, datetime.now(UTC))
     doc_id = str(item["masterId"])
     expected = item["expected"]
     if snapshot is None or not snapshot.exists:
+        if "metadataRefresh" in item:
+            from sales_monthly_categories import metadata_patch, record_metadata_expectation
+            context = dict(item["metadataRefresh"])
+            context["creator"] = context["actor"]
+            for legacy_field in ("leakageCategory", "riskTier", "riskScore"):
+                expected.pop(legacy_field, None)
+            now = datetime.now(UTC)
+            metadata_updates = metadata_patch({}, context, now, now, True)
+            expected["metadata"] = {key.split(".")[1]: value for key, value in metadata_updates.items()}
+            record_metadata_expectation(item, expected, {})
         return {
             "masterId": doc_id,
             "classification": "CREATED",
@@ -480,13 +535,25 @@ def _classify_snapshot(item: Mapping[str, Any], snapshot: Any | None) -> dict[st
             "preservedHash": None,
         }
     changes = _updates(payload, expected)
+    preserved = _projection_hash(payload)
+    if "metadataRefresh" in item:
+        from sales_monthly_categories import metadata_patch, record_metadata_expectation
+        try:
+            metadata_updates = metadata_patch(payload, item["metadataRefresh"],
+                getattr(snapshot, "create_time", None), datetime.now(UTC), bool(changes))
+        except ValueError as exc:
+            return {"masterId": doc_id, "classification": "CONFLICT", "reason": str(exc),
+                "updates": {}, "preservedHash": None}
+        changes.update(metadata_updates)
+        record_metadata_expectation(item, payload, metadata_updates)
+        preserved = _projection_hash({k: v for k, v in payload.items() if k != "metadata"})
     return {
         "masterId": doc_id,
         "classification": "UPDATED" if changes else "UNCHANGED",
         "reason": None,
         "updates": changes,
         "snapshot": snapshot,
-        "preservedHash": _projection_hash(payload),
+        "preservedHash": preserved,
     }
 
 
@@ -518,8 +585,10 @@ def _build_write_batch(
         if operation["classification"] == "CREATED":
             batch.create(ref, operation["expected"])
         elif operation["classification"] == "UPDATED":
-            snapshot = operation["snapshot"]
-            update_time = getattr(snapshot, "update_time", None)
+            update_time = operation.get("updateTime")
+            if update_time is None:
+                snapshot = operation.get("snapshot")
+                update_time = getattr(snapshot, "update_time", None)
             if update_time is None:
                 raise RuntimeError(f"Missing update_time for {operation['masterId']}")
             batch.update(
@@ -653,6 +722,261 @@ def _write_operations_for_wave(
     return committed
 
 
+
+def classify_all(
+    *,
+    db: Any,
+    collection: Any,
+    rows: Sequence[Mapping[str, Any]],
+    stats: RefreshStats,
+    preserved_before: dict[str, str],
+    recovery_sink: Any = None,
+) -> list[dict[str, Any]]:
+    """Classify the complete intended run before any Firestore write begins.
+
+    The returned plan deliberately retains no Firestore snapshot objects and no
+    duplicate expected documents. Only the update-time token needed for an
+    optimistic update precondition is carried into the write phase.
+    """
+    plan: list[dict[str, Any]] = []
+    processed = 0
+    wave_number = 0
+
+    for wave_items in _chunks(rows):
+        wave_number += 1
+        refs = [collection.document(str(item["masterId"])) for item in wave_items]
+        snapshots = _bulk_snapshots(db, refs)
+        stats.read_waves += 1
+        compact_decisions: list[dict[str, Any]] = []
+
+        for item, ref in zip(wave_items, refs):
+            snapshot = _snapshot_for(snapshots, ref)
+            if recovery_sink is not None:
+                recovery_sink(item, snapshot)
+            decision = _classify_snapshot(item, snapshot)
+            _add_classification(stats, decision)
+
+            doc_id = str(decision["masterId"])
+            preserved_hash = decision.get("preservedHash")
+            if preserved_hash is not None:
+                preserved_before[doc_id] = str(preserved_hash)
+
+            compact_decisions.append(
+                {
+                    "masterId": doc_id,
+                    "classification": str(decision["classification"]),
+                    "reason": decision.get("reason"),
+                    "updates": dict(decision.get("updates") or {}),
+                    "updateTime": (
+                        getattr(snapshot, "update_time", None)
+                        if snapshot is not None and snapshot.exists
+                        else None
+                    ),
+                }
+            )
+
+        plan.append(
+            {
+                "waveNumber": wave_number,
+                "decisions": compact_decisions,
+            }
+        )
+        processed += len(wave_items)
+        print(
+            f"Stage 08 global preflight {processed:,}/{len(rows):,}: "
+            f"create={stats.created:,} update={stats.updated:,} "
+            f"unchanged={stats.unchanged:,} conflict={stats.conflicts:,} "
+            f"failed={stats.failed:,}; readWaves={stats.read_waves:,}; writes=0"
+        )
+
+    stats.global_preflight_complete = True
+    return plan
+
+
+def evaluate_global_gate(
+    *,
+    rows: Sequence[Mapping[str, Any]],
+    plan: Sequence[Mapping[str, Any]],
+    stats: RefreshStats,
+) -> None:
+    """Prove full-run accounting and conflict freedom before writes may start."""
+    planned_count = sum(len(wave["decisions"]) for wave in plan)
+    classified_count = (
+        stats.created
+        + stats.updated
+        + stats.unchanged
+        + stats.conflicts
+        + stats.failed
+    )
+
+    if not stats.global_preflight_complete:
+        raise RuntimeError("Stage 08 global preflight did not complete")
+
+    if (
+        stats.writes_attempted != 0
+        or stats.writes_succeeded != 0
+        or stats.write_waves_attempted != 0
+        or stats.write_waves_committed != 0
+    ):
+        raise RuntimeError(
+            "Stage 08 global preflight accounting gate observed writes before approval"
+        )
+
+    if (
+        planned_count != len(rows)
+        or classified_count != len(rows)
+        or stats.inspected != len(rows)
+    ):
+        raise RuntimeError(
+            "Stage 08 global preflight accounting imbalance: "
+            f"rows={len(rows)}; planned={planned_count}; "
+            f"classified={classified_count}; inspected={stats.inspected}"
+        )
+
+    if stats.conflicts or stats.failed:
+        raise RuntimeError(
+            "Stage 08 global preflight blocked before writes: "
+            f"conflicts={stats.conflicts}; failed={stats.failed}; "
+            "writeAttemptCount=0; firestoreWrites=0"
+        )
+
+    stats.global_preflight_gate_passed = True
+
+
+def _wave_evidence(
+    *,
+    wave_number: int,
+    operations: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    ids = [str(operation["masterId"]) for operation in operations]
+    return {
+        "waveNumber": wave_number,
+        "operationCount": len(operations),
+        "firstMasterId": ids[0] if ids else None,
+        "lastMasterId": ids[-1] if ids else None,
+    }
+
+
+def execute_global_plan(
+    *,
+    db: Any,
+    collection: Any,
+    rows: Sequence[Mapping[str, Any]],
+    plan: Sequence[Mapping[str, Any]],
+    stats: RefreshStats,
+    last_update_option_cls: Any,
+    concurrency_exceptions: tuple[type[BaseException], ...],
+    scope_guard: Any = None,
+) -> None:
+    """Execute a globally approved plan; stop on the first failed write wave."""
+    if not stats.global_preflight_gate_passed:
+        raise RuntimeError("Stage 08 write phase cannot start before the global gate passes")
+    if scope_guard is not None:
+        scope_guard(rows, plan)
+
+    item_by_id = {str(item["masterId"]): item for item in rows}
+
+    for wave in plan:
+        wave_number = int(wave["waveNumber"])
+        operations: list[dict[str, Any]] = []
+
+        for decision in wave["decisions"]:
+            classification = str(decision["classification"])
+            if classification not in {"CREATED", "UPDATED"}:
+                continue
+
+            doc_id = str(decision["masterId"])
+            operations.append(
+                {
+                    "masterId": doc_id,
+                    "classification": classification,
+                    "expected": item_by_id[doc_id]["expected"],
+                    "updates": dict(decision.get("updates") or {}),
+                    "updateTime": decision.get("updateTime"),
+                }
+            )
+
+        if not operations:
+            continue
+
+        if scope_guard is not None:
+            scope_guard(rows, plan)
+
+        evidence = _wave_evidence(
+            wave_number=wave_number,
+            operations=operations,
+        )
+        stats.maximum_write_operations_in_any_batch = max(
+            stats.maximum_write_operations_in_any_batch,
+            len(operations),
+        )
+        stats.write_waves_attempted += 1
+        stats.writes_attempted += len(operations)
+
+        batch = _build_write_batch(
+            db=db,
+            collection=collection,
+            operations=operations,
+            last_update_option_cls=last_update_option_cls,
+        )
+
+        try:
+            batch.commit()
+        except concurrency_exceptions as exc:
+            stats.precondition_conflicts += 1
+            stats.failed_write_wave = evidence
+            raise RuntimeError(
+                "Stage 08 refresh concurrency failure after global preflight: "
+                f"failedWriteWave={wave_number}; "
+                f"committedWriteWaves="
+                f"{[item['waveNumber'] for item in stats.committed_write_waves]}"
+            ) from exc
+        except Exception:
+            stats.failed_write_wave = evidence
+            raise
+
+        stats.write_waves_committed += 1
+        stats.writes_succeeded += len(operations)
+        stats.committed_write_waves.append(evidence)
+
+        print(
+            f"Stage 08 write wave {wave_number:,}: "
+            f"operations={len(operations):,}; "
+            f"writesSucceeded={stats.writes_succeeded:,}"
+        )
+
+
+def _failure_result(stats: RefreshStats) -> str:
+    if stats.failed_write_wave is not None:
+        return (
+            "REFRESH_ABORTED_PARTIAL"
+            if stats.writes_succeeded
+            else "REFRESH_ABORTED_NO_WRITE"
+        )
+    if not stats.global_preflight_gate_passed:
+        return "REFRESH_ABORTED_NO_WRITE"
+    return "FAILED"
+
+
+def _batch_evidence(stats: RefreshStats) -> dict[str, Any]:
+    return {
+        "firestoreBatchSize": FIRESTORE_BATCH_SIZE,
+        "readWaves": stats.read_waves,
+        "writeWavesAttempted": stats.write_waves_attempted,
+        "writeWavesCommitted": stats.write_waves_committed,
+        "committedWriteWaves": list(stats.committed_write_waves),
+        "failedWriteWave": stats.failed_write_wave,
+        "writeOperationsAttempted": stats.writes_attempted,
+        "writeOperationsSucceeded": stats.writes_succeeded,
+        "verificationReadWaves": stats.verification_read_waves,
+        "preconditionConflictCount": stats.precondition_conflicts,
+        "maximumWriteOperationsInAnyBatch": stats.maximum_write_operations_in_any_batch,
+        "globalPreflightComplete": stats.global_preflight_complete,
+        "globalPreflightGatePassed": stats.global_preflight_gate_passed,
+        "perDocumentFallback": False,
+    }
+
+
 def run_refresh(
     *,
     project_id: str,
@@ -662,12 +986,59 @@ def run_refresh(
     manifest_path: Path,
     report_dir: Path,
     preflight_only: bool,
+    category_package_path: Path | None = None,
+    category_package_sha256: str | None = None,
+    metadata_contract_path: Path | None = None,
+    metadata_contract_sha256: str | None = None,
+    june_package_path: Path | None = None,
+    june_package_sha256: str | None = None,
 ) -> Path:
     if project_id != confirm_project:
         raise ValueError("Project confirmation mismatch")
     if not service_account_path.is_file():
         raise FileNotFoundError(f"Service account not found: {service_account_path}")
-    rows, evidence = load_and_validate(input_path, manifest_path)
+    june_ids = None
+    scope_guard = None
+    if june_package_path is not None:
+        if any(value is not None for value in (input_path, manifest_path, category_package_path,
+                category_package_sha256, metadata_contract_path, metadata_contract_sha256)):
+            raise ValueError("June baseline mode cannot use cumulative/Stage06/category inputs")
+        from sales_june_baseline import load_june_package, exact_ids, guard_plan
+        rows, evidence, june_ids = load_june_package(june_package_path, june_package_sha256, project_id)
+        exact_ids((row["masterId"] for row in rows), june_ids)
+        scope_guard = lambda selected, plan: guard_plan(selected, plan, june_ids)
+    else:
+        rows, evidence = load_and_validate(input_path, manifest_path)
+    if category_package_path is not None:
+        from sales_monthly_categories import load_package
+        rows, category_evidence = load_package(category_package_path,
+            category_package_sha256, rows, project_id)
+        evidence["monthlyCategoryPackage"] = category_evidence
+        evidence["governedMonth"] = category_evidence["month"]
+        evidence["categoryPackageSha256"] = category_evidence["sha256"]
+        evidence["classificationSourceSha256"] = category_evidence["source"]["sha256"]
+        if "populationSnapshotSha256" in category_evidence:
+            evidence["populationSnapshotSha256"] = category_evidence["populationSnapshotSha256"]
+        evidence["categoryExceptions"] = category_evidence["categoryExceptions"]
+        # Exception identities are included in the actual read scope; there is
+        # no uninspected identity allowance for population publication.
+        evidence["categoryExceptionDocumentIds"] = []
+    elif category_package_sha256:
+        raise ValueError("Category SHA requires a category package")
+    if metadata_contract_path:
+        if category_package_path:
+            raise ValueError("Category package already owns metadata; no separate metadata contract")
+        from sales_monthly_categories import load_metadata_contract
+        evidence["metadataContract"] = load_metadata_contract(metadata_contract_path,
+            metadata_contract_sha256, rows, project_id)
+    elif metadata_contract_sha256:
+        raise ValueError("Metadata SHA requires a metadata contract")
+    if not preflight_only and not category_package_path and not metadata_contract_path and not june_package_path:
+        raise ValueError("Material refresh requires an approved metadata contract; preflight remains read-only")
+    scope_ids = sorted(str(row["masterId"]) for row in rows)
+    evidence["scopeDocumentIds"] = scope_ids
+    evidence["scopeDocumentIdsSha256"] = canonical_sha256(scope_ids)
+    evidence["scopeRecordCount"] = len(scope_ids)
     try:
         sa = json.loads(service_account_path.read_text(encoding="utf-8"))
     except Exception as exc:
@@ -723,51 +1094,86 @@ def run_refresh(
         temp.replace(report_path)
 
     try:
-        processed = 0
-        for wave_items in _chunks(rows):
-            refs = [collection.document(str(item["masterId"])) for item in wave_items]
-            snapshots = _bulk_snapshots(db, refs)
-            stats.read_waves += 1
-            classified = [
-                _classify_snapshot(item, _snapshot_for(snapshots, ref))
-                for item, ref in zip(wave_items, refs)
-            ]
-
-            if preflight_only:
-                for decision in classified:
-                    _add_classification(stats, decision)
-            else:
-                try:
-                    _write_operations_for_wave(
-                        db=db,
-                        collection=collection,
-                        wave_items=wave_items,
-                        classified=classified,
-                        stats=stats,
-                        preserved_before=preserved_before,
-                        last_update_option_cls=LastUpdateOption,
-                        concurrency_exceptions=concurrency_exceptions,
-                    )
-                except systemic_exceptions:
-                    raise
-
-            processed += len(wave_items)
-            print(
-                f"Stage 08 refresh progress {processed:,}/{len(rows):,}: "
-                f"create={stats.created:,} update={stats.updated:,} unchanged={stats.unchanged:,} "
-                f"conflict={stats.conflicts:,} failed={stats.failed:,}; "
-                f"readWaves={stats.read_waves:,} writeWaves={stats.write_waves_committed:,}"
+        # A category migration captures typed before-images from the same reads
+        # used for global classification. No additional Firestore reads or
+        # snapshots retained in the compact plan are needed.
+        recovery_path = report_path.with_suffix(".before.jsonl")
+        recovery_stream = None
+        recovery_count = 0
+        def capture_before_image(item, snapshot):
+            nonlocal recovery_count
+            from sales_monthly_categories import encode_before_image
+            recovery_stream.write(json.dumps(encode_before_image(item, snapshot),
+                sort_keys=True, separators=(",", ":")) + "\n")
+            recovery_count += 1
+        try:
+            if june_package_path is not None or ((category_package_path is not None or metadata_contract_path is not None) and not preflight_only):
+                recovery_stream = recovery_path.open("x", encoding="utf-8", newline="\n")
+            if june_ids is not None:
+                exact_ids((row["masterId"] for row in rows), june_ids)
+            global_plan = classify_all(
+                db=db,
+                collection=collection,
+                rows=rows,
+                stats=stats,
+                preserved_before=preserved_before,
+                recovery_sink=capture_before_image if recovery_stream else None,
             )
+        finally:
+            if recovery_stream:
+                recovery_stream.flush()
+                os.fsync(recovery_stream.fileno())
+                recovery_stream.close()
+                report["recoveryEvidence"] = {"path": str(recovery_path),
+                    "sha256": _sha(recovery_path), "records": recovery_count,
+                    "complete": recovery_count == len(rows),
+                    "format": "Firestore-protobuf-JSONL", "remoteBackup": False}
+        evaluate_global_gate(
+            rows=rows,
+            plan=global_plan,
+            stats=stats,
+        )
+        if scope_guard is not None:
+            scope_guard(rows, global_plan)
 
-        classified_count = stats.created + stats.updated + stats.unchanged + stats.conflicts + stats.failed
-        if classified_count != stats.rows or stats.inspected != stats.rows:
-            raise RuntimeError(
-                f"Stage 08 refresh accounting imbalance: rows={stats.rows}; "
-                f"classified={classified_count}; inspected={stats.inspected}"
-            )
-        if stats.conflicts or stats.failed:
-            raise RuntimeError(
-                f"Stage 08 refresh blocked/incomplete: conflicts={stats.conflicts}; failed={stats.failed}"
+        if recovery_stream is not None and (recovery_count != len(rows)
+                or report.get("recoveryEvidence", {}).get("complete") is not True):
+            raise RuntimeError("Recovery before-image accounting incomplete; writes blocked")
+
+        if recovery_stream is not None:
+            from sales_monthly_categories import encode_write_plan
+            plan_path = report_path.with_suffix(".plan.jsonl")
+            item_by_id = {str(item["masterId"]): item for item in rows}
+            plan_count = 0
+            with plan_path.open("x", encoding="utf-8", newline="\n") as stream:
+                for wave in global_plan:
+                    for decision in wave["decisions"]:
+                        stream.write(json.dumps(encode_write_plan(decision,
+                            item_by_id[decision["masterId"]]), sort_keys=True, separators=(",", ":")) + "\n")
+                        plan_count += 1
+                stream.flush()
+                os.fsync(stream.fileno())
+            report["planEvidence"] = {"path": str(plan_path), "sha256": _sha(plan_path),
+                "records": plan_count, "complete": plan_count == len(rows),
+                "scopeDocumentIdsSha256": evidence["scopeDocumentIdsSha256"],
+                "categoryPackageSha256": evidence.get("categoryPackageSha256"),
+                "format": "Firestore-protobuf-patch-JSONL"}
+            if plan_count != len(rows):
+                raise RuntimeError("Recovery planned-patch accounting incomplete; writes blocked")
+            # Persist the admission evidence before the first commit, so a
+            # process interruption still leaves reviewable recovery bindings.
+            write_report()
+
+        if not preflight_only:
+            execute_global_plan(
+                db=db,
+                collection=collection,
+                rows=rows,
+                plan=global_plan,
+                stats=stats,
+                last_update_option_cls=LastUpdateOption,
+                concurrency_exceptions=concurrency_exceptions,
+                scope_guard=scope_guard,
             )
 
         verification: dict[str, Any] = {"status": "NOT_RUN" if preflight_only else "PASS"}
@@ -787,10 +1193,23 @@ def run_refresh(
                     if snap is None or not snap.exists:
                         raise RuntimeError(f"Post-write verification missing {doc_id}")
                     payload = snap.to_dict() or {}
-                    _verify_doc(payload, item_by_id[doc_id]["expected"])
+                    item = item_by_id[doc_id]
+                    if "categoryRefresh" in item:
+                        from sales_monthly_categories import verify
+                        verify(payload, item)
+                    else:
+                        _verify_doc(payload, item["expected"])
+                        if "metadataRefresh" in item:
+                            from sales_monthly_categories import verify_metadata
+                            verify_metadata(payload, item)
                     if doc_id in preserved_before:
                         before_hash = preserved_before[doc_id]
-                        after_hash = _projection_hash(payload)
+                        if "categoryRefresh" in item:
+                            from sales_monthly_categories import preserved_hash
+                            context = item["categoryRefresh"]
+                            after_hash = preserved_hash(payload, context["month"] if context["category"] is not None else None)
+                        else:
+                            after_hash = _projection_hash({k: v for k, v in payload.items() if k != "metadata"}) if "metadataRefresh" in item else _projection_hash(payload)
                         if before_hash != after_hash:
                             raise RuntimeError(
                                 f"Stage 08 changed non-pipeline-owned fields for {doc_id}"
@@ -811,18 +1230,7 @@ def run_refresh(
                 "maximumReferencesPerWave": FIRESTORE_BATCH_SIZE,
             }
 
-        batch_evidence = {
-            "firestoreBatchSize": FIRESTORE_BATCH_SIZE,
-            "readWaves": stats.read_waves,
-            "writeWavesAttempted": stats.write_waves_attempted,
-            "writeWavesCommitted": stats.write_waves_committed,
-            "writeOperationsAttempted": stats.writes_attempted,
-            "writeOperationsSucceeded": stats.writes_succeeded,
-            "verificationReadWaves": stats.verification_read_waves,
-            "preconditionConflictCount": stats.precondition_conflicts,
-            "maximumWriteOperationsInAnyBatch": stats.maximum_write_operations_in_any_batch,
-            "perDocumentFallback": False,
-        }
+        batch_evidence = _batch_evidence(stats)
         report.update({
             "rowsRead": stats.rows,
             "recordsInspected": stats.inspected,
@@ -848,7 +1256,11 @@ def run_refresh(
                 "writes_attempted": stats.writes_attempted,
                 "writes_succeeded": stats.writes_succeeded,
             },
-            "firestoreWrites": 0 if preflight_only else stats.writes_succeeded,
+            "firestoreWrites": stats.writes_succeeded,
+            "globalPreflight": {
+                "complete": stats.global_preflight_complete,
+                "gatePassed": stats.global_preflight_gate_passed,
+            },
             "updatesOrCreatesOnly": True,
             "deletes": 0,
             "preservedOperationalFields": [
@@ -871,19 +1283,14 @@ def run_refresh(
             "writeSuccessCount": stats.writes_succeeded,
             "conflicts": stats.conflict_records,
             "failedRecords": stats.failure_records,
-            "batchEvidence": {
-                "firestoreBatchSize": FIRESTORE_BATCH_SIZE,
-                "readWaves": stats.read_waves,
-                "writeWavesAttempted": stats.write_waves_attempted,
-                "writeWavesCommitted": stats.write_waves_committed,
-                "writeOperationsAttempted": stats.writes_attempted,
-                "writeOperationsSucceeded": stats.writes_succeeded,
-                "verificationReadWaves": stats.verification_read_waves,
-                "preconditionConflictCount": stats.precondition_conflicts,
-                "maximumWriteOperationsInAnyBatch": stats.maximum_write_operations_in_any_batch,
-                "perDocumentFallback": False,
+            "batchEvidence": _batch_evidence(stats),
+            "firestoreWrites": stats.writes_succeeded,
+            "globalPreflight": {
+                "complete": stats.global_preflight_complete,
+                "gatePassed": stats.global_preflight_gate_passed,
             },
-            "status": "FAIL", "result": "FAILED",
+            "status": "FAIL",
+            "result": _failure_result(stats),
             "errorType": type(exc).__name__, "error": str(exc),
             "deletes": 0,
         })

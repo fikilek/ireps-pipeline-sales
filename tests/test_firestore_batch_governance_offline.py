@@ -25,7 +25,7 @@ class FirestoreBatchGovernanceTests(unittest.TestCase):
 
     def test_rules_lock_400_and_cross_collection_transaction_exception(self) -> None:
         rules = source("rules/SALES_PIPELINE_RULES.md")
-        self.assertIn("**Version:** 1.10.0", rules)
+        self.assertIn("**Version:** 1.12.1", rules)
         self.assertIn("FIRESTORE_BATCH_SIZE = 400", rules)
         self.assertIn("maximum logical meters per transaction = 200", rules)
         self.assertIn("no more than 400 document references", rules)
@@ -50,6 +50,17 @@ class FirestoreBatchGovernanceTests(unittest.TestCase):
         self.assertNotIn("db.transaction()", text)
         self.assertNotIn("@firestore.transactional", text)
         self.assertIn("preflight_refresh_documents", text)
+
+    def test_stage04_monthly_source_refresh_uses_preconditioned_writebatch(self) -> None:
+        text = source("scripts/04_upload_conlog_monthly_v3.py")
+        self.assertIn('choices=("create-only", "refresh", "resume")', text)
+        self.assertIn("SOURCE_ORIGIN_MONTHLY", text)
+        self.assertIn("batch.create(", text)
+        self.assertIn("batch.update(", text)
+        self.assertIn("LastUpdateOption", text)
+        self.assertIn('"perDocumentFallback": False', text)
+        self.assertNotIn("batch.set(", text)
+        self.assertNotIn("batch.delete(", text)
 
     def test_visibility_reconciliation_uses_200_meter_batched_transaction_exception(self) -> None:
         text = source("scripts/sales_pipeline_visibility_reconciliation_dev.py")

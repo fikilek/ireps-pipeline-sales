@@ -5,9 +5,9 @@ This helper is intentionally DEV-only and hard-gated to Firebase project `ireps2
 
 For every requested month it:
 1. validates the exact Stage 03B BUILD_WRITTEN manifest locally;
-2. runs the existing Stage 04 script in preflight-only/create-only mode;
+2. runs Stage 04 in the selected create-only or monthly_source refresh preflight mode;
 3. validates the generated Stage 04 preflight report;
-4. runs the existing Stage 04 script in execute-upload/create-only mode;
+4. runs Stage 04 in the same selected execute-upload mode;
 5. validates the generated Stage 04 upload report and post-write verification;
 6. stops immediately on the first failure.
 
@@ -15,7 +15,8 @@ Safety:
 - target project must be exactly ireps2;
 - service-account project must be exactly ireps2;
 - Stage 04 script SHA256 must match the approved cleanup-fixed version;
-- Stage 04 is always invoked with mode=create-only;
+- Stage 04 is invoked with explicit mode=create-only or mode=refresh;
+- refresh remains monthly_source-only and never deletes documents;
 - no delete/update/overwrite option exists here;
 - all Stage 03B manifests are validated before the first Firestore call;
 - a fresh Stage 04 preflight occurs immediately before each month's write;
@@ -44,7 +45,7 @@ DEFAULT_LOG_DIR = PROJECT_ROOT / "output" / "logs" / "monthly_dev_upload_range"
 
 DEV_PROJECT_ID = "ireps2"
 EXPECTED_STAGE04_SHA256 = (
-    "a7beda289328650b5153d04da3f46ef21fcb09406dc9280b75a978c1de2772d9"
+    "da10225a7de887da5123d62f9819b619e732556693ae5caf936328aa9f759f9d"
 )
 EXPECTED_STAGE04_SCRIPT = "04_upload_conlog_monthly_v3.py"
 
@@ -64,7 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Upload a governed monthly-source month range to ireps2 DEV using "
-            "Stage 04 create-only semantics."
+            "Stage 04 create-only or controlled refresh semantics."
         )
     )
     parser.add_argument("--project-id", required=True)
@@ -77,6 +78,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vending-provider-id", required=True)
     parser.add_argument("--source-run-id", required=True)
     parser.add_argument("--expected-input-sha256", required=True)
+    parser.add_argument(
+        "--mode",
+        choices=("create-only", "refresh"),
+        default="create-only",
+        help="Stage 04 DEV range mode. refresh is monthly_source-only recurring refresh.",
+    )
     parser.add_argument("--stage04-script", type=Path, default=DEFAULT_STAGE04_SCRIPT)
     parser.add_argument("--manifest-dir", type=Path, default=DEFAULT_MANIFEST_DIR)
     parser.add_argument("--log-dir", type=Path, default=DEFAULT_LOG_DIR)
@@ -320,6 +327,7 @@ def validate_common_stage04_report(
     month: str,
     provider: str,
     vending_provider_id: str,
+    mode: str,
 ) -> None:
     expected = {
         "stage": "04",
@@ -327,7 +335,7 @@ def validate_common_stage04_report(
         "status": "PASS",
         "result": result,
         "operation": operation,
-        "mode": "create-only",
+        "mode": mode,
         "targetProject": project_id,
         "confirmProject": project_id,
         "credentialProject": project_id,
@@ -369,6 +377,7 @@ def validate_preflight_report(
     month: str,
     provider: str,
     vending_provider_id: str,
+    mode: str,
 ) -> dict[str, Any]:
     report = read_json(path)
     validate_common_stage04_report(
@@ -380,6 +389,7 @@ def validate_preflight_report(
         month=month,
         provider=provider,
         vending_provider_id=vending_provider_id,
+        mode=mode,
     )
 
     inputs = report.get("inputs")
@@ -398,28 +408,45 @@ def validate_preflight_report(
         rows = int(source.get("rows", -1))
         before = int(state.get("documentsBefore", -1))
         planned = int(state.get("documentsPlanned", -1))
+        planned_create = int(state.get("documentsPlannedCreate", -1))
+        planned_update = int(state.get("documentsPlannedUpdate", -1))
+        unchanged = int(state.get("unchangedDocuments", -1))
         conflicts = int(state.get("conflictCount", -1))
         extras = int(state.get("extraDocumentCount", -1))
 
-        if before != 0:
-            raise ValueError(
-                f"Create-only DEV scope is not empty for {dataset}/{month}: "
-                f"documentsBefore={before}"
-            )
         if conflicts != 0 or extras != 0:
             raise ValueError(
                 f"Conflict/extra detected for {dataset}/{month}: "
                 f"conflicts={conflicts}, extras={extras}"
             )
-        if planned != rows:
+        if planned != planned_create + planned_update:
             raise ValueError(
-                f"Planned/input row mismatch for {dataset}/{month}: "
-                f"planned={planned}, rows={rows}"
+                f"Planned write accounting mismatch for {dataset}/{month}: "
+                f"planned={planned}, create={planned_create}, update={planned_update}"
             )
+        if planned_create + planned_update + unchanged != rows:
+            raise ValueError(
+                f"Preflight/input accounting mismatch for {dataset}/{month}: "
+                f"create={planned_create}, update={planned_update}, "
+                f"unchanged={unchanged}, rows={rows}"
+            )
+        if mode == "create-only":
+            if before != 0:
+                raise ValueError(
+                    f"Create-only DEV scope is not empty for {dataset}/{month}: "
+                    f"documentsBefore={before}"
+                )
+            if planned_create != rows or planned_update != 0 or unchanged != 0:
+                raise ValueError(
+                    f"Create-only accounting mismatch for {dataset}/{month}"
+                )
 
         datasets[dataset] = {
             "rows": rows,
             "existing": before,
+            "create": planned_create,
+            "update": planned_update,
+            "unchanged": unchanged,
             "planned": planned,
             "conflicts": conflicts,
             "extra": extras,
@@ -446,6 +473,7 @@ def validate_upload_report(
     month: str,
     provider: str,
     vending_provider_id: str,
+    mode: str,
 ) -> dict[str, Any]:
     report = read_json(path)
     validate_common_stage04_report(
@@ -457,20 +485,27 @@ def validate_upload_report(
         month=month,
         provider=provider,
         vending_provider_id=vending_provider_id,
+        mode=mode,
     )
 
     inputs = report.get("inputs")
     created = report.get("documentsCreated")
+    updated = report.get("documentsUpdated")
+    unchanged = report.get("documentsUnchanged")
     verification = report.get("verification")
     if (
         not isinstance(inputs, dict)
         or not isinstance(created, dict)
+        or not isinstance(updated, dict)
+        or not isinstance(unchanged, dict)
         or not isinstance(verification, dict)
     ):
         raise ValueError(f"Stage 04 upload verification evidence missing for {month}")
 
     datasets: dict[str, Any] = {}
     total_created = 0
+    total_updated = 0
+    total_unchanged = 0
     for dataset in DATASET_ORDER:
         source = inputs.get(dataset)
         verify = verification.get(dataset)
@@ -479,41 +514,68 @@ def validate_upload_report(
 
         rows = int(source.get("rows", -1))
         created_count = int(created.get(dataset, -1))
+        updated_count = int(updated.get(dataset, -1))
+        unchanged_count = int(unchanged.get(dataset, -1))
         expected_count = int(verify.get("expectedCount", -1))
         final_count = int(verify.get("finalCount", -1))
         count_status = clean(verify.get("countVerification"))
         sample_status = clean(verify.get("sampleVerification"))
+        full_status = clean(verify.get("fullDocumentVerification"))
 
-        if created_count != rows:
+        if created_count + updated_count + unchanged_count != rows:
             raise ValueError(
-                f"Created/input mismatch for {dataset}/{month}: "
-                f"created={created_count}, rows={rows}"
+                f"Upload accounting mismatch for {dataset}/{month}: "
+                f"created={created_count}, updated={updated_count}, "
+                f"unchanged={unchanged_count}, rows={rows}"
+            )
+        if mode == "create-only" and (
+            created_count != rows or updated_count != 0 or unchanged_count != 0
+        ):
+            raise ValueError(
+                f"Create-only upload accounting mismatch for {dataset}/{month}"
             )
         if expected_count != rows or final_count != rows:
             raise ValueError(
                 f"Final count mismatch for {dataset}/{month}: "
                 f"rows={rows}, expected={expected_count}, final={final_count}"
             )
-        if count_status != "PASS" or sample_status != "PASS":
+        if count_status != "PASS":
             raise ValueError(
-                f"Verification failed for {dataset}/{month}: "
-                f"count={count_status!r}, sample={sample_status!r}"
+                f"Count verification failed for {dataset}/{month}: {count_status!r}"
+            )
+        if mode == "refresh":
+            if full_status != "PASS":
+                raise ValueError(
+                    f"Full refresh verification failed for {dataset}/{month}: "
+                    f"{full_status!r}"
+                )
+        elif sample_status != "PASS":
+            raise ValueError(
+                f"Sample verification failed for {dataset}/{month}: {sample_status!r}"
             )
 
         datasets[dataset] = {
             "rows": rows,
             "created": created_count,
+            "updated": updated_count,
+            "unchanged": unchanged_count,
             "expectedCount": expected_count,
             "finalCount": final_count,
             "countVerification": count_status,
             "sampleVerification": sample_status,
+            "fullDocumentVerification": full_status,
         }
         total_created += created_count
+        total_updated += updated_count
+        total_unchanged += unchanged_count
 
     return {
         "reportPath": str(path),
         "datasets": datasets,
         "totalCreated": total_created,
+        "totalUpdated": total_updated,
+        "totalUnchanged": total_unchanged,
+        "totalWrites": total_created + total_updated,
         "sourceFingerprint": clean(
             (report.get("sourceContract") or {}).get("fingerprint")
             if isinstance(report.get("sourceContract"), dict)
@@ -591,9 +653,9 @@ def main() -> int:
         "status": "STARTED",
         "result": "STARTED",
         "targetProject": DEV_PROJECT_ID,
-        "writeSemantics": "create-only",
+        "writeSemantics": args.mode,
         "deletesAllowed": False,
-        "updatesAllowed": False,
+        "updatesAllowed": args.mode == "refresh",
         "startedAt": utc_iso(started),
         "months": [],
     }
@@ -628,6 +690,7 @@ def main() -> int:
                 "manifestDir": str(manifest_dir),
                 "preflightReportDir": str(preflight_root),
                 "uploadReportDir": str(upload_root),
+                "mode": args.mode,
             }
         )
 
@@ -643,8 +706,9 @@ def main() -> int:
         print(f"Source run         : {source_run_id}")
         print(f"Input SHA256       : {expected_input_sha}")
         print(f"Stage 04 SHA256    : {EXPECTED_STAGE04_SHA256}")
-        print("Write mode         : create-only")
-        print("Updates/deletes    : NEVER")
+        print(f"Write mode         : {args.mode}")
+        print(f"Updates allowed    : {args.mode == 'refresh'}")
+        print("Deletes            : NEVER")
         print("Stop on first fail : YES")
         print("=" * 76)
         print("[LOCAL GATE] Validating all Stage 03B manifests before Firestore access...")
@@ -670,6 +734,8 @@ def main() -> int:
         print("")
 
         total_created = 0
+        total_updated = 0
+        total_unchanged = 0
 
         for index, month in enumerate(months, start=1):
             current_month = month
@@ -706,7 +772,7 @@ def main() -> int:
                 "--manifest",
                 str(manifests[month]),
                 "--mode",
-                "create-only",
+                args.mode,
                 "--vending-provider-id",
                 vending_provider_id,
             ]
@@ -736,6 +802,7 @@ def main() -> int:
                 month=month,
                 provider=provider,
                 vending_provider_id=vending_provider_id,
+                mode=args.mode,
             )
             month_result["preflight"] = preflight
 
@@ -744,7 +811,7 @@ def main() -> int:
                 "conflicts=0 | extra=0"
             )
             print("")
-            print("[STEP B] Stage 04 create-only upload + post-write verification")
+            print(f"[STEP B] Stage 04 {args.mode} upload + post-write verification")
 
             upload_command = common + [
                 "--log-dir",
@@ -765,9 +832,16 @@ def main() -> int:
                     if failure_reports
                     else "No Stage 04 failure report was found."
                 )
+                recovery_action = (
+                    "review the failure report, then rerun the same governed refresh "
+                    "after resolving any conflict"
+                    if args.mode == "refresh"
+                    else "review the failure report before using governed resume"
+                )
                 raise RuntimeError(
                     f"Stage 04 upload failed for {month} (exit code {upload_rc}). "
-                    f"STOPPED. Review/resume from: {failure_hint}"
+                    f"STOPPED. Failure report: {failure_hint}. Next action: "
+                    f"{recovery_action}."
                 )
 
             upload_report_path = exactly_one_report(
@@ -783,6 +857,7 @@ def main() -> int:
                 month=month,
                 provider=provider,
                 vending_provider_id=vending_provider_id,
+                mode=args.mode,
             )
 
             if preflight["sourceFingerprint"] != upload["sourceFingerprint"]:
@@ -792,21 +867,24 @@ def main() -> int:
                     f"upload={upload['sourceFingerprint']}"
                 )
 
-            if preflight["totalPlanned"] != upload["totalCreated"]:
+            if preflight["totalPlanned"] != upload["totalWrites"]:
                 raise RuntimeError(
-                    f"Planned/created total mismatch for {month}: "
+                    f"Planned/write total mismatch for {month}: "
                     f"planned={preflight['totalPlanned']}, "
-                    f"created={upload['totalCreated']}"
+                    f"writes={upload['totalWrites']}"
                 )
 
             month_result["upload"] = upload
             month_result["status"] = "PASS"
             total_created += int(upload["totalCreated"])
+            total_updated += int(upload["totalUpdated"])
+            total_unchanged += int(upload["totalUnchanged"])
 
             print("")
             print(
                 f"[MONTH VERIFIED] {month} | created={upload['totalCreated']:,} | "
-                "count verification=PASS | sample verification=PASS"
+                f"updated={upload['totalUpdated']:,} | "
+                f"unchanged={upload['totalUnchanged']:,} | verification=PASS"
             )
             print("")
 
@@ -817,6 +895,9 @@ def main() -> int:
                 "monthsPassed": len(months),
                 "monthsFailed": 0,
                 "totalDocumentsCreated": total_created,
+                "totalDocumentsUpdated": total_updated,
+                "totalDocumentsUnchanged": total_unchanged,
+                "totalWriteOperations": total_created + total_updated,
             }
         )
 
@@ -827,8 +908,9 @@ def main() -> int:
         print(f"Months uploaded         : {len(months):,}")
         print("Months failed           : 0")
         print(f"Total documents created : {total_created:,}")
-        print("Write semantics         : create-only")
-        print("Updates                 : 0")
+        print(f"Total documents updated : {total_updated:,}")
+        print(f"Total unchanged         : {total_unchanged:,}")
+        print(f"Write semantics         : {args.mode}")
         print("Deletes                 : 0")
         print("Post-write verification : PASS for every month")
         print("=" * 76)
@@ -855,11 +937,18 @@ def main() -> int:
         print(f"Failed month : {current_month}", file=sys.stderr)
         print(f"Reason       : {exc}", file=sys.stderr)
         print("No later month was attempted.", file=sys.stderr)
-        print(
-            "If Stage 04 partially wrote the failed month, use its governed "
-            "resume mode only after reviewing the failure report.",
-            file=sys.stderr,
-        )
+        if args.mode == "refresh":
+            print(
+                "For refresh failures, review the Stage 04 report and rerun the same "
+                "governed refresh only after resolving conflicts; do not switch to resume.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "If Stage 04 partially wrote the failed month, use its governed "
+                "resume mode only after reviewing the failure report.",
+                file=sys.stderr,
+            )
         print("=" * 76, file=sys.stderr)
         return 1
 

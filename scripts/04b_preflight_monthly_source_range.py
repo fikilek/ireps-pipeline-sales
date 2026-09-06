@@ -67,6 +67,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vending-provider-id", required=True)
     parser.add_argument("--source-run-id", required=True)
     parser.add_argument("--expected-input-sha256", required=True)
+    parser.add_argument(
+        "--mode",
+        choices=("create-only", "refresh"),
+        default="create-only",
+        help="Stage 04 preflight mode. refresh is monthly_source-only recurring refresh.",
+    )
     parser.add_argument("--stage04-script", type=Path, default=DEFAULT_STAGE04_SCRIPT)
     parser.add_argument("--manifest-dir", type=Path, default=DEFAULT_MANIFEST_DIR)
     parser.add_argument("--log-dir", type=Path, default=DEFAULT_LOG_DIR)
@@ -277,6 +283,7 @@ def validate_stage04_report(
     month: str,
     provider: str,
     vending_provider_id: str,
+    mode: str,
 ) -> dict[str, Any]:
     report = read_json(path)
 
@@ -286,7 +293,7 @@ def validate_stage04_report(
         "status": "PASS",
         "result": EXPECTED_STAGE04_RESULT,
         "operation": "preflight-only",
-        "mode": "create-only",
+        "mode": mode,
         "targetProject": project_id,
         "confirmProject": project_id,
         "credentialProject": project_id,
@@ -346,31 +353,50 @@ def validate_stage04_report(
 
         documents_before = int(state.get("documentsBefore", -1))
         planned = int(state.get("documentsPlanned", -1))
+        planned_create = int(state.get("documentsPlannedCreate", -1))
+        planned_update = int(state.get("documentsPlannedUpdate", -1))
+        unchanged = int(state.get("unchangedDocuments", -1))
         conflicts = int(state.get("conflictCount", -1))
         extras = int(state.get("extraDocumentCount", -1))
         input_rows = int(source.get("rows", -1))
 
-        if documents_before != 0:
-            raise ValueError(
-                f"Create-only preflight expected empty DEV scope for {dataset}/{month}; "
-                f"documentsBefore={documents_before}"
-            )
         if conflicts != 0 or extras != 0:
             raise ValueError(
                 f"Preflight conflict/extra detected for {dataset}/{month}: "
                 f"conflicts={conflicts}, extras={extras}"
             )
-        if planned != input_rows:
+        if planned != planned_create + planned_update:
             raise ValueError(
-                f"Planned/input row mismatch for {dataset}/{month}: "
-                f"planned={planned}, inputRows={input_rows}"
+                f"Planned write accounting mismatch for {dataset}/{month}: "
+                f"planned={planned}, create={planned_create}, update={planned_update}"
             )
+        if planned_create + planned_update + unchanged != input_rows:
+            raise ValueError(
+                f"Refresh accounting/input mismatch for {dataset}/{month}: "
+                f"create={planned_create}, update={planned_update}, "
+                f"unchanged={unchanged}, rows={input_rows}"
+            )
+        if mode == "create-only":
+            if documents_before != 0:
+                raise ValueError(
+                    f"Create-only preflight expected empty scope for {dataset}/{month}; "
+                    f"documentsBefore={documents_before}"
+                )
+            if planned_create != input_rows or planned_update != 0 or unchanged != 0:
+                raise ValueError(
+                    f"Create-only accounting mismatch for {dataset}/{month}: "
+                    f"create={planned_create}, update={planned_update}, "
+                    f"unchanged={unchanged}, rows={input_rows}"
+                )
 
         month_result["datasets"][dataset] = {
             "collection": clean(state.get("collection")),
             "rows": input_rows,
             "existing": documents_before,
-            "create": planned,
+            "create": planned_create,
+            "update": planned_update,
+            "unchanged": unchanged,
+            "plannedWrites": planned,
             "conflicts": conflicts,
             "extra": extras,
         }
@@ -402,9 +428,15 @@ def write_sweep_report(
                 "month",
                 "status",
                 "monthlyCreate",
+                "monthlyUpdate",
+                "monthlyUnchanged",
                 "monthlyLmCreate",
+                "monthlyLmUpdate",
+                "monthlyLmUnchanged",
                 "monthlyLmGroupsCreate",
-                "totalCreate",
+                "monthlyLmGroupsUpdate",
+                "monthlyLmGroupsUnchanged",
+                "totalWrites",
                 "stage04Report",
             ],
         )
@@ -416,11 +448,21 @@ def write_sweep_report(
                     "month": item.get("month"),
                     "status": item.get("status"),
                     "monthlyCreate": (datasets.get("monthly") or {}).get("create", ""),
+                    "monthlyUpdate": (datasets.get("monthly") or {}).get("update", ""),
+                    "monthlyUnchanged": (datasets.get("monthly") or {}).get("unchanged", ""),
                     "monthlyLmCreate": (datasets.get("monthly_lm") or {}).get("create", ""),
+                    "monthlyLmUpdate": (datasets.get("monthly_lm") or {}).get("update", ""),
+                    "monthlyLmUnchanged": (datasets.get("monthly_lm") or {}).get("unchanged", ""),
                     "monthlyLmGroupsCreate": (
                         datasets.get("monthly_lm_groups") or {}
                     ).get("create", ""),
-                    "totalCreate": item.get("plannedDocuments", ""),
+                    "monthlyLmGroupsUpdate": (
+                        datasets.get("monthly_lm_groups") or {}
+                    ).get("update", ""),
+                    "monthlyLmGroupsUnchanged": (
+                        datasets.get("monthly_lm_groups") or {}
+                    ).get("unchanged", ""),
+                    "totalWrites": item.get("plannedDocuments", ""),
                     "stage04Report": item.get("stage04Report", ""),
                 }
             )
@@ -471,6 +513,7 @@ def main() -> int:
                 "manifestDir": str(manifest_dir),
                 "stage04Script": str(stage04_script),
                 "stage04ReportDir": str(stage04_report_dir),
+                "mode": args.mode,
             }
         )
 
@@ -486,7 +529,7 @@ def main() -> int:
         print(f"Range         : {args.from_month} -> {args.to_month} ({len(months)} months)")
         print(f"Source run    : {source_run_id}")
         print(f"Input SHA256  : {expected_sha}")
-        print("Stage 04 mode : create-only / preflight-only")
+        print(f"Stage 04 mode : {args.mode} / preflight-only")
         print("Firestore writes requested: NO")
         print("=" * 72)
         print("[LOCAL GATE] Validating every Stage 03B manifest before Firestore reads...")
@@ -532,7 +575,7 @@ def main() -> int:
                 "--manifest",
                 str(manifests[month]),
                 "--mode",
-                "create-only",
+                args.mode,
                 "--vending-provider-id",
                 vending_provider_id,
                 "--log-dir",
@@ -572,6 +615,7 @@ def main() -> int:
                 month=month,
                 provider=provider,
                 vending_provider_id=vending_provider_id,
+                mode=args.mode,
             )
             summary["months"].append(month_result)
             total_planned += int(month_result["plannedDocuments"])
@@ -579,10 +623,10 @@ def main() -> int:
             d = month_result["datasets"]
             print(
                 f"[MONTH PASS] {month} | "
-                f"monthly={d['monthly']['create']:,} | "
-                f"lm={d['monthly_lm']['create']:,} | "
-                f"groups={d['monthly_lm_groups']['create']:,} | "
-                f"total={month_result['plannedDocuments']:,}"
+                f"monthly C/U={d['monthly']['create']:,}/{d['monthly']['update']:,} | "
+                f"lm C/U={d['monthly_lm']['create']:,}/{d['monthly_lm']['update']:,} | "
+                f"groups C/U={d['monthly_lm_groups']['create']:,}/{d['monthly_lm_groups']['update']:,} | "
+                f"writes={month_result['plannedDocuments']:,}"
             )
             print("")
 

@@ -1,13 +1,215 @@
 # iREPS Sales Pipeline Rules
 
+## 2026-09-05 final-state monthly refresh cutover
+
+This controlling amendment supersedes conflicting Stage 1 transition wording in section 0D and historical rules below. The related schema is `sales_all_meters` v1.4.1. It records local implementation requirements, not deployed or migrated status.
+
+`monthlyCategories` is the only category authority. Read the explicitly selected/report month; absent exact-month data renders unavailable/NAv. No scalar fallback, per-meter latest category substitution, Demo Sales restoration or internal classifier is permitted. Default the view to the latest successfully governed and published scope month.
+
+Existing root `leakageCategory`, `riskTier` and `riskScore` are frozen, legacy and non-authoritative. Preserve them without update or deletion. Preserve `salesStatus` behaviour and operational ownership unchanged.
+
+Global preflight classifies the whole intended run, checks complete accounting and rejects any history/identity conflict before writes. Normal refresh appends only approved exact month children; it cannot shrink or rewrite history. Preserve valid `created*`; material writes alone advance `updated*`. Missing creation metadata requires authoritative per-document first-capture evidence. The recorded DEV SPU UID/user convention is `fXBACUfMzybcqC0AbeNeyYyTeRu1` / `Fikile Kentane`, as evidenced by `ireps-web/functions/scripts/ireps2-users-20260621-2233.json`; do not use that user record's timestamp as Sales creation time or substitute the migration operator.
+
+Supplier population is complete membership evidence, not classification or purchasing membership. Store immutable SHA-256-addressed snapshots at `governed-sales/{lmPcode}/{provider}/snapshots/{sha256}.json` in the configured Storage bucket, following schema v1.4.1's artifact contract. Serve through an authenticated scope-authorized backend. Direct client access is denied. Do not add a `monthlyPopulation` map or population business collection.
+
+The scope's `publication.json` may advance only after sequential June, July and August data execution and exact verification. A local plan, partial commit or passing preflight is insufficient. Use immutable snapshot hashes, publication generation preconditions and recovery evidence. Preserve exact partial results because Firestore write waves are not collectively atomic. No remote publication or database writes are authorized by this local rules amendment.
+
+Stage 14 remains separate: enrichment requires authoritative one-to-one linkage and preserves ambiguity as exceptions. Address parsing and candidate lists alone cannot authorize cadastral relationships. Preserve existing values and metadata; conflicting populated evidence requires separate correction. No canonical `sgCode`/`erfNo` projection is established in the inspected Sales schema: retain `sg.prclKey` as source evidence and block projection until its destination semantics are settled.
+
+Reason: user approved final-state cutover and one coordinated local completion pass. Effect: align writers, readers and release evidence without scalar fallback. Migration action: prepare one consolidated release approval; execute no remote changes before that approval.
+
 **File:** `rules/SALES_PIPELINE_RULES.md`
 **Project:** `C:\dev\ireps-pipeline-sales`
 **Status:** Governing project rules
-**Version:** 1.10.0
-**Effective date:** 2026-08-13
-**Current phase:** Sales Enrich v1 + governed Firestore 400-batch execution
+**Version:** 1.12.1
+**Effective date:** 2026-09-05
+**Current phase:** Sales Monthly Refresh + Population — final local cutover contract; not released
 **Canonical Atomic provider:** Conlog; approved monthly-source providers remain bound by frozen source contracts
 **Current Sales Enrich regression LM / workbase:** Endumeni — `ZA5241`
+
+---
+
+## 0D. Version 1.12.0 — Sales monthly categories and standard metadata amendment
+
+This section is the controlling amendment for the Sales Monthly Refresh + Population workstream. Where an older Sales All rule later in this historical file conflicts specifically with `monthlyCategories`, standard Sales `metadata`, legacy root category authority, or the exact category-write contract below, this section and `sales_all_meters` schema v1.4.0 govern. Unrelated historical rules remain unchanged.
+
+### 0D.1 Scope and non-regression boundary
+
+This amendment adds governance for:
+
+```text
+monthlyCategories
+metadata
+```
+
+It does **not** redesign the already-working `salesStatus` contract. Existing `salesStatus` ownership, values and monotonic lifecycle behaviour remain unchanged and must be preserved by every new Sales Pipeline path.
+
+It also does not create a Sales population field, a Firestore population collection, an iREPS category classifier, or a Targeted Batch redesign.
+
+### 0D.2 Governing principle — persist truth, calculate convenience
+
+Do not persist properties for facts that can be deterministically calculated from canonical data already stored.
+
+Persist source/authoritative truth and necessary provenance. Calculate derived convenience/read-model values on demand.
+
+The current sprint therefore does not add Sales roots such as:
+
+```text
+monthlyPopulation
+earliestPurchaseMonth
+firstObservedSalesMonth
+lastPurchaseMonth
+rolling3MonthSales
+rolling5MonthSales
+rolling12MonthSales
+meterJoinKey
+```
+
+### 0D.3 Category authority and monthly source mapping
+
+Mpilo is the authoritative classifier for the current sprint. iREPS does not calculate CAT1–CAT8 and must not implement an internal classifier.
+
+The governed mapping is:
+
+```text
+2026-06 -> June workbook   -> Leakage_Category
+2026-07 -> July workbook   -> July_2026_Category
+2026-08 -> August workbook -> August_2026_Category
+future  -> month workbook  -> <MonthName>_<YYYY>_Category
+```
+
+For July and August, `Leakage_Category` is the retained June baseline/reference and is not the current-month category.
+
+`Risk_Tier` and `Risk_Score` are scoped to the terminal month of the corresponding classification workbook unless a later supplier contract explicitly introduces month-specific variants.
+
+A classification row does not create Sales population identity. Category evidence may be attached only to an eligible governed Sales document. Unmatched classification-source identities are external exceptions and must not create Sales documents.
+
+### 0D.4 Canonical `monthlyCategories` contract
+
+The canonical Sales All shape is month-keyed:
+
+```json
+"monthlyCategories": {
+  "2026-06": {
+    "leakageCategory": "...",
+    "riskTier": "...",
+    "riskScore": 6
+  },
+  "2026-07": {
+    "leakageCategory": "...",
+    "riskTier": "...",
+    "riskScore": 4
+  }
+}
+```
+
+Each month child contains exactly:
+
+```text
+leakageCategory
+riskTier
+riskScore
+```
+
+`riskScore` is a non-negative Firestore integer. Boolean, float, string and null representations are invalid. No permanent maximum such as 16 is hard-coded unless the authoritative supplier contract explicitly fixes it.
+
+Missing authoritative category month means the key is absent. Do not persist `NAv - Not Available` or another manufactured placeholder. UI readers may display an unavailable state for an absent month.
+
+CAT7 remains supported even when a source month contains zero CAT7 rows.
+
+### 0D.5 Historical category safety
+
+Normal monthly refresh is append-only at the exact month-child path.
+
+For the governed month `M`:
+
+```text
+missing monthlyCategories.M       -> eligible CREATE of that child
+identical monthlyCategories.M     -> UNCHANGED / no category write
+different monthlyCategories.M     -> CONFLICT
+historical month missing/drifted  -> FAIL CLOSED according to governed preflight
+```
+
+Normal refresh must never replace the whole `monthlyCategories` map.
+
+A later month must preserve all earlier month children value-for-value according to the canonical Firestore comparison contract.
+
+Historical correction is a separate governed correction operation and is not normal monthly refresh.
+
+### 0D.6 Standard six-field Sales metadata
+
+The canonical Sales metadata map contains exactly:
+
+```text
+createdAt
+createdByUid
+createdByUser
+updatedAt
+updatedByUid
+updatedByUser
+```
+
+`createdAt` and `updatedAt` are Firestore Timestamps.
+
+`createdAt`, `createdByUid` and `createdByUser` are the immutable creation triple. They identify when and by whom the Sales identity first entered iREPS; `createdAt` is not the commercial Sales month and must not be replaced with the current migration timestamp.
+
+For the governed migration of the original Endumeni 10,216 Sales documents, the creation actor is the approved SPU user identity and the creation time must come from authoritative original iREPS Sales creation/first-capture evidence. The exact UID/user values are resolved at migration execution and must not be invented in code or documentation.
+
+`updatedAt`, `updatedByUid` and `updatedByUser` are changed together only when an approved writer performs a material Sales document mutation. Idempotent/no-op processing must not advance the update triple.
+
+The names `createdByLabel` and `updatedByLabel` are prohibited.
+
+### 0D.7 Writer ownership after metadata introduction
+
+The existing business-path ownership rules remain in force.
+
+An approved writer may mutate only its already-owned business path(s), plus the standard metadata update triple required by a material successful Sales document mutation.
+
+The metadata introduction therefore supersedes older Sales All statements that prohibit all metadata or state that an operational writer may touch literally no path other than its business path. The business ownership itself does not expand.
+
+Examples:
+
+- a visibility bridge still owns only its approved `master` path for business data, but a successful material visibility mutation also updates the metadata update triple;
+- a Targeted lifecycle writer still owns only its approved Targeted / `salesStatus` business path(s), plus the metadata update triple when it materially changes the Sales document;
+- Stage 08 category refresh owns the exact current-month `monthlyCategories.<YYYY-MM>` child plus the metadata update triple;
+- no writer may rewrite the immutable metadata creation triple after it is established.
+
+Stage 2 must make legitimate backend writers compatible with this rule before the first migration write.
+
+### 0D.8 Legacy root category fields — Stage 1 non-change boundary
+
+The existing root fields:
+
+```text
+leakageCategory
+riskTier
+riskScore
+```
+
+remain under their current compatibility behaviour during Stage 1. This amendment does not delete, rewrite, reclassify or formally freeze them.
+
+Their formal `LEGACY / FROZEN / NON-AUTHORITATIVE` transition belongs to the separately approved **Stage 13 — Legacy Category Freeze**, after the preceding compatibility and consumer stages are complete.
+
+Stage 1 therefore authorizes no behavioural change to these existing roots.
+
+### 0D.9 `salesStatus` preservation
+
+The approved `salesStatus` contract remains unchanged.
+
+Stage 06 must not derive or reset it. Stage 08 must preserve an existing valid value. Operational lifecycle writers continue to use the already-approved ownership and monotonic transition rules.
+
+No part of the Sales Monthly Refresh + Population workstream may reopen or behaviorally redesign `salesStatus` unless a separate defect is proven and explicitly approved.
+
+### 0D.10 Stage 1 acceptance boundary
+
+Stage 1 is complete when:
+
+1. `sales_all_meters` schema v1.4.0 is locked with `monthlyCategories` and the six-field metadata contract;
+2. this rules file is versioned to 1.12.0 with the same contract;
+3. the existing `salesStatus` amendment is preserved without behavioural change;
+4. no implementation code, Firestore data or runtime behaviour has yet been changed by Stage 1.
+
+The next stage is backend compatibility. No Firestore migration is authorized by this amendment alone.
 
 ---
 
@@ -324,6 +526,193 @@ perDocumentFallback = false
 The cross-collection transaction exception should report the corresponding transaction-wave counts and maximum reads/writes per transaction.
 
 Offline tests must prove the 400-operation partition, precondition propagation, create-only semantics, zero writes in preflight-only mode, bounded failed-wave recovery, no per-document fallback, exact-path preservation, and non-regression of already compliant Stage 02/04/07-create/08-initial-load paths before any Firestore execution.
+
+
+## 0C. Version 1.11.0 — Stage 04 monthly-source recurring refresh amendment
+
+This section is the controlling Stage 04 amendment for recurring `monthly_source` uploads. It supersedes later historical Stage 04 statements that limit every Stage 04 execution to `create-only` / `resume` and create operations only. The Atomic Stage 03 path is not changed by this amendment.
+
+### 0C.1 Scope boundary
+
+Stage 04 keeps the existing execution grain:
+
+```text
+one Firebase project + one LM + one month per execution
+```
+
+The existing Atomic source path remains governed by:
+
+```text
+create-only
+resume
+```
+
+`refresh` is approved only when the accepted Stage 03 manifest has:
+
+```text
+stage        = 03B
+sourceOrigin = monthly_source
+result       = BUILD_WRITTEN
+status       = PASS
+```
+
+An Atomic manifest supplied with `--mode refresh` must fail before Firebase starts.
+
+### 0C.2 Distinct mode meanings
+
+Stage 04 modes have separate meanings:
+
+```text
+create-only = first creation into an empty LM/month scope
+refresh     = recurring reconciliation of a governed monthly_source LM/month
+resume      = restricted recovery of the exact same failed create-only/resume upload contract
+```
+
+`resume` is not refresh and must not authorise changed business data. A failed refresh is reviewed and then rerun as the same governed refresh; it must not be converted into `resume`.
+
+### 0C.3 Refresh classifications
+
+For every expected monthly-source document, Stage 04 refresh must classify exactly one of:
+
+```text
+CREATED    expected locally and missing in Firestore
+UNCHANGED  existing document exactly matches the governed expected document
+UPDATED    existing compatible document has changed refresh-owned values
+CONFLICT   existing document violates identity, source, shape or type governance
+```
+
+Every expected input row must be accounted for exactly once. Identical documents receive no write.
+
+Unexpected existing documents inside the requested LM/month scope are conflicts. Refresh must not delete, hide, merge, or silently retain an unexplained extra scope member and still declare the month verified.
+
+### 0C.4 Monthly-source ownership and immutable fields
+
+The Firestore document ID is always immutable.
+
+For `conlog_sales_monthly`, these existing fields are immutable during refresh:
+
+```text
+sourceOrigin
+provider
+lmPcode
+meterNo
+ym
+y
+m
+```
+
+The refresh-owned mutable fields are:
+
+```text
+amountTotalC
+unitsTotal
+salesGroupId
+salesGroupLabel
+sourceDocumentId
+sourceEndRow
+```
+
+For `conlog_sales_monthly_lm`, these existing fields are immutable:
+
+```text
+sourceOrigin
+provider
+lmPcode
+ym
+y
+m
+```
+
+The refresh-owned mutable fields are:
+
+```text
+metersCount
+amountTotalC
+unitsTotal
+zeroSalesMetersCount
+```
+
+For `conlog_sales_monthly_lm_groups`, these existing fields are immutable:
+
+```text
+sourceOrigin
+provider
+lmPcode
+ym
+y
+m
+salesGroupId
+```
+
+The refresh-owned mutable fields are:
+
+```text
+salesGroupLabel
+metersCount
+amountTotalC
+unitsTotal
+zeroSalesMetersCount
+```
+
+An existing document must have the exact governed monthly-source field set. Missing fields, extra fields, invalid Firestore types, immutable-value drift, missing update-time evidence, or an incompatible source/provider identity are `CONFLICT`; refresh must not repair them silently.
+
+### 0C.5 Refresh write mechanics
+
+Missing expected documents use:
+
+```python
+batch.create(document_ref, expected_document)
+```
+
+Changed compatible documents use only exact refresh-owned field updates with the public Firestore update-time precondition contract:
+
+```python
+batch.update(
+    document_ref,
+    changed_refresh_owned_fields,
+    option=LastUpdateOption(snapshot.update_time),
+)
+```
+
+Stage 04 refresh must never use:
+
+```text
+set()
+merge=True
+whole-document blind replacement
+delete()
+per-document network write fallback
+```
+
+No refresh execution may change an immutable field.
+
+### 0C.6 Governed 400-wave execution and verification
+
+Version 1.10.0 batching remains binding. Expected-document preflight reads and post-write verification reads use governed `get_all` waves of no more than 400 document references. Multi-document writes use WriteBatch commits of no more than 400 create/update operations.
+
+Refresh updates must carry the preflight snapshot update-time precondition. A concurrency or write failure stops the run; no per-document fallback is permitted.
+
+After execution, Stage 04 refresh must verify:
+
+- the LM/month scope count equals the governed expected row count;
+- every expected document exists;
+- every expected document exactly matches the governed monthly-source document after the write;
+- no unexpected scope document remains;
+- created, updated and unchanged counts reconcile exactly to the input rows for each of the three datasets.
+
+The Stage 04 audit report must record create/update/unchanged/conflict/extra counts, governed batch size, read/write wave evidence, write-operation counts, verification evidence, and `perDocumentFallback = false`.
+
+### 0C.7 Range helper contract
+
+`scripts/04b_preflight_monthly_source_range.py` may orchestrate either `create-only` or `refresh` preflight across an explicit continuous range, but it still invokes the core Stage 04 uploader once per month and never exposes a Firestore write operation itself.
+
+`scripts/04c_upload_monthly_source_range_dev.py` may orchestrate either `create-only` or `refresh` in `ireps2` DEV only. It must use the same mode for the fresh preflight and execute-upload of each month, stop on the first failed month, and verify the Stage 04 report before advancing.
+
+### 0C.8 Canonical schema gate
+
+The July 2026 monthly collection schemas predate the governed monthly-source document profile and still describe create-only Atomic-shaped fields. They must be amended and approved in the authoritative schema repository before any Stage 04 monthly-source `--execute-upload --mode refresh` is authorised against Firestore.
+
+Pipeline-side implementation and offline tests may be prepared and reviewed before that schema amendment. No DEV, TEST or LIVE refresh write is approved until the authoritative schemas and the Master Dictionary agree with this section.
 
 
 ## 1. Purpose

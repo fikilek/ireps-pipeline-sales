@@ -15,9 +15,13 @@ Safety model:
     - source manifest, exact origin-specific CSV schemas, SHA-256, identities, and reconciliation;
     - governed vending-provider document must exist and be active;
     - create-only for normal uploads;
+    - monthly_source refresh is a distinct recurring mode: missing documents are created,
+      compatible changed pipeline-owned fields are preconditioned updates, and identical
+      documents receive no write;
     - resume only with a previous failed Stage 04 execute-upload report that proves
       the exact same project, LM, month, Stage 03 manifest, input SHA set, and planned IDs;
-    - Firestore create operations only: no merge, update, delete, or silent skip;
+    - Atomic remains create-only/resume; refresh is prohibited for Atomic inputs;
+    - no merge, delete, blind overwrite, or silent conflict skip;
     - all three target scopes are preflighted before any write;
     - post-upload counts and deterministic sample verification;
     - JSON audit report for every preflight or upload attempt.
@@ -32,7 +36,7 @@ import io
 import json
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -278,6 +282,14 @@ class MonthlyDataset:
     file_sha256: str
 
 
+@dataclass(frozen=True)
+class PlannedUpdate:
+    document_id: str
+    updates: dict[str, Any]
+    update_time: Any
+    differing_fields: tuple[str, ...]
+
+
 @dataclass
 class ExistingState:
     count: int
@@ -288,6 +300,47 @@ class ExistingState:
     missing_ids: list[str]
     conflict_examples: list[dict[str, Any]]
     extra_examples: list[str]
+    updated: int = 0
+    update_operations: list[PlannedUpdate] = field(default_factory=list)
+    read_waves: int = 0
+
+
+MONTHLY_SOURCE_REFRESH_IMMUTABLE_FIELDS = {
+    "monthly": {
+        "sourceOrigin",
+        "provider",
+        "lmPcode",
+        "meterNo",
+        "ym",
+        "y",
+        "m",
+    },
+    "monthly_lm": {
+        "sourceOrigin",
+        "provider",
+        "lmPcode",
+        "ym",
+        "y",
+        "m",
+    },
+    "monthly_lm_groups": {
+        "sourceOrigin",
+        "provider",
+        "lmPcode",
+        "ym",
+        "y",
+        "m",
+        "salesGroupId",
+    },
+}
+
+MONTHLY_SOURCE_INTEGER_DOCUMENT_FIELDS = {
+    "y",
+    "m",
+    "metersCount",
+    "amountTotalC",
+    "zeroSalesMetersCount",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -308,8 +361,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mode",
         required=True,
-        choices=("create-only", "resume"),
-        help="create-only is normal; resume is only for verified partial-upload recovery.",
+        choices=("create-only", "refresh", "resume"),
+        help=(
+            "create-only is normal; refresh is governed recurring monthly_source; "
+            "resume is only verified partial-upload recovery."
+        ),
     )
     parser.add_argument(
         "--resume-report",
@@ -1841,12 +1897,20 @@ def build_source_contract(
         "fingerprint": canonical_json_sha256(contract_core),
     }
 
+def validate_mode_source_contract(mode: str, source_origin: str) -> None:
+    if mode == "refresh" and source_origin != SOURCE_ORIGIN_MONTHLY:
+        raise ValueError(
+            "Stage 04 refresh is approved only for sourceOrigin=monthly_source; "
+            "Atomic remains create-only/resume"
+        )
+
+
 def validate_resume_contract(
     args: argparse.Namespace,
     *,
     source_contract: dict[str, Any],
 ) -> Optional[dict[str, Any]]:
-    if args.mode == "create-only":
+    if args.mode in {"create-only", "refresh"}:
         if args.resume_report is not None:
             raise ValueError(
                 "--resume-report is only valid when --mode resume"
@@ -2038,6 +2102,180 @@ def strict_document_differences(
     return sorted(differences)
 
 
+def is_valid_monthly_source_document_value(field_name: str, value: Any) -> bool:
+    if field_name in MONTHLY_SOURCE_INTEGER_DOCUMENT_FIELDS:
+        return type(value) is int
+    if field_name == "unitsTotal":
+        return type(value) is float
+    if field_name == "sourceEndRow":
+        return value is None or type(value) is int
+    return type(value) is str
+
+
+def classify_monthly_source_refresh_snapshot(
+    dataset: MonthlyDataset,
+    snapshot: Any,
+    expected: dict[str, Any],
+) -> tuple[str, Optional[PlannedUpdate], list[str]]:
+    actual = snapshot.to_dict()
+    if type(actual) is not dict:
+        return "CONFLICT", None, ["<document>"]
+
+    expected_fields = set(expected)
+    actual_fields = set(actual)
+    shape_drift = sorted(expected_fields ^ actual_fields)
+    if shape_drift:
+        return "CONFLICT", None, shape_drift
+
+    invalid_types = sorted(
+        field_name
+        for field_name, actual_value in actual.items()
+        if not is_valid_monthly_source_document_value(field_name, actual_value)
+    )
+    if invalid_types:
+        return "CONFLICT", None, invalid_types
+
+    immutable_fields = MONTHLY_SOURCE_REFRESH_IMMUTABLE_FIELDS[dataset.dataset]
+    immutable_differences = sorted(
+        field_name
+        for field_name in immutable_fields
+        if actual[field_name] != expected[field_name]
+        or type(actual[field_name]) is not type(expected[field_name])
+    )
+    if immutable_differences:
+        return "CONFLICT", None, immutable_differences
+
+    mutable_fields = expected_fields - immutable_fields
+    differing_fields = sorted(
+        field_name
+        for field_name in mutable_fields
+        if actual[field_name] != expected[field_name]
+        or type(actual[field_name]) is not type(expected[field_name])
+    )
+    if not differing_fields:
+        return "UNCHANGED", None, []
+
+    update_time = getattr(snapshot, "update_time", None)
+    if update_time is None:
+        return "CONFLICT", None, ["<updateTime>"]
+
+    updates = {field_name: expected[field_name] for field_name in differing_fields}
+    return (
+        "UPDATED",
+        PlannedUpdate(
+            document_id=str(snapshot.id),
+            updates=updates,
+            update_time=update_time,
+            differing_fields=tuple(differing_fields),
+        ),
+        differing_fields,
+    )
+
+
+def bulk_get_expected_snapshots(
+    db: Any,
+    dataset: MonthlyDataset,
+    document_ids: list[str],
+) -> tuple[dict[str, Any], int]:
+    snapshots: dict[str, Any] = {}
+    read_waves = 0
+    for chunk in batched(document_ids, BATCH_SIZE):
+        refs = [
+            db.collection(dataset.collection).document(document_id)
+            for document_id in chunk
+        ]
+        read_waves += 1
+        for snapshot in db.get_all(refs):
+            snapshots[str(snapshot.id)] = snapshot
+    return snapshots, read_waves
+
+
+def inspect_refresh_state(
+    db: Any,
+    dataset: MonthlyDataset,
+    *,
+    lm_pcode: str,
+    month: str,
+) -> ExistingState:
+    if "sourceOrigin" not in dataset.frame.columns:
+        raise ValueError("Stage 04 refresh is only approved for monthly_source inputs")
+
+    scope_count = query_count(scope_query(db, dataset.collection, lm_pcode, month))
+    frame_by_id = dataset.frame.set_index("docId", drop=False)
+    expected_ids = sorted(frame_by_id.index.map(str).tolist())
+    snapshots, read_waves = bulk_get_expected_snapshots(db, dataset, expected_ids)
+
+    missing_ids: list[str] = []
+    update_operations: list[PlannedUpdate] = []
+    conflict_examples: list[dict[str, Any]] = []
+    matching = 0
+    conflicts = 0
+    present_in_requested_scope = 0
+
+    for document_id in expected_ids:
+        snapshot = snapshots.get(document_id)
+        if snapshot is None or not bool(getattr(snapshot, "exists", False)):
+            missing_ids.append(document_id)
+            continue
+
+        actual = snapshot.to_dict() or {}
+        if (
+            type(actual) is dict
+            and actual.get("lmPcode") == lm_pcode
+            and actual.get("ym") == month
+        ):
+            present_in_requested_scope += 1
+
+        expected = row_to_document(dataset.dataset, frame_by_id.loc[document_id])
+        classification, update_operation, differing = (
+            classify_monthly_source_refresh_snapshot(dataset, snapshot, expected)
+        )
+        if classification == "UNCHANGED":
+            matching += 1
+        elif classification == "UPDATED":
+            if update_operation is None:
+                raise RuntimeError("Refresh classification produced no update operation")
+            update_operations.append(update_operation)
+        else:
+            conflicts += 1
+            if len(conflict_examples) < 5:
+                conflict_examples.append(
+                    {
+                        "docId": document_id,
+                        "differingFields": differing,
+                        "classification": "CONFLICT",
+                    }
+                )
+
+    extra = scope_count - present_in_requested_scope
+    if extra < 0:
+        raise ValueError(
+            f"Refresh scope accounting failed for {dataset.collection}: "
+            f"scopeCount={scope_count}, expectedInScope={present_in_requested_scope}"
+        )
+
+    accounted = matching + len(update_operations) + conflicts + len(missing_ids)
+    if accounted != len(expected_ids):
+        raise ValueError(
+            f"Refresh did not account for all {dataset.dataset} rows: "
+            f"accounted={accounted}, expected={len(expected_ids)}"
+        )
+
+    return ExistingState(
+        count=scope_count,
+        matching=matching,
+        missing=len(missing_ids),
+        conflicts=conflicts,
+        extra=extra,
+        missing_ids=missing_ids,
+        conflict_examples=conflict_examples,
+        extra_examples=[],
+        updated=len(update_operations),
+        update_operations=update_operations,
+        read_waves=read_waves,
+    )
+
+
 def inspect_existing_state(
     db: Any,
     dataset: MonthlyDataset,
@@ -2046,6 +2284,14 @@ def inspect_existing_state(
     month: str,
     mode: str,
 ) -> ExistingState:
+    if mode == "refresh":
+        return inspect_refresh_state(
+            db,
+            dataset,
+            lm_pcode=lm_pcode,
+            month=month,
+        )
+
     query = scope_query(db, dataset.collection, lm_pcode, month)
     expected_ids = set(dataset.frame["docId"].tolist())
 
@@ -2143,6 +2389,155 @@ def create_documents(
             f"created {len(chunk):,} (total {created:,}/{len(document_ids):,})"
         )
     return created, committed
+
+
+def last_update_option(update_time: Any) -> Any:
+    try:
+        from google.cloud.firestore_v1 import LastUpdateOption
+    except ImportError as exc:
+        raise RuntimeError(
+            "google-cloud-firestore LastUpdateOption is required for Stage 04 refresh"
+        ) from exc
+    return LastUpdateOption(update_time)
+
+
+def write_refresh_documents(
+    db: Any,
+    dataset: MonthlyDataset,
+    state: ExistingState,
+) -> dict[str, int]:
+    frame_by_id = dataset.frame.set_index("docId", drop=False)
+    planned: list[tuple[str, str, Optional[PlannedUpdate]]] = []
+    planned.extend((document_id, "CREATE", None) for document_id in state.missing_ids)
+    planned.extend(
+        (operation.document_id, "UPDATE", operation)
+        for operation in state.update_operations
+    )
+    planned.sort(key=lambda item: (item[0], item[1]))
+
+    if not planned:
+        return {
+            "created": 0,
+            "updated": 0,
+            "committedBatches": 0,
+            "writeOperationsAttempted": 0,
+            "writeOperationsSucceeded": 0,
+            "maximumWriteOperationsInAnyBatch": 0,
+        }
+
+    total_batches = (len(planned) + BATCH_SIZE - 1) // BATCH_SIZE
+    created = 0
+    updated = 0
+    committed = 0
+    maximum_batch = 0
+
+    for number, chunk in enumerate(batched(planned, BATCH_SIZE), start=1):
+        batch = db.batch()
+        chunk_created = 0
+        chunk_updated = 0
+        for document_id, operation_type, update_operation in chunk:
+            document_ref = db.collection(dataset.collection).document(document_id)
+            if operation_type == "CREATE":
+                row = frame_by_id.loc[document_id]
+                batch.create(
+                    document_ref,
+                    row_to_document(dataset.dataset, row),
+                )
+                chunk_created += 1
+                continue
+
+            if update_operation is None:
+                raise RuntimeError(
+                    f"Missing refresh update operation for {dataset.collection}/{document_id}"
+                )
+            batch.update(
+                document_ref,
+                update_operation.updates,
+                option=last_update_option(update_operation.update_time),
+            )
+            chunk_updated += 1
+
+        batch.commit()
+        committed += 1
+        created += chunk_created
+        updated += chunk_updated
+        maximum_batch = max(maximum_batch, len(chunk))
+        print(
+            f"  - {dataset.collection} batch {number}/{total_batches}: "
+            f"created {chunk_created:,}, updated {chunk_updated:,} "
+            f"(writes {len(chunk):,})"
+        )
+
+    return {
+        "created": created,
+        "updated": updated,
+        "committedBatches": committed,
+        "writeOperationsAttempted": len(planned),
+        "writeOperationsSucceeded": created + updated,
+        "maximumWriteOperationsInAnyBatch": maximum_batch,
+    }
+
+
+def verify_refresh_post_upload(
+    db: Any,
+    dataset: MonthlyDataset,
+    *,
+    lm_pcode: str,
+    month: str,
+) -> dict[str, Any]:
+    final_count = query_count(scope_query(db, dataset.collection, lm_pcode, month))
+    expected_count = len(dataset.frame)
+    if final_count != expected_count:
+        raise ValueError(
+            f"{dataset.collection} refresh count verification failed: "
+            f"expected {expected_count}, found {final_count}"
+        )
+
+    frame_by_id = dataset.frame.set_index("docId", drop=False)
+    expected_ids = sorted(frame_by_id.index.map(str).tolist())
+    snapshots, read_waves = bulk_get_expected_snapshots(db, dataset, expected_ids)
+    mismatch_examples: list[dict[str, Any]] = []
+    missing_count = 0
+    mismatch_count = 0
+
+    for document_id in expected_ids:
+        snapshot = snapshots.get(document_id)
+        if snapshot is None or not bool(getattr(snapshot, "exists", False)):
+            missing_count += 1
+            if len(mismatch_examples) < 5:
+                mismatch_examples.append(
+                    {"docId": document_id, "differingFields": ["<missing>"]}
+                )
+            continue
+
+        expected = row_to_document(dataset.dataset, frame_by_id.loc[document_id])
+        actual = snapshot.to_dict() or {}
+        differing = strict_document_differences(actual, expected)
+        if differing:
+            mismatch_count += 1
+            if len(mismatch_examples) < 5:
+                mismatch_examples.append(
+                    {"docId": document_id, "differingFields": differing}
+                )
+
+    if missing_count or mismatch_count:
+        raise ValueError(
+            f"{dataset.collection} refresh verification failed: "
+            f"missing={missing_count}, mismatched={mismatch_count}, "
+            f"examples={mismatch_examples}"
+        )
+
+    return {
+        "expectedCount": expected_count,
+        "finalCount": final_count,
+        "countVerification": "PASS",
+        "fullDocumentVerification": "PASS",
+        "documentsVerified": expected_count,
+        "verificationReadWaves": read_waves,
+        "mismatchCount": 0,
+        "missingCount": 0,
+        "mismatchExamples": [],
+    }
 
 
 def deterministic_sample_ids(frame: pd.DataFrame) -> list[str]:
@@ -2250,7 +2645,11 @@ def main() -> int:
     firebase_app = None
     db = None
     created_counts = {dataset: 0 for dataset in COLLECTIONS}
+    updated_counts = {dataset: 0 for dataset in COLLECTIONS}
     committed_counts = {dataset: 0 for dataset in COLLECTIONS}
+    write_operations_attempted = {dataset: 0 for dataset in COLLECTIONS}
+    write_operations_succeeded = {dataset: 0 for dataset in COLLECTIONS}
+    maximum_batch_operations = {dataset: 0 for dataset in COLLECTIONS}
 
     try:
         validate_month(args.month)
@@ -2272,6 +2671,7 @@ def main() -> int:
                 f"Atomic Stage 03 uploads remain governed for "
                 f"{CONLOG_VENDING_PROVIDER_ID!r}"
             )
+        validate_mode_source_contract(args.mode, source_origin)
 
         datasets = {
             dataset: validate_dataset(
@@ -2361,13 +2761,30 @@ def main() -> int:
                 "collection": datasets[dataset].collection,
                 "documentsBefore": state.count,
                 "matchingDocuments": state.matching,
-                "documentsPlanned": state.missing,
+                "unchangedDocuments": state.matching,
+                "documentsPlanned": state.missing + state.updated,
+                "documentsPlannedCreate": state.missing,
+                "documentsPlannedUpdate": state.updated,
+                "preflightReadWaves": state.read_waves,
                 "conflictCount": state.conflicts,
                 "extraDocumentCount": state.extra,
                 "conflictExamples": state.conflict_examples,
                 "extraDocumentExamples": state.extra_examples,
             }
             for dataset, state in states.items()
+        }
+        report["firestoreBatching"] = {
+            "firestoreBatchSize": BATCH_SIZE,
+            "preflightReadWaves": {
+                dataset: states[dataset].read_waves for dataset in COLLECTIONS
+            },
+            "writeWavesCommitted": {dataset: 0 for dataset in COLLECTIONS},
+            "writeOperationsAttempted": {dataset: 0 for dataset in COLLECTIONS},
+            "writeOperationsSucceeded": {dataset: 0 for dataset in COLLECTIONS},
+            "maximumWriteOperationsInAnyBatch": {
+                dataset: 0 for dataset in COLLECTIONS
+            },
+            "perDocumentFallback": False,
         }
 
         print("[STAGE 04] MONTHLY SALES CSVs -> FIRESTORE")
@@ -2389,43 +2806,116 @@ def main() -> int:
             print(
                 f"  {value.collection}: rows={len(value.frame):,}, "
                 f"existing={state.count:,}, create={state.missing:,}, "
+                f"update={state.updated:,}, unchanged={state.matching:,}, "
                 f"conflicts={state.conflicts:,}, extra={state.extra:,}"
             )
+
+        if args.mode == "refresh":
+            blocked = {
+                dataset: {
+                    "conflicts": state.conflicts,
+                    "extra": state.extra,
+                }
+                for dataset, state in states.items()
+                if state.conflicts or state.extra
+            }
+            if blocked:
+                raise ValueError(
+                    "Stage 04 refresh blocked by conflicting or unexpected existing "
+                    f"documents: {blocked}"
+                )
 
         if args.preflight_only:
             report["status"] = "PASS"
             report["result"] = "PREFLIGHT_OK"
             print("\n[PREFLIGHT OK] No Monthly Sales documents were written.")
         else:
-            for dataset in ("monthly", "monthly_lm", "monthly_lm_groups"):
-                value = datasets[dataset]
-                created, committed = create_documents(
-                    db,
-                    value,
-                    states[dataset].missing_ids,
-                )
-                created_counts[dataset] = created
-                committed_counts[dataset] = committed
+            if args.mode == "refresh":
+                for dataset in ("monthly", "monthly_lm", "monthly_lm_groups"):
+                    value = datasets[dataset]
+                    write_result = write_refresh_documents(
+                        db,
+                        value,
+                        states[dataset],
+                    )
+                    created_counts[dataset] = write_result["created"]
+                    updated_counts[dataset] = write_result["updated"]
+                    committed_counts[dataset] = write_result["committedBatches"]
+                    write_operations_attempted[dataset] = write_result[
+                        "writeOperationsAttempted"
+                    ]
+                    write_operations_succeeded[dataset] = write_result[
+                        "writeOperationsSucceeded"
+                    ]
+                    maximum_batch_operations[dataset] = write_result[
+                        "maximumWriteOperationsInAnyBatch"
+                    ]
 
-            verification = {
-                dataset: verify_post_upload(
-                    db,
-                    value,
-                    lm_pcode=lm_pcode,
-                    month=args.month,
-                )
-                for dataset, value in datasets.items()
-            }
+                verification = {
+                    dataset: verify_refresh_post_upload(
+                        db,
+                        value,
+                        lm_pcode=lm_pcode,
+                        month=args.month,
+                    )
+                    for dataset, value in datasets.items()
+                }
+            else:
+                for dataset in ("monthly", "monthly_lm", "monthly_lm_groups"):
+                    value = datasets[dataset]
+                    created, committed = create_documents(
+                        db,
+                        value,
+                        states[dataset].missing_ids,
+                    )
+                    created_counts[dataset] = created
+                    committed_counts[dataset] = committed
+                    write_operations_attempted[dataset] = created
+                    write_operations_succeeded[dataset] = created
+                    maximum_batch_operations[dataset] = min(BATCH_SIZE, created)
+
+                verification = {
+                    dataset: verify_post_upload(
+                        db,
+                        value,
+                        lm_pcode=lm_pcode,
+                        month=args.month,
+                    )
+                    for dataset, value in datasets.items()
+                }
+
             report.update(
                 {
                     "documentsCreated": created_counts,
+                    "documentsUpdated": updated_counts,
+                    "documentsUnchanged": {
+                        dataset: states[dataset].matching for dataset in COLLECTIONS
+                    },
                     "committedBatches": committed_counts,
+                    "firestoreBatching": {
+                        "firestoreBatchSize": BATCH_SIZE,
+                        "preflightReadWaves": {
+                            dataset: states[dataset].read_waves
+                            for dataset in COLLECTIONS
+                        },
+                        "writeWavesCommitted": committed_counts,
+                        "writeOperationsAttempted": write_operations_attempted,
+                        "writeOperationsSucceeded": write_operations_succeeded,
+                        "maximumWriteOperationsInAnyBatch": maximum_batch_operations,
+                        "perDocumentFallback": False,
+                    },
                     "verification": verification,
                     "status": "PASS",
                     "result": "UPLOAD_VERIFIED",
                 }
             )
-            print("\n[VERIFY PASS] All three collection counts and samples match.")
+            if args.mode == "refresh":
+                print(
+                    "\n[VERIFY PASS] All three collection counts and full "
+                    "monthly_source documents match."
+                )
+            else:
+                print("\n[VERIFY PASS] All three collection counts and samples match.")
         return 0
 
     except Exception as exc:
@@ -2434,7 +2924,15 @@ def main() -> int:
                 "status": "FAIL",
                 "result": "FAILED",
                 "documentsCreated": created_counts,
+                "documentsUpdated": updated_counts,
                 "committedBatches": committed_counts,
+                "firestoreBatching": {
+                    "firestoreBatchSize": BATCH_SIZE,
+                    "writeOperationsAttempted": write_operations_attempted,
+                    "writeOperationsSucceeded": write_operations_succeeded,
+                    "maximumWriteOperationsInAnyBatch": maximum_batch_operations,
+                    "perDocumentFallback": False,
+                },
                 "errorType": type(exc).__name__,
                 "error": str(exc),
             }

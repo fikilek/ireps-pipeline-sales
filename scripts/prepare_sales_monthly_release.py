@@ -28,7 +28,12 @@ def write(path, value):
     return {"path": str(path), "sha256": sha(path)}
 
 
-def prepare(output):
+ALLOWED_PROJECTS = ["ireps2", "ireps-test", "ireps-5c3e9"]
+
+
+def prepare(output, project_id: str = "ireps2"):
+    if project_id not in ALLOWED_PROJECTS:
+        raise ValueError(f"Target project not permitted: {project_id!r}")
     output.mkdir(parents=True, exist_ok=True)
     source_root = ROOT / "input/endumeni_demo_sales/source_originals"
     stage06 = ROOT / "output/sales_all_meters/sales_all_meters__ZA5241__FULL__2023-12_to_2026-08.csv"
@@ -55,7 +60,7 @@ def prepare(output):
         source = {"path": str(path), "sha256": source_sha, "sheet": sheet,
             "categoryColumn": "Leakage_Category" if month == "2026-06" else {"2026-07":"July_2026_Category","2026-08":"August_2026_Category"}[month],
             "riskTierColumn": "Risk_Tier", "riskScoreColumn": "Risk_Score"}
-        package = {"schemaVersion": 1, "projectId": "ireps2", "month": month,
+        package = {"schemaVersion": 1, "projectId": project_id, "month": month,
             "source": source, "creator": {"uid": "fXBACUfMzybcqC0AbeNeyYyTeRu1", "user": "Fikile Kentane"},
             "creatorEvidence": creator_evidence, "creatorEligibleIds": baseline_ids,
             "creatorScope": {"path": str(baseline), "sha256": sha(baseline)},
@@ -127,7 +132,7 @@ def prepare(output):
         "currentCumulative": cumulative_evidence, "newIdentityCount": len(new_ids),
         "newIdentities": new_ids, "months": sales_deltas,
         "meaning": "Existing identity history preserved; appended supplier identities can carry authoritative earlier-month sales."})
-    release = {"status": "PREPARED_NOT_RELEASE_READY", "projectId": "ireps2",
+    release = {"status": "PREPARED_NOT_RELEASE_READY", "projectId": project_id,
         "collection": "sales-all-meters", "firestoreAccess": False, "firestoreWrites": 0,
         "stage06Evidence": stage06_evidence, "categoryMonths": inventory,
         "categoryComparison": deltas, "historicalSalesMutationPlanned": False,
@@ -154,4 +159,9 @@ def prepare(output):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path)
-    prepare(parser.parse_args().output.resolve())
+    parser.add_argument("--project-id", default="ireps2", choices=ALLOWED_PROJECTS)
+    parser.add_argument("--confirm-project", default="ireps2", choices=ALLOWED_PROJECTS)
+    args = parser.parse_args()
+    if args.project_id != args.confirm_project:
+        raise ValueError("Project confirmation mismatch")
+    prepare(args.output.resolve(), project_id=args.project_id)

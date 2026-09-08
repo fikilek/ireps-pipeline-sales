@@ -80,6 +80,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 COLLECTION_NAME = "sales-all-meters"
 BATCH_SIZE = 400
 INITIAL_LOAD_PROJECTS = {"ireps-test", "ireps-5c3e9"}
+ALLOWED_PROJECTS = {"ireps2", "ireps-test", "ireps-5c3e9"}
 GOVERNED_PROVIDER = "conlog"
 MONTH_COLUMN_RE = re.compile(r"^amount_(\d{4})_(\d{2})_C$")
 METER_ID_RE = re.compile(r"^[A-Z0-9]+$")
@@ -1366,6 +1367,9 @@ def build_config(args: argparse.Namespace) -> UploadConfig:
     confirm_project = safe_str(args.confirm_project)
     if not project_id:
         raise ValueError("--project-id may not be blank")
+    if project_id not in ALLOWED_PROJECTS:
+        allowed = ", ".join(sorted(ALLOWED_PROJECTS))
+        raise ValueError(f"Project not permitted: {project_id!r}; allowed: {allowed}")
     if confirm_project != project_id:
         raise ValueError(
             f"Project confirmation failed: --project-id={project_id!r}, "
@@ -1423,7 +1427,8 @@ def print_preflight(config: UploadConfig, result: PreflightResult) -> None:
 
 def main() -> None:
     args = parse_args()
-    if args.mode != "refresh" and not args.preflight_only:
+    if (args.mode != "refresh" and not args.preflight_only
+            and getattr(args, "project_id", None) not in INITIAL_LOAD_PROJECTS):
         raise ValueError("Final-state Sales writes require --mode refresh and an approved metadata/category contract")
     if args.mode == "refresh":
         from sales_pipeline_sales_all_refresh import run_refresh

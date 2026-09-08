@@ -977,6 +977,9 @@ def _batch_evidence(stats: RefreshStats) -> dict[str, Any]:
     }
 
 
+ALLOWED_PROJECTS = {"ireps2", "ireps-test", "ireps-5c3e9"}
+
+
 def run_refresh(
     *,
     project_id: str,

@@ -49,9 +49,12 @@ def current_members(source, canonical_ids):
         book.close()
 
 
+ALLOWED_PROJECTS = {"ireps2", "ireps-test", "ireps-5c3e9"}
+
+
 def load_analytics_package(package, digest, project_id):
     from sales_june_baseline import exact_ids
-    if (project_id != 'ireps2' or package.get('projectId') != project_id
+    if (project_id not in ALLOWED_PROJECTS or package.get('projectId') != project_id
             or package.get('schemaVersion') != 2 or package.get('operation') != 'AMEND_ANALYTICS_JUNE_BASELINE'
             or package.get('month') != '2026-06' or package.get('lmPcode') != 'ZA5241'
             or package.get('provider') != 'contour'):

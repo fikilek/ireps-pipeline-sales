@@ -103,13 +103,19 @@ console.log(JSON.stringify({schemaRecords:checked,schemaFailures:failures.length
 """
 
 
+ALLOWED_PROJECTS = ["ireps2", "ireps-test", "ireps-5c3e9"]
+
+
 def prepare(args):
     started = time.monotonic()
+    target_project = getattr(args, "project_id", "ireps2")
+    if target_project not in ALLOWED_PROJECTS:
+        raise ValueError(f"Target project not permitted: {target_project!r}")
     out = args.output_dir.resolve()
     out.mkdir(parents=True, exist_ok=True)
     review = load(args.review_dir / "pre_stage10_august_readiness.json")
     if (review["source"]["sha256"] != SOURCE_SHA or review["month"] != MONTH
-            or review["projectId"] != "ireps2" or review["lmPcode"] != "ZA5241"):
+            or review["projectId"] not in ALLOWED_PROJECTS or review["lmPcode"] != "ZA5241"):
         raise ValueError("Wrong approved August review/source scope")
     source = {k: review["source"][k] for k in ("path", "sha256", "sheet")}
     source["identityField"] = "CorrectedMeterNumber"
@@ -168,7 +174,7 @@ def prepare(args):
     package = {k: copy.deepcopy(july_package[k]) for k in (
         "actor", "actorEvidence", "creator", "creatorEvidence", "creatorScope",
         "creatorEligibleIds", "pipelineAttributionEvidence", "attributionConfirmation")}
-    package.update(schemaVersion=1, projectId="ireps2", collection="sales-all-meters",
+    package.update(schemaVersion=1, projectId=target_project, collection="sales-all-meters",
         lmPcode="ZA5241", provider="contour", month=MONTH, source=source,
         runId=out.name, executionIds=sorted(ids), categories=values, exceptions=[],
         canonicalStage06=copy.deepcopy(july_package["canonicalStage06"]),
@@ -201,7 +207,7 @@ def prepare(args):
         categories.verified_bytes(canonical[key], "Previously approved canonical " + key)
     input_rows, input_evidence = refresh.load_and_validate(
         Path(canonical["input"]["path"]), Path(canonical["manifest"]["path"]))
-    selected, admission = categories.load_package(package_path, package_ref["sha256"], input_rows, "ireps2")
+    selected, admission = categories.load_package(package_path, package_ref["sha256"], input_rows, target_project)
     if ({r["masterId"] for r in selected} != ids or len(selected) != 10241
             or any("createOnly" in r or "metadataRefresh" in r or "categoryRefresh" not in r for r in selected)):
         raise ValueError("Wrong path: August must admit existing category updates only")
@@ -341,9 +347,13 @@ def prepare(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--project-id", default="ireps2", choices=ALLOWED_PROJECTS)
+    parser.add_argument("--confirm-project", default="ireps2", choices=ALLOWED_PROJECTS)
     parser.add_argument("--review-dir", type=Path, required=True)
     parser.add_argument("--july-finalization", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--node", type=Path, required=True)
     args = parser.parse_args()
+    if args.project_id != args.confirm_project:
+        raise ValueError("Project confirmation mismatch")
     raise SystemExit(prepare(args))

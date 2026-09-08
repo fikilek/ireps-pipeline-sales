@@ -35,12 +35,15 @@ def guard_plan(rows, plan, approved):
             category(decision["updates"]["monthlyCategories.2026-06"])
 
 
+ALLOWED_PROJECTS = {"ireps2", "ireps-test", "ireps-5c3e9"}
+
+
 def load_june_package(path: Path, digest: str, project_id: str):
     package = json.loads(verified_bytes({"path": str(path), "sha256": digest}, "June package"))
     if package.get("schemaVersion") == 2:
         from sales_june_analytics_baseline import load_analytics_package
         return load_analytics_package(package, digest, project_id)
-    if (project_id != "ireps2" or package.get("projectId") != project_id
+    if (project_id not in ALLOWED_PROJECTS or package.get("projectId") != project_id
             or package.get("month") != "2026-06" or package.get("schemaVersion") != 1
             or package.get("operation") != "AMEND_ORIGINAL_JUNE_BASELINE"
             or package.get("lmPcode") != "ZA5241" or package.get("provider") != "contour"):

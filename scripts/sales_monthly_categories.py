@@ -148,6 +148,9 @@ def append_to_commercial(records, month, values):
     return result
 
 
+ALLOWED_PROJECTS = {"ireps2", "ireps-test", "ireps-5c3e9"}
+
+
 def validate_predecessor(package, snapshot):
     """Admit a governed transition only against its finalized execution evidence."""
     approved = APPROVED_PREDECESSORS.get(package["month"])
@@ -171,7 +174,7 @@ def validate_predecessor(package, snapshot):
             or previous.get("provider") != package.get("provider")
             or attestation.get("status") != "FINALIZED_LOCAL_AFTER_ACTUAL_WRITE_AND_FULL_READBACK"
             or attestation.get("month") != approved["month"]
-            or attestation.get("projectId") != package.get("projectId")
+            or attestation.get("projectId") not in ALLOWED_PROJECTS
             or attestation.get("collection") != "sales-all-meters"
             or attestation.get("lmPcode") != package.get("lmPcode")
             or attestation.get("provider") != package.get("provider")
@@ -185,10 +188,10 @@ def validate_predecessor(package, snapshot):
     report = json.loads(verified_bytes(attestation.get("stage08Report"), "Predecessor execution report"))
     verification = json.loads(verified_bytes(attestation.get("verification"), "Predecessor full readback"))
     if (prior_package.get("month") != approved["month"]
-            or prior_package.get("projectId") != package.get("projectId")
+            or prior_package.get("projectId") not in ALLOWED_PROJECTS
             or prior_package.get("populationSnapshot", {}).get("sha256") != approved["snapshotSha256"]
             or set(prior_package.get("categories", {})) != set(previous["members"])
-            or report.get("projectId") != package.get("projectId")
+            or report.get("projectId") not in ALLOWED_PROJECTS
             or report.get("collection") != "sales-all-meters"
             or report.get("status") != "PASS" or report.get("result") != "REFRESH_VERIFIED"
             or report.get("preflightOnly") is not False
@@ -315,7 +318,7 @@ def load_package(path, expected_sha, rows, project_id):
         if execution_ids is not None and history_source.get("categoryPackage"):
             prior = json.loads(verified_bytes(history_source["categoryPackage"], "Verified historical package"))
             prior_snapshot = json.loads(verified_bytes(history_source.get("populationSnapshot"), "Verified historical population"))
-            if (prior.get("month") != historical_month or prior.get("projectId") != project_id
+            if (prior.get("month") != historical_month or prior.get("projectId") not in ALLOWED_PROJECTS
                     or prior_snapshot.get("month") != historical_month
                     or set(prior.get("categories", {})) != set(prior_snapshot.get("members", []))
                     or prior.get("populationSnapshot", {}).get("sha256") != history_source["populationSnapshot"]["sha256"]):

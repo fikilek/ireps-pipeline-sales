@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import importlib.util
 import json
 import sys
@@ -608,6 +609,131 @@ class Stage08GlobalPreflightTests(unittest.TestCase):
             run_source,
         )
 
+    def test_run_refresh_preflight_only_with_capture_plan_emits_plan_and_before_jsonl(self):
+        rows = [item(f"P{index:05d}") for index in range(1, 101)]
+        db = DB()
+        modules, _ = google_module_stubs(db)
+
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            service_account_path = root / "sa.json"
+            service_account_path.write_text(
+                json.dumps({"project_id": "ireps-dev"}),
+                encoding="utf-8",
+            )
+            input_path = root / "input.csv"
+            manifest_path = root / "manifest.json"
+            input_path.write_text("unused", encoding="utf-8")
+            manifest_path.write_text("{}", encoding="utf-8")
+            report_dir = root / "reports"
+
+            with (
+                mock.patch.dict(sys.modules, modules, clear=False),
+                mock.patch.object(
+                    refresh,
+                    "load_and_validate",
+                    return_value=(rows, {"rows": len(rows)}),
+                ),
+            ):
+                report_path = refresh.run_refresh(
+                    project_id="ireps-dev",
+                    confirm_project="ireps-dev",
+                    service_account_path=service_account_path,
+                    input_path=input_path,
+                    manifest_path=manifest_path,
+                    report_dir=report_dir,
+                    preflight_only=True,
+                    capture_plan=True,
+                )
+
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(report["recordsInspected"], 100)
+            self.assertEqual(report["firestoreWrites"], 0)
+            self.assertEqual(report["result"], "PREFLIGHT_PASS")
+            self.assertIn("recoveryEvidence", report)
+            self.assertTrue(report["recoveryEvidence"]["complete"])
+            self.assertEqual(report["recoveryEvidence"]["records"], 100)
+            self.assertIn("planEvidence", report)
+            self.assertTrue(report["planEvidence"]["complete"])
+            self.assertEqual(report["planEvidence"]["records"], 100)
+            before_path = report_path.with_suffix(".before.jsonl")
+            plan_path = report_path.with_suffix(".plan.jsonl")
+            self.assertTrue(before_path.is_file())
+            self.assertTrue(plan_path.is_file())
+            self.assertEqual(len(before_path.read_text(encoding="utf-8").strip().split("\n")), 100)
+            self.assertEqual(len(plan_path.read_text(encoding="utf-8").strip().split("\n")), 100)
+
+    def test_guard_commercial_repair_envelope_validates_envelope_and_blocks_violations(self):
+        from sales_pipeline_sales_all_refresh import (
+            COMMERCIAL_REPAIR_STAGE06_ONLY_IDS,
+            guard_commercial_repair_envelope,
+        )
+
+        all_ids = sorted(
+            list(COMMERCIAL_REPAIR_STAGE06_ONLY_IDS)
+            + [f"C{i:05d}" for i in range(10271 - len(COMMERCIAL_REPAIR_STAGE06_ONLY_IDS))]
+        )
+        rows = [{"masterId": mid} for mid in all_ids]
+
+        # Valid plan
+        decisions = []
+        for i, mid in enumerate(all_ids):
+            if i < 10216:
+                updates = {
+                    "monthlySalesC.2026-07": 100,
+                    "metadata.updatedAt": "2026-09-08T23:00:00Z",
+                }
+                if mid == "04298092612":
+                    updates["metadata.createdAt"] = "2026-08-09T05:27:38Z"
+                decisions.append({
+                    "masterId": mid,
+                    "classification": "UPDATED",
+                    "updates": updates,
+                })
+            else:
+                decisions.append({
+                    "masterId": mid,
+                    "classification": "UNCHANGED",
+                    "updates": {},
+                })
+        plan = [{"waveNumber": 1, "decisions": decisions}]
+
+        stats = refresh.RefreshStats(rows=10271)
+        stats.inspected = 10271
+        stats.updated = 10216
+        stats.unchanged = 55
+        stats.created = 0
+        stats.conflicts = 0
+        stats.failed = 0
+
+        # Should pass cleanly
+        guard_commercial_repair_envelope(rows, plan, stats=stats)
+
+        # 1. Unpermitted path violation
+        bad_plan = copy.deepcopy(plan)
+        bad_plan[0]["decisions"][0]["updates"]["badField"] = 123
+        with self.assertRaisesRegex(ValueError, "unpermitted patch path 'badField'"):
+            guard_commercial_repair_envelope(rows, bad_plan, stats=stats)
+
+        # 2. Creation metadata on non-predecessor meter
+        bad_plan2 = copy.deepcopy(plan)
+        bad_plan2[0]["decisions"][0]["updates"]["metadata.createdAt"] = "2026-08-09T00:00:00Z"
+        with self.assertRaisesRegex(ValueError, "unpermitted patch path 'metadata.createdAt'"):
+            guard_commercial_repair_envelope(rows, bad_plan2, stats=stats)
+
+        # 3. Workbook-only meter present
+        bad_rows = copy.deepcopy(rows)
+        bad_rows[0]["masterId"] = "04297839708"
+        with self.assertRaisesRegex(ValueError, "workbook-only meter 04297839708 must remain untouched"):
+            guard_commercial_repair_envelope(bad_rows, plan, stats=stats)
+
+        # 4. Conflict violation
+        bad_stats = copy.deepcopy(stats)
+        bad_stats.conflicts = 1
+        with self.assertRaisesRegex(ValueError, "CONFLICT must be 0"):
+            guard_commercial_repair_envelope(rows, plan, stats=bad_stats)
+
 
 if __name__ == "__main__":
     unittest.main()
+

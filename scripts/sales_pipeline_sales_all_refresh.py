@@ -998,6 +998,142 @@ def _batch_evidence(stats: RefreshStats) -> dict[str, Any]:
 
 ALLOWED_PROJECTS = {"ireps2", "ireps-test", "ireps-5c3e9"}
 
+COMMERCIAL_REPAIR_STAGE06_POPULATION = 10271
+COMMERCIAL_REPAIR_MAX_UPDATED = 10216
+COMMERCIAL_REPAIR_MIN_UNCHANGED = 55
+COMMERCIAL_REPAIR_EXPECTED_UNIVERSE = 10273
+COMMERCIAL_REPAIR_HISTORICAL_PREDECESSOR = "04298092612"
+COMMERCIAL_REPAIR_WORKBOOK_ONLY_IDS = frozenset({"04297839708", "04298618952"})
+COMMERCIAL_REPAIR_STAGE06_ONLY_IDS = frozenset({
+    "04297698195", "04297705461", "04297751788", "04297758312", "04297769079",
+    "04297771562", "04297772107", "04297839922", "04297855084", "04297856298",
+    "04297861769", "04297862627", "04297864334", "04298075930", "04298078033",
+    "04298078454", "04298079296", "04298079932", "04298081276", "04298083959",
+    "04298088453", "04298089337", "04298092612", "04298101157", "04298102403",
+    "04298107600", "04298108459", "04298112261", "04298117286", "04298618168",
+    "04300436989", "07049815116",
+})
+COMMERCIAL_REPAIR_PERMITTED_COMMERCIAL_PATHS = frozenset({
+    "monthlySalesC.2026-07",
+    "monthlySalesC.2026-08",
+    "monthlyTotalsC.2026-07",
+    "monthlyTotalsC.2026-08",
+    "monthlyUnits.2026-07",
+    "monthlyUnits.2026-08",
+    "salesPeriodTo",
+    "totalAmountC",
+    "totalSalesC",
+    "totalUnits",
+})
+COMMERCIAL_REPAIR_PERMITTED_METADATA_PATHS = frozenset({
+    "metadata.updatedAt",
+    "metadata.updatedByUid",
+    "metadata.updatedByUser",
+})
+COMMERCIAL_REPAIR_PREDECESSOR_CREATION_PATHS = frozenset({
+    "metadata.createdAt",
+    "metadata.createdByUid",
+    "metadata.createdByUser",
+})
+
+
+def guard_commercial_repair_envelope(
+    rows: Sequence[Mapping[str, Any]],
+    plan: Sequence[Mapping[str, Any]],
+    *,
+    stats: RefreshStats | None = None,
+    collection: Any = None,
+) -> None:
+    """Enforce the strict approved July/August commercial repair envelope before any write."""
+    if len(rows) != COMMERCIAL_REPAIR_STAGE06_POPULATION:
+        raise ValueError(
+            f"Commercial repair envelope violation: input row count {len(rows)} != {COMMERCIAL_REPAIR_STAGE06_POPULATION}"
+        )
+
+    if collection is not None:
+        try:
+            universe_count = collection.where("lmPcode", "==", "ZA5241").count().get()[0][0].value
+            if universe_count != COMMERCIAL_REPAIR_EXPECTED_UNIVERSE:
+                raise ValueError(
+                    f"Commercial repair envelope violation: Firestore universe is {universe_count}, "
+                    f"expected {COMMERCIAL_REPAIR_EXPECTED_UNIVERSE}"
+                )
+        except Exception as exc:
+            if "Commercial repair envelope violation" in str(exc):
+                raise
+
+    if stats is not None:
+        if stats.created != 0:
+            raise ValueError(f"Commercial repair envelope violation: CREATED must be 0, got {stats.created}")
+        if stats.conflicts != 0:
+            raise ValueError(f"Commercial repair envelope violation: CONFLICT must be 0, got {stats.conflicts}")
+        if stats.failed != 0:
+            raise ValueError(f"Commercial repair envelope violation: FAILED must be 0, got {stats.failed}")
+        if stats.updated > COMMERCIAL_REPAIR_MAX_UPDATED:
+            raise ValueError(
+                f"Commercial repair envelope violation: UPDATED {stats.updated} exceeds max {COMMERCIAL_REPAIR_MAX_UPDATED}"
+            )
+        if stats.unchanged < COMMERCIAL_REPAIR_MIN_UNCHANGED:
+            raise ValueError(
+                f"Commercial repair envelope violation: UNCHANGED {stats.unchanged} below min {COMMERCIAL_REPAIR_MIN_UNCHANGED}"
+            )
+
+    decisions = [decision for wave in plan for decision in wave["decisions"]]
+    if len(decisions) != COMMERCIAL_REPAIR_STAGE06_POPULATION:
+        raise ValueError(
+            f"Commercial repair envelope violation: plan decision count {len(decisions)} != {COMMERCIAL_REPAIR_STAGE06_POPULATION}"
+        )
+
+    plan_ids = {str(d["masterId"]) for d in decisions}
+    row_ids = {str(r["masterId"]) for r in rows}
+    for wb_id in COMMERCIAL_REPAIR_WORKBOOK_ONLY_IDS:
+        if wb_id in plan_ids or wb_id in row_ids:
+            raise ValueError(
+                f"Commercial repair envelope violation: workbook-only meter {wb_id} must remain untouched"
+            )
+
+    if plan_ids != row_ids:
+        raise ValueError("Commercial repair envelope violation: plan master IDs do not match input rows")
+
+    missing_stage06_only = COMMERCIAL_REPAIR_STAGE06_ONLY_IDS - plan_ids
+    if missing_stage06_only:
+        raise ValueError(
+            f"Commercial repair envelope violation: missing Stage06-only meters: {sorted(missing_stage06_only)}"
+        )
+
+    updated_count = 0
+    unchanged_count = 0
+    for d in decisions:
+        cls = str(d["classification"])
+        mid = str(d["masterId"])
+        if cls == "UPDATED":
+            updated_count += 1
+        elif cls == "UNCHANGED":
+            unchanged_count += 1
+        else:
+            raise ValueError(
+                f"Commercial repair envelope violation: unapproved classification '{cls}' for meter {mid}"
+            )
+
+        updates = dict(d.get("updates") or {})
+        for path in updates.keys():
+            if path in COMMERCIAL_REPAIR_PERMITTED_COMMERCIAL_PATHS or path in COMMERCIAL_REPAIR_PERMITTED_METADATA_PATHS:
+                continue
+            if mid == COMMERCIAL_REPAIR_HISTORICAL_PREDECESSOR and path in COMMERCIAL_REPAIR_PREDECESSOR_CREATION_PATHS:
+                continue
+            raise ValueError(
+                f"Commercial repair envelope violation for meter {mid}: unpermitted patch path '{path}'"
+            )
+
+    if updated_count > COMMERCIAL_REPAIR_MAX_UPDATED:
+        raise ValueError(
+            f"Commercial repair envelope violation: UPDATED count {updated_count} exceeds maximum {COMMERCIAL_REPAIR_MAX_UPDATED}"
+        )
+    if unchanged_count < COMMERCIAL_REPAIR_MIN_UNCHANGED:
+        raise ValueError(
+            f"Commercial repair envelope violation: UNCHANGED count {unchanged_count} below minimum {COMMERCIAL_REPAIR_MIN_UNCHANGED}"
+        )
+
 
 def run_refresh(
     *,
@@ -1014,6 +1150,8 @@ def run_refresh(
     metadata_contract_sha256: str | None = None,
     june_package_path: Path | None = None,
     june_package_sha256: str | None = None,
+    capture_plan: bool = False,
+    commercial_envelope_guard: bool = False,
 ) -> Path:
     if project_id != confirm_project:
         raise ValueError("Project confirmation mismatch")
@@ -1080,6 +1218,12 @@ def run_refresh(
     db = firestore.Client(project=project_id, credentials=credentials)
     collection = db.collection(COLLECTION)
     stats = RefreshStats(rows=len(rows))
+    if commercial_envelope_guard:
+        if scope_guard is not None:
+            raise ValueError("Commercial envelope guard cannot combine with existing scope guard")
+        scope_guard = lambda selected, plan: guard_commercial_repair_envelope(
+            selected, plan, stats=stats, collection=collection
+        )
     preserved_before: dict[str, str] = {}
     run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     report_dir.mkdir(parents=True, exist_ok=True)
@@ -1130,7 +1274,7 @@ def run_refresh(
                 sort_keys=True, separators=(",", ":")) + "\n")
             recovery_count += 1
         try:
-            if june_package_path is not None or ((category_package_path is not None or metadata_contract_path is not None) and not preflight_only):
+            if capture_plan or june_package_path is not None or ((category_package_path is not None or metadata_contract_path is not None) and not preflight_only):
                 recovery_stream = recovery_path.open("x", encoding="utf-8", newline="\n")
             if june_ids is not None:
                 exact_ids((row["masterId"] for row in rows), june_ids)

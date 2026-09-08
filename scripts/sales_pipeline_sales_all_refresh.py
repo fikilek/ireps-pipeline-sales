@@ -12,6 +12,7 @@ import io
 import json
 import os
 import re
+import subprocess
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
@@ -41,6 +42,7 @@ VISIBILITY_VALUES = {"VISIBLE", "INVISIBLE"}
 DEFAULT_VISIBILITY = "INVISIBLE"
 COLLECTION = "sales-all-meters"
 FIRESTORE_BATCH_SIZE = 400
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 BASE_COLUMNS = [
     "masterId", "meterNo", "meterNoNormalized", "provider", "customerNo", "accountNo",
@@ -91,6 +93,23 @@ class RefreshStats:
 
 def _sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _git_head() -> str | None:
+    """Return the repository HEAD for run evidence without changing Git state."""
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(PROJECT_ROOT), "rev-parse", "HEAD"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    if completed.returncode != 0:
+        return None
+    head = completed.stdout.strip()
+    return head or None
 
 
 def _decimal(value: Any, label: str) -> Decimal:
@@ -1070,6 +1089,7 @@ def run_refresh(
         "operation": "sales_all_meters_refresh", "mode": "refresh",
         "preflightOnly": preflight_only, "projectId": project_id,
         "collection": COLLECTION, "startedAt": datetime.now(UTC).isoformat(),
+        "gitHead": _git_head(),
         "sourceEvidence": evidence, "status": "STARTED", "result": "STARTED",
         "firestoreBatchSize": FIRESTORE_BATCH_SIZE,
     }

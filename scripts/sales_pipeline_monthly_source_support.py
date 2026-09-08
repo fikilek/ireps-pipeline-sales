@@ -776,6 +776,14 @@ def build_stage06_monthly_source(
                 row[field] = safe_str(value)
             else:
                 row[field] = safe_str(value)
+
+        # Stage 03A preserves sparse supplier history, where salesPeriodTo may
+        # reflect the last month explicitly present for a retained identity.
+        # Stage 06 is the dense Sales All projection: every row below carries
+        # governed monthly Sales/Units columns through `to_month`, including
+        # explicit zero months. Here salesPeriodTo therefore means the end of
+        # the commercial coverage window, not the last non-zero purchase month.
+        row["salesPeriodTo"] = months[-1]
         for field in COMMERCIAL_JSON_FIELDS:
             value = source.get(field)
             if value is None or value == "":

@@ -341,6 +341,80 @@ class Stage06ContractTests(unittest.TestCase):
             self.assertEqual(json.loads(report_path.read_text(encoding="utf-8"))["rawAddressMutationCount"], 0)
             self.assertEqual(commercial_path.read_bytes(), original_source_bytes)
 
+    def test_monthly_source_stage06_advances_dense_coverage_period_through_zero_months(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            monthly_dir = root / "monthly"
+            monthly_dir.mkdir()
+            commercial_path = root / "commercial.jsonl"
+            source_row = synthetic_commercial_row()
+            source_row["salesPeriodFrom"] = "2026-06"
+            source_row["salesPeriodTo"] = "2026-06"
+            commercial_sha = write_jsonl(commercial_path, [source_row])
+
+            for month, amount, units in (
+                ("2026-06", "100", "5"),
+                ("2026-07", "0", "0"),
+                ("2026-08", "0", "0"),
+            ):
+                pd.DataFrame(
+                    [
+                        {
+                            "lmPcode": "ZA7423",
+                            "meterNo": "ABC123",
+                            "ym": month,
+                            "provider": "contour",
+                            "amountTotalC": amount,
+                            "unitsTotal": units,
+                            "sourceOrigin": "monthly_source",
+                        }
+                    ]
+                ).to_csv(
+                    monthly_dir / f"monthly__FULL__{month}__from_monthly_source.csv",
+                    index=False,
+                    encoding="utf-8",
+                )
+
+            master_path = root / "meter_master.csv"
+            master_manifest_path = root / "meter_master.manifest.json"
+            monthly_support.build_stage05_monthly_source(
+                lm_pcode="ZA7423",
+                provider="contour",
+                meter_type="electricity",
+                from_month="2026-06",
+                to_month="2026-08",
+                commercial_source=commercial_path,
+                expected_commercial_sha256=commercial_sha,
+                monthly_dir=monthly_dir,
+                output_path=master_path,
+                manifest_path=master_manifest_path,
+                source_run_id="SYNTHETIC_RUN",
+            )
+
+            sales_path = root / "sales_all_meters__ZA7423__FULL__2026-06_to_2026-08.csv"
+            monthly_support.build_stage06_monthly_source(
+                lm_pcode="ZA7423",
+                provider="contour",
+                from_month="2026-06",
+                to_month="2026-08",
+                master_path=master_path,
+                master_manifest_path=master_manifest_path,
+                commercial_source=commercial_path,
+                expected_commercial_sha256=commercial_sha,
+                monthly_dir=monthly_dir,
+                output_path=sales_path,
+                manifest_path=sales_path.with_suffix(".manifest.json"),
+            )
+
+            output = pd.read_csv(sales_path, dtype=str, encoding="utf-8-sig").fillna("")
+            row = output.to_dict("records")[0]
+            self.assertEqual(row["amount_2026_07_C"], "0")
+            self.assertEqual(row["amount_2026_08_C"], "0")
+            self.assertEqual(row["units_2026_07"], "0")
+            self.assertEqual(row["units_2026_08"], "0")
+            self.assertEqual(row["salesPeriodFrom"], "2026-06")
+            self.assertEqual(row["salesPeriodTo"], "2026-08")
+
     def test_monthly_source_stage06_identity_join_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

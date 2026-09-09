@@ -224,6 +224,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--metadata-contract", type=Path,
         help="Hash-bound creation/update actor provenance for a full commercial refresh.")
     parser.add_argument("--metadata-contract-sha256")
+    parser.add_argument(
+        "--capture-plan",
+        action="store_true",
+        help="Capture before-image and frozen plan JSONL during preflight.",
+    )
+    parser.add_argument(
+        "--commercial-envelope-guard",
+        action="store_true",
+        help="Enforce strict approved commercial repair envelope before any write.",
+    )
     args = parser.parse_args()
     if (args.category_package or args.category_package_sha256) and args.mode != "refresh":
         parser.error("Category packages require --mode refresh")
@@ -1445,6 +1455,8 @@ def main() -> None:
             category_package_sha256=args.category_package_sha256,
             metadata_contract_path=(resolve_project_path(args.metadata_contract) if args.metadata_contract else None),
             metadata_contract_sha256=args.metadata_contract_sha256,
+            capture_plan=bool(getattr(args, "capture_plan", False)),
+            commercial_envelope_guard=bool(getattr(args, "commercial_envelope_guard", False)),
         )
         print("=== SALES ALL METERS REFRESH COMPLETE ===")
         print(f"Mode: {'PREFLIGHT ONLY' if args.preflight_only else 'REFRESH + VERIFY'}")

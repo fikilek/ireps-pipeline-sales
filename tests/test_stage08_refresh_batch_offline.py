@@ -5,6 +5,8 @@ import json
 import sys
 import types
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 from pathlib import Path
 
 
@@ -116,6 +118,17 @@ class DB:
 
 
 class Stage08RefreshBatchTests(unittest.TestCase):
+    def test_git_head_capture_is_read_only_and_uses_repository_root(self):
+        with patch.object(refresh.subprocess, "run") as run:
+            run.return_value = SimpleNamespace(returncode=0, stdout="abc123\n", stderr="")
+            self.assertEqual(refresh._git_head(), "abc123")
+            run.assert_called_once_with(
+                ["git", "-C", str(refresh.PROJECT_ROOT), "rev-parse", "HEAD"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
     def test_10216_partition_is_25x400_plus_216(self):
         waves = list(refresh._chunks(list(range(10216))))
         self.assertEqual([len(wave) for wave in waves], [400] * 25 + [216])
